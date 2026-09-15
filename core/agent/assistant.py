@@ -1,0 +1,982 @@
+from core.agent.context import ConversationContext
+from core.agent.executor import CommandExecutor
+from core.agent.intent import IntentDetector, IntentType
+from core.agent.planner import AgentPlanner
+from core.agent.semantic import SemanticToolEngine
+
+from core.memory.intent import MemoryIntentType
+from core.memory.service import MemoryService
+
+from core.agent.agent import RiyaAgent
+from core.ai.local_runtime import LocalLlamaRuntime
+
+
+class RIYAAssistant:
+    """
+    Main RIYA application interface.
+
+    Public interface:
+
+        assistant = RIYAAssistant()
+        assistant.process("...")
+        assistant.close()
+
+    Architecture:
+
+        User
+          ↓
+        Memory
+          ↓
+        Deterministic Router
+          ↓
+        Semantic Tool Retrieval
+          ↓
+        AI Planner
+          ↓
+        Security
+          ↓
+        Tool Execution
+          ↓
+        Verification
+          ↓
+        RIYA Response
+    """
+
+    def __init__(self):
+
+        # =====================================================
+        # RIYA AGENT
+        # =====================================================
+
+        self.agent = RiyaAgent()
+
+        # =====================================================
+        # LOCAL SEMANTIC ENGINE
+        # =====================================================
+
+        self.semantic = SemanticToolEngine(
+            self.agent.tools,
+            top_k=8,
+        )
+
+        # =====================================================
+        # LOCAL AI
+        # =====================================================
+
+        self.ai = LocalLlamaRuntime(
+            context_size=4096,
+            max_tokens=256,
+        )
+
+        # =====================================================
+        # MODEL
+        # =====================================================
+
+        self.model_path = self._find_model()
+
+        self.ai.load_model(
+            str(self.model_path)
+        )
+
+        # =====================================================
+        # CORE COMPONENTS
+        # =====================================================
+
+        self.intent_detector = IntentDetector()
+
+        self.command_executor = CommandExecutor(
+            self.agent
+        )
+
+        self.memory = MemoryService()
+
+        # =====================================================
+        # AI PLANNER + SEMANTIC ENGINE
+        # =====================================================
+
+        self.planner = AgentPlanner(
+            self.ai,
+            self.agent.tools,
+            semantic_engine=self.semantic,
+        )
+
+        # =====================================================
+        # CONVERSATION CONTEXT
+        # =====================================================
+
+        self.context = ConversationContext(
+            max_messages=12
+        )
+
+        # =====================================================
+        # PENDING CONFIRMATION
+        # =====================================================
+
+        self.pending_action = None
+
+    # =========================================================
+    # MODEL LOCATION
+    # =========================================================
+
+    def _find_model(self):
+
+        from pathlib import Path
+
+        candidates = [
+
+            # -------------------------------------------------
+            # Project model
+            # -------------------------------------------------
+
+            Path.home()
+            / "Projects"
+            / "RIYA"
+            / "models"
+            / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+
+            # -------------------------------------------------
+            # Hugging Face cache
+            # -------------------------------------------------
+
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--lmstudio-community--Qwen3-4B-Instruct-2507-GGUF"
+            / "snapshots",
+        ]
+
+        # -----------------------------------------------------
+        # Direct model file
+        # -----------------------------------------------------
+
+        for candidate in candidates:
+
+            if candidate.is_file():
+
+                return candidate
+
+        # -----------------------------------------------------
+        # Search Hugging Face snapshots
+        # -----------------------------------------------------
+
+        hf_snapshots = candidates[-1]
+
+        if hf_snapshots.exists():
+
+            for snapshot in hf_snapshots.iterdir():
+
+                if not snapshot.is_dir():
+                    continue
+
+                model_file = (
+                    snapshot
+                    / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+                )
+
+                if model_file.exists():
+
+                    return model_file
+
+        raise FileNotFoundError(
+            "RIYA local Qwen3 model was not found.\n"
+            "Expected either:\n"
+            f"  {candidates[0]}\n"
+            "or the existing Hugging Face cache."
+        )
+
+    # =========================================================
+    # MAIN PROCESSING
+    # =========================================================
+
+    def process(
+        self,
+        user_input: str,
+    ) -> str:
+
+        user_input = user_input.strip()
+
+        # -----------------------------------------------------
+        # Empty input
+        # -----------------------------------------------------
+
+        if not user_input:
+
+            return (
+                "Please tell me what you'd like me to do."
+            )
+
+        # -----------------------------------------------------
+        # Pending confirmation
+        # -----------------------------------------------------
+
+        if self.pending_action is not None:
+
+            return self._handle_confirmation(
+                user_input
+            )
+
+        # =====================================================
+        # MEMORY SYSTEM
+        # =====================================================
+
+        memory_intent = self.memory.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Recall
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.RECALL
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "I couldn't find that memory."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # List memories
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.LIST
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "RIYA has no stored memories."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Remember
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.REMEMBER
+        ):
+
+            action = (
+                self.memory.build_remember_action(
+                    memory_intent
+                )
+            )
+
+            self.pending_action = {
+                "tool": action["tool"],
+                "parameters": action["parameters"],
+            }
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            value = (
+                action["parameters"]["value"]
+            )
+
+            response = (
+                f"I'll remember '{value}' "
+                f"under '{category}' as '{key}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Forget
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.FORGET
+        ):
+
+            action = (
+                self.memory.build_forget_action(
+                    memory_intent
+                )
+            )
+
+            self.pending_action = {
+                "tool": action["tool"],
+                "parameters": action["parameters"],
+            }
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            response = (
+                f"I'll forget the memory "
+                f"'{key}' under '{category}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # DETERMINISTIC COMMAND ROUTER
+        # =====================================================
+
+        intent = self.intent_detector.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Exit
+        # -----------------------------------------------------
+
+        if intent.type == IntentType.EXIT:
+
+            return "Goodbye."
+
+        # -----------------------------------------------------
+        # Simple deterministic command
+        # -----------------------------------------------------
+
+        if intent.type != IntentType.CHAT:
+
+            try:
+
+                result = (
+                    self.command_executor.execute(
+                        intent
+                    )
+                )
+
+                response = self._format_result(
+                    result
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            except Exception as exc:
+
+                response = (
+                    "I couldn't complete that action: "
+                    f"{exc}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+        # =====================================================
+        # SEMANTIC + AI PLANNER
+        # =====================================================
+
+        try:
+
+            plan = self.planner.create_plan(
+                user_input
+            )
+
+        except Exception:
+
+            plan = None
+
+        # =====================================================
+        # NORMAL CONVERSATION
+        # =====================================================
+
+        if plan is None or not plan.steps:
+
+            response = self.ai.generate(
+                user_input,
+                conversation_context=(
+                    self.context.format_for_prompt()
+                ),
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # MULTI-STEP EXECUTION
+        # =====================================================
+
+        results = []
+
+        for step in plan.steps:
+
+            try:
+
+                result = self.agent.execute(
+                    step.action,
+                    **step.parameters,
+                )
+
+            except Exception as exc:
+
+                response = (
+                    "I couldn't complete the full task. "
+                    f"The operation "
+                    f"'{step.action}' failed: {exc}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Confirmation required
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                == "confirmation_required"
+            ):
+
+                self.pending_action = {
+                    "tool": result.get(
+                        "tool",
+                        step.action,
+                    ),
+                    "parameters": result.get(
+                        "parameters",
+                        step.parameters,
+                    ),
+                }
+
+                response = (
+                    f"{result.get('reason', 'This action requires confirmation.')} "
+                    "Proceed?"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Execution failure
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                in {
+                    "failed",
+                    "verification_failed",
+                }
+            ):
+
+                reason = result.get(
+                    "reason",
+                    result.get(
+                        "error",
+                        "Unknown failure.",
+                    ),
+                )
+
+                response = (
+                    f"I couldn't complete "
+                    f"'{step.description or step.action}'. "
+                    f"{reason}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Successful result
+            # -------------------------------------------------
+
+            results.append(
+                {
+                    "action": step.action,
+                    "description": step.description,
+                    "result": result,
+                }
+            )
+
+        # =====================================================
+        # FINAL RESULT
+        # =====================================================
+
+        response = self._summarize_results(
+            results
+        )
+
+        self._update_context(
+            user_input,
+            response,
+        )
+
+        return response
+
+    # =========================================================
+    # CONFIRMATION
+    # =========================================================
+
+    def _handle_confirmation(
+        self,
+        user_input: str,
+    ) -> str:
+
+        normalized = (
+            user_input.lower()
+            .strip()
+        )
+
+        yes_words = {
+            "yes",
+            "y",
+            "yeah",
+            "yep",
+            "sure",
+            "ok",
+            "okay",
+            "confirm",
+            "do it",
+        }
+
+        no_words = {
+            "no",
+            "n",
+            "nope",
+            "cancel",
+            "stop",
+            "don't",
+            "dont",
+        }
+
+        # -----------------------------------------------------
+        # Cancel
+        # -----------------------------------------------------
+
+        if normalized in no_words:
+
+            self.pending_action = None
+
+            response = (
+                "Okay, I cancelled that action."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Invalid confirmation
+        # -----------------------------------------------------
+
+        if normalized not in yes_words:
+
+            return (
+                "Please say yes to proceed "
+                "or no to cancel."
+            )
+
+        # -----------------------------------------------------
+        # Execute confirmed action
+        # -----------------------------------------------------
+
+        action = self.pending_action
+
+        self.pending_action = None
+
+        try:
+
+            result = self.agent.execute(
+                action["tool"],
+                confirm=True,
+                **action["parameters"],
+            )
+
+            response = self._format_result(
+                result
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        except Exception as exc:
+
+            response = (
+                "I couldn't complete the "
+                f"confirmed action: {exc}"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+    # =========================================================
+    # RESULT FORMATTING
+    # =========================================================
+
+    def _format_result(
+        self,
+        result,
+    ) -> str:
+
+        # -----------------------------------------------------
+        # Plain string
+        # -----------------------------------------------------
+
+        if isinstance(result, str):
+
+            return result.strip()
+
+        # -----------------------------------------------------
+        # Structured result
+        # -----------------------------------------------------
+
+        if isinstance(result, dict):
+
+            status = result.get(
+                "status"
+            )
+
+            # -------------------------------------------------
+            # Confirmation
+            # -------------------------------------------------
+
+            if status == "confirmation_required":
+
+                self.pending_action = {
+                    "tool": result.get(
+                        "tool"
+                    ),
+                    "parameters": result.get(
+                        "parameters",
+                        {},
+                    ),
+                }
+
+                return (
+                    f"{result.get('reason', 'Confirmation required.')} "
+                    "Proceed?"
+                )
+
+            # -------------------------------------------------
+            # Failed
+            # -------------------------------------------------
+
+            if status == "failed":
+
+                return (
+                    "I couldn't complete the action. "
+                    f"{result.get('error', 'Unknown error.')}"
+                )
+
+            # -------------------------------------------------
+            # Verification failed
+            # -------------------------------------------------
+
+            if status == "verification_failed":
+
+                return (
+                    "The action was attempted, "
+                    "but I could not verify that it "
+                    "completed successfully. "
+                    f"{result.get('reason', '')}"
+                ).strip()
+
+            # -------------------------------------------------
+            # Successful
+            # -------------------------------------------------
+
+            if status == "success":
+
+                actual_result = result.get(
+                    "result"
+                )
+
+                if isinstance(
+                    actual_result,
+                    str,
+                ):
+
+                    return actual_result.strip()
+
+                if actual_result is not None:
+
+                    return str(
+                        actual_result
+                    )
+
+                verification = result.get(
+                    "verification"
+                )
+
+                if isinstance(
+                    verification,
+                    dict,
+                ):
+
+                    reason = verification.get(
+                        "reason"
+                    )
+
+                    if reason:
+
+                        return str(
+                            reason
+                        )
+
+                return (
+                    "The action completed successfully."
+                )
+
+            # -------------------------------------------------
+            # Unknown dictionary
+            # -------------------------------------------------
+
+            return str(result)
+
+        return str(result)
+
+    # =========================================================
+    # MULTI-STEP SUMMARY
+    # =========================================================
+
+    def _summarize_results(
+        self,
+        results,
+    ) -> str:
+
+        if not results:
+
+            return (
+                "The task completed."
+            )
+
+        successful = []
+
+        for item in results:
+
+            raw_result = item.get(
+                "result"
+            )
+
+            # -------------------------------------------------
+            # Structured ToolExecutor result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                dict,
+            ):
+
+                status = raw_result.get(
+                    "status"
+                )
+
+                if status == "success":
+
+                    actual_result = (
+                        raw_result.get(
+                            "result"
+                        )
+                    )
+
+                    if actual_result is not None:
+
+                        text = str(
+                            actual_result
+                        ).strip()
+
+                        if text:
+
+                            successful.append(
+                                text
+                            )
+
+                        continue
+
+                    verification = (
+                        raw_result.get(
+                            "verification"
+                        )
+                    )
+
+                    if isinstance(
+                        verification,
+                        dict,
+                    ):
+
+                        reason = (
+                            verification.get(
+                                "reason"
+                            )
+                        )
+
+                        if reason:
+
+                            successful.append(
+                                str(
+                                    reason
+                                ).strip()
+                            )
+
+                continue
+
+            # -------------------------------------------------
+            # Plain string result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                str,
+            ):
+
+                cleaned = (
+                    raw_result.strip()
+                )
+
+                if cleaned:
+
+                    successful.append(
+                        cleaned
+                    )
+
+        # -----------------------------------------------------
+        # No readable result
+        # -----------------------------------------------------
+
+        if not successful:
+
+            return (
+                "Done. The requested actions "
+                "were completed and verified."
+            )
+
+        # -----------------------------------------------------
+        # One result
+        # -----------------------------------------------------
+
+        if len(successful) == 1:
+
+            return successful[0]
+
+        # -----------------------------------------------------
+        # Multiple results
+        # -----------------------------------------------------
+
+        lines = [
+            "Done. I completed the requested actions:"
+        ]
+
+        for result in successful:
+
+            lines.append(
+                f"• {result}"
+            )
+
+        return "\n".join(
+            lines
+        )
+
+    # =========================================================
+    # CONVERSATION CONTEXT
+    # =========================================================
+
+    def _update_context(
+        self,
+        user_input: str,
+        response: str,
+    ) -> None:
+
+        self.context.add_user(
+            user_input
+        )
+
+        if response:
+
+            self.context.add_assistant(
+                response
+            )
+
+    # =========================================================
+    # SHUTDOWN
+    # =========================================================
+
+    def close(self):
+
+        if self.ai is not None:
+
+            try:
+
+                self.ai.unload_model()
+
+            except Exception:
+
+                pass

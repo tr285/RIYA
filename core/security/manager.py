@@ -1,0 +1,71 @@
+from dataclasses import dataclass
+
+
+@dataclass
+class SecurityDecision:
+    """Result of a RIYA security check."""
+
+    allowed: bool
+    requires_confirmation: bool
+    reason: str = ""
+
+
+class SecurityManager:
+    """RIYA security and permission layer."""
+
+    SAFE_ACTIONS = {
+        "current_time",
+        "battery_status",
+        "system_information",
+        "take_screenshot",
+        "set_volume",
+        "mute_volume",
+        "unmute_volume",
+        "open_application",
+        "close_application",
+
+        "list_files",
+        "find_files",
+        "read_file",
+
+        "recall_memory",
+        "list_memories",
+    }
+
+    CONFIRMATION_ACTIONS = {
+        "create_folder",
+        "write_file",
+
+        "remember",
+
+        "delete_file",
+        "delete_folder",
+        "send_message",
+        "send_email",
+        "shutdown",
+        "restart",
+        "lock_screen",
+    }
+
+    def check(self, tool_name: str) -> SecurityDecision:
+        """Check whether a tool is allowed to execute."""
+
+        if tool_name in self.SAFE_ACTIONS:
+            return SecurityDecision(
+                allowed=True,
+                requires_confirmation=False,
+                reason="Safe action.",
+            )
+
+        if tool_name in self.CONFIRMATION_ACTIONS:
+            return SecurityDecision(
+                allowed=True,
+                requires_confirmation=True,
+                reason="This action requires user confirmation.",
+            )
+
+        return SecurityDecision(
+            allowed=False,
+            requires_confirmation=False,
+            reason="Unknown or unauthorized tool.",
+        )
