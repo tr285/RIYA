@@ -1,0 +1,112 @@
+from pathlib import Path
+
+from core.config.settings import DEVELOPER_NAME
+
+from core.ai.runtime import AIRuntime
+from core.ai.native.llama_runtime import NativeLlamaRuntime
+
+
+class LocalLlamaRuntime(AIRuntime):
+    """
+    RIYA local AI runtime.
+
+    Uses the native llama.cpp runtime directly.
+    No server, Ollama, API, or network connection is required.
+    """
+
+    def __init__(
+        self,
+        context_size: int = 4096,
+        max_tokens: int = 128,
+        backend: str = "auto",
+    ):
+        if backend not in {"auto", "metal", "cpu"}:
+            raise ValueError(
+                f"Unsupported backend '{backend}'. "
+                "Choose 'auto', 'metal', or 'cpu'."
+            )
+
+        self.context_size = context_size
+        self.max_tokens = max_tokens
+        self.backend = backend
+        self._runtime = None
+
+    def load_model(
+        self,
+        model_path: str,
+    ) -> None:
+
+        model_path = (
+            Path(model_path)
+            .expanduser()
+            .resolve()
+        )
+
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Local RIYA model not found: "
+                f"{model_path}"
+            )
+
+        self.unload_model()
+        self._runtime = NativeLlamaRuntime(
+            str(model_path),
+            context_size=self.context_size,
+            backend=self.backend,
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        conversation_context: str | None = None,
+    ) -> str:
+
+        if self._runtime is None:
+            raise RuntimeError(
+                "AI runtime is not loaded."
+            )
+
+        context_block = ""
+
+        if conversation_context:
+            context_block = (
+                "\n\nRecent conversation:\n"
+                f"{conversation_context}"
+            )
+
+        full_prompt = (
+            "You are RIYA, an offline-first personal "
+            f"AI assistant created by {DEVELOPER_NAME}. "
+            "Your name is RIYA. "
+            "Answer naturally and helpfully. "
+            "Use the recent conversation when it "
+            "helps resolve references such as "
+            "'it', 'that', 'why', 'this', or "
+            "'the previous one'. "
+            "Do not identify yourself as Qwen or "
+            "another assistant."
+            f"{context_block}\n\n"
+            f"User: {prompt}\n"
+            "RIYA:"
+        )
+
+        return self._runtime.generate(
+            full_prompt,
+            max_tokens=self.max_tokens,
+        )
+
+    def unload_model(self) -> None:
+
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._runtime is not None
+
+    @property
+    def selected_backend(self) -> str:
+        if self._runtime is None:
+            return "unloaded"
+        return self._runtime.backend

@@ -1,8 +1,13 @@
+from typing import Any
+
 from core.agent.planner import Plan
 from core.agent.tool_registry import ToolRegistry
-from core.agent.tool_executor import ToolExecutor
+from core.agent.tool_executor import ToolExecutor, _UNSET
+from core.security.permissions import PermissionManager
 
+from core.device import get_platform_adapter
 from core.device.macos import MacOSPlatform
+from core.device.platform import PlatformAdapter
 
 from core.tools.filesystem.files import (
     list_files,
@@ -10,6 +15,21 @@ from core.tools.filesystem.files import (
     create_folder,
     read_file,
     write_file,
+    inspect_file_metadata,
+)
+from core.tools.filesystem.discovery import (
+    search_files_advanced,
+    file_insights,
+)
+from core.tools.filesystem.extraction import extract_document_text
+from core.tools.filesystem.summarizer import summarize_document
+from core.tools.filesystem.duplicates import find_duplicate_files
+from core.tools.filesystem.organization import (
+    copy_file,
+    move_file,
+    rename_file,
+    delete_file,
+    organize_files,
 )
 
 from core.tools.memory import (
@@ -17,7 +37,61 @@ from core.tools.memory import (
     recall_memory,
     list_memories,
     forget_memory,
+    search_memory,
 )
+from core.tools.compute import (
+    calculate,
+    python_sandbox,
+)
+from core.tools.system.terminal import terminal_command
+from core.tools.database import local_db_query
+from core.browser import (
+    browser_open_local,
+    browser_inspect_page,
+    browser_extract_links,
+    browser_fetch_url,
+    browser_submit_form,
+)
+from core.automation import (
+    desktop_app_details,
+    desktop_app_resources,
+    desktop_app_state,
+    desktop_focus_app,
+    desktop_list_apps,
+    desktop_open_url,
+    desktop_running_apps,
+    desktop_running_apps_detailed,
+    desktop_search_apps,
+    desktop_terminate_app,
+)
+from core.tools.productivity import (
+    create_task,
+    get_task,
+    list_tasks,
+    update_task,
+    complete_task,
+    reopen_task,
+    delete_task,
+    create_reminder,
+    list_reminders,
+    snooze_reminder,
+    cancel_reminder,
+    create_calendar_event,
+    list_calendar_events,
+    get_daily_schedule,
+    get_weekly_schedule,
+    delete_calendar_event,
+    create_note,
+    get_note,
+    list_notes,
+    search_notes,
+    update_note,
+    delete_note,
+    get_daily_plan,
+    get_end_of_day_summary,
+)
+from core.security.manager import RiskLevel
+from core.agent.tool_registry import ToolPermission
 
 
 class RiyaAgent:
@@ -33,23 +107,51 @@ class RiyaAgent:
     - Support multi-step plans
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        identity_manager: Any = None,
+        permission_store: Any = None,
+        permission_manager: Any = None,
+        strict_permissions: bool = False,
+        require_identity: bool = False,
+        default_identity: Any = None,
+        platform: PlatformAdapter | None = None,
+    ):
 
         # =====================================================
         # CORE TOOL SYSTEM
         # =====================================================
 
         self.tools = ToolRegistry()
+        if permission_manager is not None:
+            self.permission_manager = permission_manager
+        elif (
+            identity_manager is not None
+            and hasattr(identity_manager, "database")
+            and hasattr(identity_manager, "validate_session")
+        ):
+            self.permission_manager = PermissionManager(
+                identity_manager,
+                strict_default_deny=strict_permissions,
+            )
+        else:
+            self.permission_manager = None
 
         self.executor = ToolExecutor(
-            self.tools
+            self.tools,
+            identity_manager=identity_manager,
+            permission_store=permission_store,
+            permission_manager=self.permission_manager,
+            require_identity=require_identity,
+            default_identity=default_identity,
         )
 
         # =====================================================
         # PLATFORM
         # =====================================================
 
-        self.platform = MacOSPlatform()
+        self.platform = platform if platform is not None else get_platform_adapter()
 
         # =====================================================
         # REGISTER TOOLS
@@ -60,6 +162,12 @@ class RiyaAgent:
         self._register_filesystem_tools()
 
         self._register_memory_tools()
+
+        self._register_compute_and_data_tools()
+
+        self._register_browser_and_desktop_tools()
+
+        self._register_productivity_tools()
 
     # =========================================================
     # PLATFORM TOOLS
@@ -155,12 +263,116 @@ class RiyaAgent:
         )
 
         self.tools.register(
+            name="storage_status",
+            description=(
+                "Get available and total disk storage space."
+            ),
+            function=self.platform.storage_status,
+            parameters={"path"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.info", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="network_status",
+            description=(
+                "Get local network connectivity and interface status without probing external servers."
+            ),
+            function=self.platform.network_status,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.info", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="check_application",
+            description=(
+                "Check whether a specific application is installed or list installed applications with bundle metadata."
+            ),
+            function=self.platform.check_application,
+            parameters={"app_name"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.info", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="platform_capabilities",
+            description=(
+                "Describe the current operating system platform and supported native capabilities."
+            ),
+            function=self.platform.describe_capabilities_text,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.info", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="system",
+        )
+
+        self.tools.register(
             name="lock_screen",
             description=(
                 "Lock the Mac screen."
             ),
             function=self.platform.lock_screen,
             parameters=set(),
+        )
+
+        self.tools.register(
+            name="clipboard_read",
+            description=(
+                "Read plain text from the local system clipboard on explicit request."
+            ),
+            function=self.platform.clipboard_read,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.clipboard", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="clipboard_write",
+            description=(
+                "Write plain text to the local system clipboard after confirmation."
+            ),
+            function=self.platform.clipboard_write,
+            parameters={"text"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("system.clipboard", RiskLevel.MEDIUM, True),
+            timeout_seconds=5.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="send_notification",
+            description=(
+                "Send a local operating-system notification."
+            ),
+            function=self.platform.send_notification,
+            parameters={"title", "message", "subtitle"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("system.notification", RiskLevel.LOW, False),
+            timeout_seconds=6.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="active_window_info",
+            description=(
+                "Get the frontmost application and active window title when Accessibility permission is available."
+            ),
+            function=self.platform.active_window_info,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=6.0,
+            category="desktop",
         )
 
     # =========================================================
@@ -226,6 +438,155 @@ class RiyaAgent:
             },
         )
 
+        self.tools.register(
+            name="inspect_file_metadata",
+            description=(
+                "Inspect file or directory metadata (type, size, modified time, permissions) inside allowed roots."
+            ),
+            function=self.platform.inspect_file_metadata,
+            parameters={"path"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="filesystem",
+        )
+
+        # ---- Milestone 6.3: Intelligent File Management ----
+
+        self.tools.register(
+            name="search_files_advanced",
+            description=(
+                "Search files using natural language or structured filters (extension, category, "
+                "size, date, keyword). Returns a JSON list of matching files."
+            ),
+            function=search_files_advanced,
+            parameters={"query", "path", "category", "sort_by", "limit", "recursive",
+                        "include_hidden", "modified_within_days", "min_size_bytes", "max_size_bytes"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=30.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="extract_document_text",
+            description=(
+                "Extract text or metadata from a document or file "
+                "(PDF, DOCX, TXT, CSV, XLSX, JSON, XML, images, WAV). "
+                "Returns extracted text as a string."
+            ),
+            function=extract_document_text,
+            parameters={"path", "max_chars"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=30.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="summarize_document",
+            description=(
+                "Summarize a document using RIYA's local offline AI model. "
+                "Never calls cloud services. Returns a factual summary string."
+            ),
+            function=summarize_document,
+            parameters={"path", "focus"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=60.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="find_duplicate_files",
+            description=(
+                "Scan a directory for duplicate files using SHA-256 hashing. "
+                "Returns a JSON report of duplicate groups and wasted bytes. Never deletes files."
+            ),
+            function=find_duplicate_files,
+            parameters={"path", "recursive", "min_size_bytes"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=60.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="file_insights",
+            description=(
+                "Show high-level directory statistics: total files, total bytes, largest files, "
+                "most recent files, oldest files, and category distribution."
+            ),
+            function=file_insights,
+            parameters={"path", "top_n"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("filesystem.read", RiskLevel.LOW, False),
+            timeout_seconds=15.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="copy_file",
+            description="Copy a file to a new location inside allowed paths. Requires confirmation.",
+            function=copy_file,
+            parameters={"source_path", "destination_path"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("filesystem.create", RiskLevel.MEDIUM, True),
+            timeout_seconds=30.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="move_file",
+            description="Move a file to a new location inside allowed paths. Requires confirmation.",
+            function=move_file,
+            parameters={"source_path", "destination_path"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("filesystem.modify", RiskLevel.MEDIUM, True),
+            timeout_seconds=30.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="rename_file",
+            description="Rename a file within its current directory. Requires confirmation.",
+            function=rename_file,
+            parameters={"source_path", "new_name"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("filesystem.modify", RiskLevel.MEDIUM, True),
+            timeout_seconds=15.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="delete_file",
+            description=(
+                "Permanently delete a single file inside allowed paths. "
+                "High risk; requires filesystem.delete permission and explicit confirmation."
+            ),
+            function=delete_file,
+            parameters={"source_path"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("filesystem.delete", RiskLevel.HIGH, True),
+            timeout_seconds=15.0,
+            category="filesystem",
+        )
+
+        self.tools.register(
+            name="organize_files",
+            description=(
+                "Preview or execute bulk file organization inside a directory. "
+                "Strategies: by_category, by_extension, by_date, custom. "
+                "Always previews first; execution requires confirmation."
+            ),
+            function=organize_files,
+            parameters={"path", "strategy", "execute", "custom_rules_json"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("filesystem.modify", RiskLevel.MEDIUM, True),
+            timeout_seconds=60.0,
+            category="filesystem",
+        )
+
     # =========================================================
     # MEMORY TOOLS
     # =========================================================
@@ -280,6 +641,514 @@ class RiyaAgent:
             },
         )
 
+        self.tools.register(
+            name="search_memory",
+            description=(
+                "Search stored personal memories by keyword or semantic meaning."
+            ),
+            function=search_memory,
+            parameters={
+                "query",
+                "category",
+                "limit",
+            },
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("memory.read", RiskLevel.LOW, False),
+            category="memory",
+        )
+
+    # =========================================================
+    # COMPUTE, SANDBOX, TERMINAL & LOCAL DATABASE TOOLS
+    # =========================================================
+
+    def _register_compute_and_data_tools(self):
+
+        self.tools.register(
+            name="calculate",
+            description=(
+                "Evaluate safe mathematical expressions using pure arithmetic and math functions."
+            ),
+            function=calculate,
+            parameters={"expression"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("compute.calculate", RiskLevel.LOW, False),
+            timeout_seconds=5.0,
+            category="compute",
+        )
+
+        self.tools.register(
+            name="python_sandbox",
+            description=(
+                "Execute validated pure Python analysis snippets in an isolated sandbox subprocess."
+            ),
+            function=python_sandbox,
+            parameters={"code", "timeout_seconds"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("python.sandbox", RiskLevel.HIGH, True, sandboxed=True),
+            timeout_seconds=16.0,
+            category="compute",
+        )
+
+        self.tools.register(
+            name="terminal_command",
+            description=(
+                "Run strictly allowlisted read-only/verification commands (ls, cat, git status/diff/log, pytest, py_compile) inside allowed workspace paths."
+            ),
+            function=terminal_command,
+            parameters={"command", "args", "path"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("terminal.execute", RiskLevel.HIGH, True, sandboxed=True),
+            timeout_seconds=20.0,
+            category="system",
+        )
+
+        self.tools.register(
+            name="local_db_query",
+            description=(
+                "Run a single validated SQLite query or update inside the user's isolated workspace database."
+            ),
+            function=local_db_query,
+            parameters={"sql", "db_name"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("database.local", RiskLevel.MEDIUM, True, sandboxed=True),
+            timeout_seconds=10.0,
+            category="data",
+        )
+
+    # =========================================================
+    # BROWSER & DESKTOP INTERACTION TOOLS
+    # =========================================================
+
+    def _register_browser_and_desktop_tools(self):
+
+        self.tools.register(
+            name="browser_open_local",
+            description=(
+                "Open and safely inspect a local HTML or document file inside allowed roots."
+            ),
+            function=browser_open_local,
+            parameters={"path"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("browser.interact", RiskLevel.MEDIUM, True),
+            timeout_seconds=8.0,
+            category="browser",
+        )
+
+        self.tools.register(
+            name="browser_inspect_page",
+            description=(
+                "Read sanitized text and form metadata from an allowed local HTML page."
+            ),
+            function=browser_inspect_page,
+            parameters={"path"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("browser.interact", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="browser",
+        )
+
+        self.tools.register(
+            name="browser_extract_links",
+            description=(
+                "Extract sanitized links from an allowed local HTML page."
+            ),
+            function=browser_extract_links,
+            parameters={"path"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("browser.interact", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="browser",
+        )
+
+        self.tools.register(
+            name="browser_fetch_url",
+            description=(
+                "Fetch a public HTTP/HTTPS web page (offline-blocked by default unless online browsing and domain permissions are granted)."
+            ),
+            function=browser_fetch_url,
+            parameters={"url"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("browser.interact", RiskLevel.HIGH, True),
+            timeout_seconds=12.0,
+            category="browser",
+            offline_safe=False,
+        )
+
+        self.tools.register(
+            name="browser_submit_form",
+            description=(
+                "Submit non-sensitive form fields to a permitted public HTTP/HTTPS endpoint after confirmation (offline-blocked by default)."
+            ),
+            function=browser_submit_form,
+            parameters={"url", "fields_json"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("browser.interact", RiskLevel.HIGH, True),
+            timeout_seconds=12.0,
+            category="browser",
+            offline_safe=False,
+        )
+
+        self.tools.register(
+            name="desktop_list_apps",
+            description=(
+                "List installed local desktop applications."
+            ),
+            function=desktop_list_apps,
+            parameters={"filter_text"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_running_apps",
+            description=(
+                "List currently running non-background desktop applications."
+            ),
+            function=desktop_running_apps,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_app_state",
+            description=(
+                "Check whether a local desktop application is running, frontmost, or not running."
+            ),
+            function=desktop_app_state,
+            parameters={"app_name"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_focus_app",
+            description=(
+                "Bring a running desktop application to the foreground after user confirmation."
+            ),
+            function=desktop_focus_app,
+            parameters={"app_name"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("desktop.automate", RiskLevel.MEDIUM, True),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_search_apps",
+            description=(
+                "Search installed applications by name, bundle ID, or keyword."
+            ),
+            function=desktop_search_apps,
+            parameters={"query"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_app_details",
+            description=(
+                "Get detailed installation, version, and bundle metadata for an application."
+            ),
+            function=desktop_app_details,
+            parameters={"app_name"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_running_apps_detailed",
+            description=(
+                "List currently running applications with process IDs and memory telemetry."
+            ),
+            function=desktop_running_apps_detailed,
+            parameters=set(),
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_app_resources",
+            description=(
+                "Inspect CPU and memory resource consumption of a running application."
+            ),
+            function=desktop_app_resources,
+            parameters={"app_name"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("desktop.automate", RiskLevel.LOW, False),
+            timeout_seconds=8.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_terminate_app",
+            description=(
+                "Gracefully terminate a running desktop application after user confirmation."
+            ),
+            function=desktop_terminate_app,
+            parameters={"app_name"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("system.close_app", RiskLevel.MEDIUM, True),
+            timeout_seconds=10.0,
+            category="desktop",
+        )
+
+        self.tools.register(
+            name="desktop_open_url",
+            description=(
+                "Open a validated URL in the default or specified web browser after user confirmation."
+            ),
+            function=desktop_open_url,
+            parameters={"url", "browser"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("browser.interact", RiskLevel.MEDIUM, True),
+            timeout_seconds=10.0,
+            category="desktop",
+        )
+
+    # =========================================================
+    # PERSONAL PRODUCTIVITY TOOLS (PHASE 6.6)
+    # =========================================================
+
+    def _register_productivity_tools(self):
+        # Tasks
+        self.tools.register(
+            name="create_task",
+            description="Create a new personal task with title, priority, due date, category, and optional recurrence.",
+            function=create_task,
+            parameters={"title", "description", "priority", "due_date", "category", "recurrence"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="get_task",
+            description="Retrieve details of a personal task by its ID.",
+            function=get_task,
+            parameters={"task_id"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="list_tasks",
+            description="List personal tasks with optional status, category, priority, and overdue filters.",
+            function=list_tasks,
+            parameters={"status", "category", "priority", "overdue_only", "limit"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="update_task",
+            description="Update task fields including title, description, status, priority, or due date.",
+            function=update_task,
+            parameters={"task_id", "title", "description", "status", "priority", "due_date"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="complete_task",
+            description="Mark a task as completed.",
+            function=complete_task,
+            parameters={"task_id"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="reopen_task",
+            description="Reopen a completed or cancelled task.",
+            function=reopen_task,
+            parameters={"task_id"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="delete_task",
+            description="Permanently delete a task. High-risk; requires confirmation.",
+            function=delete_task,
+            parameters={"task_id"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("productivity.delete", RiskLevel.HIGH, True),
+            category="productivity",
+        )
+
+        # Reminders
+        self.tools.register(
+            name="create_reminder",
+            description="Schedule a reminder for a specific date and time, optionally recurring or linked to a task.",
+            function=create_reminder,
+            parameters={"title", "trigger_at", "recurring_rule", "task_id"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="list_reminders",
+            description="List scheduled reminders for the active user.",
+            function=list_reminders,
+            parameters={"status", "due_before", "limit"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="snooze_reminder",
+            description="Snooze an active reminder by a specified number of minutes.",
+            function=snooze_reminder,
+            parameters={"reminder_id", "minutes"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="cancel_reminder",
+            description="Cancel a scheduled reminder. High-risk; requires confirmation.",
+            function=cancel_reminder,
+            parameters={"reminder_id"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("productivity.delete", RiskLevel.HIGH, True),
+            category="productivity",
+        )
+
+        # Calendar
+        self.tools.register(
+            name="create_calendar_event",
+            description="Schedule a calendar event with start/end time, location, and conflict detection.",
+            function=create_calendar_event,
+            parameters={"title", "start_time", "end_time", "description", "location", "recurrence"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="list_calendar_events",
+            description="List calendar events in a date/time window.",
+            function=list_calendar_events,
+            parameters={"start_after", "end_before", "limit"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="get_daily_schedule",
+            description="Get the full calendar event schedule for a specific day.",
+            function=get_daily_schedule,
+            parameters={"date_str"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="get_weekly_schedule",
+            description="Get the 7-day calendar schedule starting on a given date.",
+            function=get_weekly_schedule,
+            parameters={"start_date_str"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="delete_calendar_event",
+            description="Delete/cancel a calendar event. High-risk; requires confirmation.",
+            function=delete_calendar_event,
+            parameters={"event_id"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("productivity.delete", RiskLevel.HIGH, True),
+            category="productivity",
+        )
+
+        # Notes
+        self.tools.register(
+            name="create_note",
+            description="Create a personal markdown note with title, content, category, tags, and optional pinning.",
+            function=create_note,
+            parameters={"title", "content", "category", "tags", "pinned", "linked_task_id", "linked_event_id"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="get_note",
+            description="Retrieve a note by its ID.",
+            function=get_note,
+            parameters={"note_id"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="list_notes",
+            description="List personal notes with category or pinned filters.",
+            function=list_notes,
+            parameters={"category", "pinned_only", "include_archived", "limit"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="search_notes",
+            description="Search notes by query keywords in title, body, or tags.",
+            function=search_notes,
+            parameters={"query", "limit"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="update_note",
+            description="Update an existing note's title, content, category, tags, or pinned/archived state.",
+            function=update_note,
+            parameters={"note_id", "title", "content", "category", "tags", "pinned", "archived"},
+            risk_level=RiskLevel.MEDIUM,
+            permission=ToolPermission("productivity.write", RiskLevel.MEDIUM, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="delete_note",
+            description="Permanently delete a note. High-risk; requires confirmation.",
+            function=delete_note,
+            parameters={"note_id"},
+            risk_level=RiskLevel.HIGH,
+            permission=ToolPermission("productivity.delete", RiskLevel.HIGH, True),
+            category="productivity",
+        )
+
+        # Daily Planning & Summaries
+        self.tools.register(
+            name="get_daily_plan",
+            description="Synthesize daily schedule, prioritized tasks, and active reminders into a cohesive agenda.",
+            function=get_daily_plan,
+            parameters={"date_str"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+        self.tools.register(
+            name="get_end_of_day_summary",
+            description="Generate a markdown summary of daily productivity, completed tasks, and upcoming deadlines.",
+            function=get_end_of_day_summary,
+            parameters={"date_str"},
+            risk_level=RiskLevel.LOW,
+            permission=ToolPermission("productivity.read", RiskLevel.LOW, False),
+            category="productivity",
+        )
+
     # =========================================================
     # PLANNING
     # =========================================================
@@ -320,6 +1189,15 @@ class RiyaAgent:
 
         return self.tools.list_tools()
 
+    def set_identity(self, identity: Any) -> None:
+        """Bind or clear the active authenticated identity on the central executor."""
+
+        self.executor.set_identity(identity)
+
+    @property
+    def current_identity(self):
+        return self.executor._active_identity
+
     # =========================================================
     # SINGLE TOOL EXECUTION
     # =========================================================
@@ -327,7 +1205,8 @@ class RiyaAgent:
     def execute(
         self,
         tool_name: str,
-        confirm: bool = False,
+        confirmation_token: str | None = None,
+        user_context: Any = _UNSET,
         **parameters,
     ):
         """
@@ -339,7 +1218,8 @@ class RiyaAgent:
 
         return self.executor.execute(
             tool_name,
-            confirm=confirm,
+            confirmation_token=confirmation_token,
+            user_context=user_context,
             **parameters,
         )
 
@@ -350,7 +1230,7 @@ class RiyaAgent:
     def execute_plan(
         self,
         plan,
-        confirm: bool = False,
+        user_context: Any = _UNSET,
     ):
         """
         Execute a complete multi-step RIYA plan.
@@ -366,8 +1246,16 @@ class RiyaAgent:
 
         return self.executor.execute_plan(
             plan,
-            confirm=confirm,
+            user_context=user_context,
         )
+
+    def cancel_confirmation(
+        self,
+        confirmation_token: str | None,
+    ) -> None:
+        """Cancel a pending confirmation through the central executor."""
+
+        self.executor.cancel_confirmation(confirmation_token)
 
     # =========================================================
     # SIMPLE DECISION + EXECUTION
@@ -377,6 +1265,7 @@ class RiyaAgent:
         self,
         request: str,
         ai_runtime,
+        user_context: Any = _UNSET,
     ):
         """
         Use the AI decision engine for a request.
@@ -400,7 +1289,23 @@ class RiyaAgent:
         if decision.tool is None:
             return None
 
+        if (
+            not isinstance(decision.tool, str)
+            or not isinstance(decision.parameters, dict)
+            or not all(isinstance(key, str) for key in decision.parameters)
+        ):
+            raise ValueError(
+                "Tool decisions cannot supply invalid parameter structures."
+            )
+
+        self.tools.validate_parameters(
+            decision.tool,
+            decision.parameters,
+        )
+
         return self.execute(
             decision.tool,
+            confirmation_token=None,
+            user_context=user_context,
             **decision.parameters,
         )

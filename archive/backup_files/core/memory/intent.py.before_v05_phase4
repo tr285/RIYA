@@ -1,0 +1,419 @@
+from dataclasses import dataclass
+from enum import Enum
+
+
+class MemoryIntentType(str, Enum):
+
+    NONE = "none"
+    REMEMBER = "remember"
+    RECALL = "recall"
+    FORGET = "forget"
+    LIST = "list"
+
+
+@dataclass
+class MemoryIntent:
+
+    type: MemoryIntentType
+    category: str | None = None
+    key: str | None = None
+    value: str | None = None
+
+
+class MemoryIntentDetector:
+
+    REMEMBER_PREFIXES = (
+        "remember that ",
+        "remember ",
+        "save that ",
+        "save ",
+        "store that ",
+        "store ",
+        "keep in mind that ",
+        "keep in mind ",
+        "don't forget that ",
+        "dont forget that ",
+    )
+
+    RECALL_PREFIXES = (
+        "what do you remember about ",
+        "what do you remember ",
+        "do you remember ",
+        "recall ",
+        "tell me what you remember about ",
+    )
+
+    FORGET_PREFIXES = (
+        "forget that ",
+        "forget ",
+        "remove the memory of ",
+        "delete the memory of ",
+    )
+
+    LIST_PHRASES = {
+        "list my memories",
+        "show my memories",
+        "show me my memories",
+        "what do you remember about me",
+        "what do you remember about me?",
+        "what do you know about me",
+        "what do you know about me?",
+    }
+
+    def detect(
+        self,
+        text: str,
+    ) -> MemoryIntent:
+
+        text = text.strip()
+
+        if not text:
+            return MemoryIntent(
+                MemoryIntentType.NONE
+            )
+
+        normalized = text.lower()
+
+        # PERSONAL MEMORY RECALL
+        personal_question = normalized.rstrip(" ?.!")
+
+        personal_recall_questions = {
+            "what is my name",
+            "what's my name",
+            "what is my full name",
+            "who am i",
+            "tell me my name",
+            "do you know my name",
+        }
+
+        if personal_question in personal_recall_questions:
+            return MemoryIntent(
+                type=MemoryIntentType.RECALL,
+                category="personal",
+                key="my_name",
+            )
+
+        # LIST
+        if normalized in self.LIST_PHRASES:
+
+            return MemoryIntent(
+                MemoryIntentType.LIST
+            )
+
+        # REMEMBER
+        for prefix in self.REMEMBER_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return (
+                        self._build_remember_intent(
+                            content
+                        )
+                    )
+
+        # FORGET
+        for prefix in self.FORGET_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.FORGET
+                        ),
+                        category="general",
+                        key=self._make_key(
+                            content
+                        ),
+                    )
+
+        # RECALL
+        for prefix in self.RECALL_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.RECALL
+                        ),
+                        category="general",
+                        key=self._make_key(
+                            content
+                        ),
+                    )
+
+        return MemoryIntent(
+            MemoryIntentType.NONE
+        )
+
+    def _build_remember_intent(
+        self,
+        content: str,
+    ) -> MemoryIntent:
+
+        category = "general"
+
+        key = self._make_key(
+            content
+        )
+
+        value = content
+
+        lowered = content.lower()
+
+        # ------------------------------------------
+        # "X is Y"
+        # ------------------------------------------
+
+        markers = (
+            " is ",
+            " are ",
+            " = ",
+        )
+
+        for marker in markers:
+
+            index = lowered.find(marker)
+
+            if index > 0:
+
+                left = content[
+                    :index
+                ].strip()
+
+                right = content[
+                    index + len(marker):
+                ].strip()
+
+                if left and right:
+
+                    key = self._make_key(
+                        left
+                    )
+
+                    value = right
+
+                    category = (
+                        self._infer_category(
+                            left
+                        )
+                    )
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.REMEMBER
+                        ),
+                        category=category,
+                        key=key,
+                        value=value,
+                    )
+
+        # ------------------------------------------
+        # "I prefer X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i prefer "
+        ):
+
+            value = content[
+                len("I prefer "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="preferred",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "I like X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i like "
+        ):
+
+            value = content[
+                len("I like "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="likes",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "I don't like X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i don't like "
+        ):
+
+            value = content[
+                len("I don't like "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="dislikes",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "My favorite X is Y"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "my favorite "
+        ):
+
+            marker = " is "
+
+            index = lowered.find(
+                marker
+            )
+
+            if index > 0:
+
+                left = content[
+                    len("My favorite "):
+                    index
+                ].strip()
+
+                right = content[
+                    index + len(marker):
+                ].strip()
+
+                if left and right:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.REMEMBER
+                        ),
+                        category="preferences",
+                        key=(
+                            "favorite_"
+                            + self._make_key(
+                                left
+                            )
+                        ),
+                        value=right,
+                    )
+
+        return MemoryIntent(
+            type=MemoryIntentType.REMEMBER,
+            category=category,
+            key=key,
+            value=value,
+        )
+
+    def _infer_category(
+        self,
+        text: str,
+    ) -> str:
+
+        lowered = text.lower()
+
+        if any(
+            word in lowered
+            for word in (
+                "favorite",
+                "favourite",
+                "prefer",
+                "preference",
+                "like",
+                "dislike",
+            )
+        ):
+            return "preferences"
+
+        if any(
+            word in lowered
+            for word in (
+                "project",
+                "application",
+                "app",
+                "software",
+            )
+        ):
+            return "projects"
+
+        if any(
+            word in lowered
+            for word in (
+                "job",
+                "work",
+                "company",
+                "office",
+            )
+        ):
+            return "work"
+
+        if any(
+            word in lowered
+            for word in (
+                "name",
+                "birthday",
+                "location",
+                "city",
+            )
+        ):
+            return "personal"
+
+        return "general"
+
+    def _make_key(
+        self,
+        text: str,
+    ) -> str:
+
+        words = []
+
+        for word in text.lower().split():
+
+            cleaned = "".join(
+                character
+                for character in word
+                if character.isalnum()
+            )
+
+            if cleaned:
+                words.append(
+                    cleaned
+                )
+
+        if not words:
+            return "memory"
+
+        return "_".join(
+            words[:8]
+        )

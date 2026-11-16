@@ -1,6 +1,7 @@
 #include "llama.h"
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -10,24 +11,31 @@ struct RiyaContext {
     llama_model * model;
     llama_context * context;
     const llama_vocab * vocab;
+    std::string backend;
 };
 
-RiyaContext * riya_load_model(
+
+static RiyaContext * riya_load_model_internal(
     const char * model_path,
-    int32_t context_size
+    int32_t context_size,
+    int32_t gpu_layers,
+    const char * backend_name
 ) {
     if (model_path == nullptr || context_size <= 0) {
         return nullptr;
     }
 
+    static std::once_flag backend_init_flag;
+    std::call_once(backend_init_flag, []() {
+        llama_backend_init();
+    });
+
     llama_model_params model_params =
         llama_model_default_params();
+    model_params.n_gpu_layers = gpu_layers;
 
     llama_model * model =
-        llama_model_load_from_file(
-            model_path,
-            model_params
-        );
+        llama_model_load_from_file(model_path, model_params);
 
     if (model == nullptr) {
         return nullptr;
@@ -35,15 +43,11 @@ RiyaContext * riya_load_model(
 
     llama_context_params context_params =
         llama_context_default_params();
-
     context_params.n_ctx = context_size;
     context_params.n_batch = context_size;
 
     llama_context * context =
-        llama_init_from_model(
-            model,
-            context_params
-        );
+        llama_init_from_model(model, context_params);
 
     if (context == nullptr) {
         llama_model_free(model);
@@ -53,8 +57,65 @@ RiyaContext * riya_load_model(
     return new RiyaContext{
         model,
         context,
-        llama_model_get_vocab(model)
+        llama_model_get_vocab(model),
+        backend_name
     };
+}
+
+RiyaContext * riya_load_model_with_backend(
+    const char * model_path,
+    int32_t context_size,
+    const char * backend_mode
+) {
+    if (backend_mode == nullptr) {
+        return nullptr;
+    }
+
+    if (std::strcmp(backend_mode, "metal") == 0) {
+        return riya_load_model_internal(
+            model_path, context_size, -1, "metal"
+        );
+    }
+
+    if (std::strcmp(backend_mode, "cpu") == 0) {
+        return riya_load_model_internal(
+            model_path, context_size, 0, "cpu"
+        );
+    }
+
+    if (std::strcmp(backend_mode, "auto") == 0) {
+        RiyaContext * handle = riya_load_model_internal(
+            model_path, context_size, -1, "metal"
+        );
+
+        if (handle != nullptr) {
+            return handle;
+        }
+
+        return riya_load_model_internal(
+            model_path, context_size, 0, "cpu"
+        );
+    }
+
+    return nullptr;
+}
+
+// Preserve the original two-argument API.
+RiyaContext * riya_load_model(
+    const char * model_path,
+    int32_t context_size
+) {
+    return riya_load_model_with_backend(
+        model_path, context_size, "metal"
+    );
+}
+
+const char * riya_get_backend(RiyaContext * handle) {
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    return handle->backend.c_str();
 }
 
 void riya_free_model(RiyaContext * handle) {
@@ -104,63 +165,57 @@ static std::string build_chat_prompt(
     RiyaContext * handle,
     const char * user_prompt
 ) {
-    const char * tmpl =
-        llama_model_chat_template(
-            handle->model,
-            nullptr
-        );
-
-    if (tmpl == nullptr || user_prompt == nullptr) {
-        return std::string(
-            "You are RIYA, an offline-first personal "
-            "AI assistant created by Tularam. "
-            "Your name is RIYA.\n\n"
-            "User: "
-        ) + (user_prompt ? user_prompt : "") +
-            "\nRIYA:";
+    if (handle == nullptr || user_prompt == nullptr) {
+        return "";
     }
 
-    llama_chat_message message;
+    const char * tmpl =
+        llama_model_chat_template(handle->model, nullptr);
 
-    message.role = "user";
-    message.content = user_prompt;
+    const char * system_prompt =
+        "You are RIYA, an offline-first personal AI assistant "
+        "created by Tularam. Your name is RIYA. "
+        "Answer naturally, accurately, and helpfully. "
+        "You can explain code and generate code, read and edit files within authorized roots, "
+        "and execute commands only if an authorized execution tool exists and confirmation is granted for sensitive operations. "
+        "Never claim execution occurred when it did not and never bypass security permissions. "
+        "Never identify yourself as Qwen or another assistant.";
 
-    int32_t required =
-        llama_chat_apply_template(
-            tmpl,
-            &message,
-            1,
-            true,
-            nullptr,
-            0
-        );
+    if (tmpl == nullptr) {
+        return std::string(system_prompt) + "\n\nUser: " + user_prompt + "\nRIYA:";
+    }
+
+    llama_chat_message messages[2];
+
+    messages[0].role = "system";
+    messages[0].content = system_prompt;
+
+    messages[1].role = "user";
+    messages[1].content = user_prompt;
+
+    int32_t required = llama_chat_apply_template(
+        tmpl, messages, 2, true, nullptr, 0
+    );
 
     if (required <= 0) {
-        return std::string(
-            "User: "
-        ) + user_prompt +
-            "\nRIYA:";
+        return std::string(system_prompt) + "\n\nUser: " + user_prompt + "\nRIYA:";
     }
 
     std::vector<char> buffer(
         static_cast<size_t>(required) + 1
     );
 
-    int32_t written =
-        llama_chat_apply_template(
-            tmpl,
-            &message,
-            1,
-            true,
-            buffer.data(),
-            static_cast<int32_t>(buffer.size())
-        );
+    int32_t written = llama_chat_apply_template(
+        tmpl,
+        messages,
+        2,
+        true,
+        buffer.data(),
+        static_cast<int32_t>(buffer.size())
+    );
 
     if (written <= 0) {
-        return std::string(
-            "User: "
-        ) + user_prompt +
-            "\nRIYA:";
+        return std::string(system_prompt) + "\n\nUser: " + user_prompt + "\nRIYA:";
     }
 
     return std::string(
@@ -168,6 +223,7 @@ static std::string build_chat_prompt(
         static_cast<size_t>(written)
     );
 }
+
 
 int32_t riya_generate(
     RiyaContext * handle,
@@ -230,7 +286,7 @@ int32_t riya_generate(
             tokens.data(),
             static_cast<int32_t>(tokens.size()),
             true,
-            false
+            true
         );
 
     if (n_prompt_tokens < 0) {
@@ -246,7 +302,7 @@ int32_t riya_generate(
                 tokens.data(),
                 static_cast<int32_t>(tokens.size()),
                 true,
-                false
+                true
             );
     }
 

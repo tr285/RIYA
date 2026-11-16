@@ -1,0 +1,902 @@
+"""Conversational Text + Voice User Interface (framework-independent VM + Tkinter view)."""
+
+from __future__ import annotations
+
+import math
+import queue
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from core.voice.audio_input import list_input_devices, list_output_devices
+from core.voice.config import (
+    RESPONSE_STYLES,
+    SUPPORTED_LANGUAGES,
+    VERIFIED_LANGUAGES,
+    VoiceConfig,
+)
+from core.voice.orchestrator import VoiceOrchestrator
+from core.voice.session import TranscriptEntry
+from core.voice.state import ACTIVE_STATES, VoiceState
+from core.voice.tts import LocalTTS
+
+
+@dataclass(frozen=True)
+class VoiceVisualSnapshot:
+    """Thread-safe snapshot consumed by GUI/CLI views."""
+
+    mode: str
+    voice_state: VoiceState
+    status_label: str
+    microphone_active: bool
+    assistant_speaking: bool
+    audio_level: float
+    waveform_bars: tuple[float, ...]
+    transcript: tuple[TranscriptEntry, ...]
+    error_message: str | None
+    can_interrupt: bool
+    config: VoiceConfig
+
+
+class VoiceUIController:
+    """Connects UI actions cleanly to ``VoiceOrchestrator`` without state leakage."""
+
+    BAR_COUNT = 24
+
+    def __init__(self, orchestrator: VoiceOrchestrator):
+        self.orchestrator = orchestrator
+        self._phase = 0.0
+
+    @staticmethod
+    def status_label_for(state: VoiceState, *, mode: str) -> str:
+        mapping = {
+            VoiceState.IDLE: "Ready (Text mode)" if mode == "text" else "Voice Ready",
+            VoiceState.LISTENING: "Listening...",
+            VoiceState.TRANSCRIBING: "Transcribing speech...",
+            VoiceState.THINKING: "Thinking...",
+            VoiceState.SPEAKING: "Speaking...",
+            VoiceState.INTERRUPTED: "Interrupted",
+            VoiceState.ERROR: "Voice Error",
+            VoiceState.STOPPING: "Stopping voice...",
+        }
+        return mapping.get(state, state.value)
+
+    @staticmethod
+    def language_options() -> list[tuple[str, str]]:
+        """Return (code, honest_display_label) pairs for settings UI."""
+
+        options: list[tuple[str, str]] = []
+        for code, name in SUPPORTED_LANGUAGES.items():
+            if code in VERIFIED_LANGUAGES:
+                options.append((code, f"{name} ({code})"))
+            else:
+                options.append((code, f"{name} ({code} - untested)"))
+        return options
+
+    def advance_waveform(self, state: VoiceState, level: float) -> tuple[float, ...]:
+        """Compute lightweight 24-bar animation envelope without busy polling."""
+
+        self._phase = (self._phase + 0.35) % (2.0 * math.pi)
+        bars: list[float] = []
+        center = (self.BAR_COUNT - 1) / 2.0
+
+        for idx in range(self.BAR_COUNT):
+            dist_scale = 1.0 - 0.55 * (abs(idx - center) / max(1.0, center))
+            if state == VoiceState.LISTENING:
+                amp = 0.14 + 0.86 * min(1.0, max(0.0, level))
+                wave = 0.5 + 0.5 * math.sin(self._phase + idx * 0.45)
+                val = amp * dist_scale * (0.45 + 0.55 * wave)
+            elif state == VoiceState.SPEAKING:
+                amp = 0.22 + 0.78 * min(1.0, max(0.15, level))
+                wave = 0.5 + 0.5 * math.sin(self._phase * 1.4 + idx * 0.55)
+                val = amp * dist_scale * (0.40 + 0.60 * wave)
+            elif state in (VoiceState.TRANSCRIBING, VoiceState.THINKING):
+                pulse = 0.5 + 0.5 * math.sin(self._phase * 0.9 - idx * 0.35)
+                val = 0.15 + 0.35 * pulse * dist_scale
+            elif state == VoiceState.IDLE:
+                val = 0.08 * dist_scale
+            else:
+                val = 0.05
+            bars.append(round(max(0.04, min(1.0, val)), 3))
+        return tuple(bars)
+
+    def snapshot(self) -> VoiceVisualSnapshot:
+        state = self.orchestrator.state
+        mode = self.orchestrator.mode
+        mic_active = self.orchestrator.session.microphone_active
+        speaking = state == VoiceState.SPEAKING or self.orchestrator.player.is_playing
+        if speaking:
+            level = self.orchestrator.player.current_level
+        elif mic_active:
+            level = self.orchestrator.session.microphone_level
+        else:
+            level = 0.0
+
+        return VoiceVisualSnapshot(
+            mode=mode,
+            voice_state=state,
+            status_label=self.status_label_for(state, mode=mode),
+            microphone_active=mic_active,
+            assistant_speaking=speaking,
+            audio_level=level,
+            waveform_bars=self.advance_waveform(state, level),
+            transcript=tuple(self.orchestrator.session.transcript_entries()),
+            error_message=self.orchestrator.last_error,
+            can_interrupt=state in (VoiceState.SPEAKING, VoiceState.THINKING),
+            config=self.orchestrator.config,
+        )
+
+    def submit_text(self, text: str) -> str:
+        return self.orchestrator.send_text(text)
+
+    def toggle_voice_mode(self) -> str:
+        target = "text" if self.orchestrator.mode == "voice" else "voice"
+        return self.orchestrator.switch_mode(target)
+
+    def stop_voice(self) -> None:
+        self.orchestrator.stop_voice_mode()
+
+    def interrupt(self) -> None:
+        self.orchestrator.interrupt("user_ui_interrupt")
+
+    def apply_settings(self, **changes: Any) -> VoiceConfig:
+        new_cfg = self.orchestrator.config.updated(**changes)
+        self.orchestrator.update_config(new_cfg)
+        identity_mgr = getattr(self.orchestrator, "identity_manager", None)
+        resolve_id = getattr(self.orchestrator, "_resolve_active_identity", None)
+        active_identity = resolve_id() if callable(resolve_id) else None
+        if identity_mgr is not None and active_identity is not None:
+            new_cfg.save_for_user(identity_mgr.users_root, active_identity.user_id)
+        else:
+            new_cfg.save()
+        return new_cfg
+
+    def _permission_context(self) -> tuple[Any, Any]:
+        resolve_pm = getattr(self.orchestrator, "_resolve_permission_manager", None)
+        pm = resolve_pm() if callable(resolve_pm) else getattr(
+            self.orchestrator, "permission_manager", None
+        )
+        resolve_id = getattr(self.orchestrator, "_resolve_active_identity", None)
+        identity = resolve_id() if callable(resolve_id) else None
+        if pm is None:
+            raise PermissionError("PermissionManager is not configured.")
+        if identity is None:
+            raise PermissionError("Signed-in user session is required to manage permissions.")
+        return pm, identity
+
+    @staticmethod
+    def permission_catalog():
+        from core.security.permissions import PermissionManager
+
+        return PermissionManager.list_catalog()
+
+    def list_permissions(
+        self,
+        category: str | None = None,
+        *,
+        include_revoked: bool = False,
+    ):
+        pm, identity = self._permission_context()
+        return pm.list_permissions(
+            identity,
+            category=category,
+            include_revoked=include_revoked,
+        )
+
+    def grant_permission(
+        self,
+        permission_key: str,
+        *,
+        decision: str = "allow",
+        lifetime: str = "session",
+        resource_scope: str = "*",
+        ttl_seconds: float | None = None,
+        reason: str = "Granted via RIYA UI",
+        explicit_user_approval: bool = False,
+    ):
+        pm, identity = self._permission_context()
+        return pm.grant_permission(
+            identity,
+            permission_key,
+            decision=decision,
+            lifetime=lifetime,
+            resource_scope=resource_scope,
+            ttl_seconds=ttl_seconds,
+            reason=reason,
+            actor="user_ui",
+            explicit_user_approval=explicit_user_approval,
+        )
+
+    def deny_permission(
+        self,
+        permission_key: str,
+        *,
+        resource_scope: str = "*",
+        lifetime: str = "persistent",
+        ttl_seconds: float | None = None,
+        reason: str = "Denied via RIYA UI",
+    ):
+        pm, identity = self._permission_context()
+        return pm.deny_permission(
+            identity,
+            permission_key,
+            resource_scope=resource_scope,
+            lifetime=lifetime,
+            ttl_seconds=ttl_seconds,
+            reason=reason,
+            actor="user_ui",
+        )
+
+    def revoke_permission(
+        self,
+        permission_key: str,
+        *,
+        resource_scope: str | None = None,
+        grant_id: str | None = None,
+        reason: str = "Revoked via RIYA UI",
+    ) -> int:
+        pm, identity = self._permission_context()
+        return pm.revoke_permission(
+            identity,
+            permission_key,
+            resource_scope=resource_scope,
+            grant_id=grant_id,
+            reason=reason,
+            actor="user_ui",
+        )
+
+    def reset_permissions(
+        self,
+        category: str | None = None,
+        *,
+        reason: str = "Reset via RIYA UI",
+    ) -> int:
+        pm, identity = self._permission_context()
+        return pm.reset_permissions(
+            identity,
+            category=category,
+            reason=reason,
+            actor="user_ui",
+        )
+
+    def audit_history(self, limit: int = 25):
+        pm, identity = self._permission_context()
+        return pm.audit_logger.list_audit_events(identity, limit=limit)
+
+    def current_user_label(self) -> str:
+        resolve_id = getattr(self.orchestrator, "_resolve_active_identity", None)
+        identity = resolve_id() if callable(resolve_id) else None
+        if identity is None:
+            return "Signed out"
+        return f"{identity.display_name} (@{identity.username})"
+
+    def ai_status_summary(self) -> tuple[bool, str]:
+        assistant = getattr(self.orchestrator, "assistant", None)
+        if assistant is None:
+            return False, "AI: Unavailable"
+        ai_rt = getattr(assistant, "ai", None)
+        loaded = bool(getattr(ai_rt, "is_loaded", False) is True)
+        if loaded:
+            backend = str(getattr(ai_rt, "selected_backend", "unknown"))
+            return True, f"AI: Ready ({backend})"
+        reason = getattr(assistant, "ai_unavailable_reason", None)
+        if reason:
+            return False, "AI: Limited Mode"
+        return False, "AI: Not Loaded"
+
+    def list_memories(self) -> list[dict[str, Any]]:
+        assistant = getattr(self.orchestrator, "assistant", None)
+        resolve_id = getattr(self.orchestrator, "_resolve_active_identity", None)
+        identity = resolve_id() if callable(resolve_id) else None
+        if assistant is None or identity is None:
+            return []
+        mgr = getattr(getattr(assistant, "memory", None), "manager", None)
+        if mgr is None:
+            return []
+        scoped = mgr.for_identity(identity)
+        return scoped.list_memories()
+
+    def clear_transcript_history(self) -> None:
+        self.orchestrator.session.clear_transcript()
+
+
+def launch_voice_gui(
+    orchestrator: VoiceOrchestrator,
+    *,
+    coordinator: Any | None = None,
+    on_logout: Callable[[], None] | None = None,
+    root_window: Any | None = None,
+) -> str:
+    """Launch RIYA's offline macOS desktop conversation window (Tkinter).
+
+    Returns ``"logout"`` when exited via Logout, or ``"closed"`` on window close.
+    """
+
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    controller = VoiceUIController(orchestrator)
+    owns_root = root_window is None
+    root = root_window or tk.Tk()
+    root.title("RIYA — Offline Personal AI Assistant")
+    root.geometry("940x700")
+    root.configure(bg="#11141a")
+    exit_action = {"reason": "closed"}
+
+    ui_events: queue.Queue[str] = queue.Queue()
+    observer_cb = lambda: ui_events.put("refresh")
+    orchestrator.add_observer(observer_cb)
+
+    # ---- Header / Mode bar ----------------------------------------------
+    top = tk.Frame(root, bg="#181d26", pady=10, padx=14)
+    top.pack(fill=tk.X)
+
+    title_lbl = tk.Label(
+        top,
+        text="RIYA",
+        fg="#f3f6fb",
+        bg="#181d26",
+        font=("Helvetica", 16, "bold"),
+    )
+    title_lbl.pack(side=tk.LEFT)
+
+    user_var = tk.StringVar(value=controller.current_user_label())
+    tk.Label(
+        top,
+        textvariable=user_var,
+        fg="#93c5fd",
+        bg="#181d26",
+        font=("Helvetica", 10, "bold"),
+    ).pack(side=tk.LEFT, padx=(10, 6))
+
+    ai_ok_init, ai_lbl_init = controller.ai_status_summary()
+    ai_var = tk.StringVar(value=ai_lbl_init)
+    ai_lbl = tk.Label(
+        top,
+        textvariable=ai_var,
+        fg="#10b981" if ai_ok_init else "#fbbf24",
+        bg="#1e293b",
+        padx=8,
+        pady=3,
+        font=("Helvetica", 9, "bold"),
+    )
+    ai_lbl.pack(side=tk.LEFT, padx=4)
+
+    status_var = tk.StringVar(value="Ready (Text mode)")
+    mic_var = tk.StringVar(value="MIC OFF")
+    mic_lbl = tk.Label(
+        top,
+        textvariable=mic_var,
+        fg="#98a2b3",
+        bg="#232a36",
+        padx=10,
+        pady=4,
+        font=("Helvetica", 10, "bold"),
+    )
+    mic_lbl.pack(side=tk.LEFT, padx=(8, 6))
+
+    status_lbl = tk.Label(
+        top,
+        textvariable=status_var,
+        fg="#cbd5e1",
+        bg="#181d26",
+        font=("Helvetica", 11),
+    )
+    status_lbl.pack(side=tk.LEFT, padx=4)
+
+    btn_bar = tk.Frame(root, bg="#151a22", pady=6, padx=14)
+    btn_bar.pack(fill=tk.X)
+
+    logout_btn = ttk.Button(btn_bar, text="Logout")
+    logout_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    diag_btn = ttk.Button(btn_bar, text="System Status")
+    diag_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    memories_btn = ttk.Button(btn_bar, text="Memories")
+    memories_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    perms_btn = ttk.Button(btn_bar, text="Permissions & Trust")
+    perms_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    settings_btn = ttk.Button(btn_bar, text="Settings")
+    settings_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    mode_btn_var = tk.StringVar(value="Start Voice")
+    mode_btn = ttk.Button(btn_bar, textvariable=mode_btn_var)
+    mode_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    interrupt_btn = ttk.Button(btn_bar, text="Interrupt")
+    interrupt_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    # ---- Active voice waveform card -------------------------------------
+    wave_frame = tk.Frame(root, bg="#151a22", pady=8, padx=14)
+    wave_frame.pack(fill=tk.X)
+    canvas = tk.Canvas(
+        wave_frame,
+        height=72,
+        bg="#151a22",
+        highlightthickness=0,
+    )
+    canvas.pack(fill=tk.X)
+
+    err_var = tk.StringVar(value="")
+    err_lbl = tk.Label(
+        root,
+        textvariable=err_var,
+        fg="#fca5a5",
+        bg="#11141a",
+        font=("Helvetica", 10),
+    )
+    err_lbl.pack(fill=tk.X, padx=14)
+
+    # ---- Conversation transcript ----------------------------------------
+    transcript_box = tk.Text(
+        root,
+        wrap=tk.WORD,
+        bg="#0d1015",
+        fg="#e2e8f0",
+        insertbackground="#e2e8f0",
+        relief=tk.FLAT,
+        padx=14,
+        pady=12,
+        font=("Helvetica", 12),
+        state=tk.DISABLED,
+    )
+    transcript_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=(4, 10))
+    transcript_box.tag_configure("user", foreground="#7dd3fc")
+    transcript_box.tag_configure("assistant", foreground="#e2e8f0")
+    transcript_box.tag_configure("meta", foreground="#64748b", font=("Helvetica", 9))
+
+    # ---- Text input bar -------------------------------------------------
+    bottom = tk.Frame(root, bg="#11141a", padx=14, pady=12)
+    bottom.pack(fill=tk.X)
+
+    entry = tk.Entry(
+        bottom,
+        bg="#1b212c",
+        fg="#f8fafc",
+        insertbackground="#f8fafc",
+        relief=tk.FLAT,
+        font=("Helvetica", 12),
+    )
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 8))
+
+    busy_state = {"thinking": False}
+
+    def _on_send(_event=None):
+        text = entry.get().strip()
+        if not text or busy_state["thinking"]:
+            return
+        entry.delete(0, tk.END)
+        busy_state["thinking"] = True
+        status_var.set("Processing...")
+        send_btn.configure(state=tk.DISABLED)
+
+        def _worker():
+            try:
+                controller.submit_text(text)
+            except Exception as exc:
+                err_var.set(str(exc))
+            finally:
+                busy_state["thinking"] = False
+                ui_events.put("refresh")
+
+        threading.Thread(target=_worker, name="riya-ui-turn", daemon=True).start()
+
+    send_btn = ttk.Button(bottom, text="Send", command=_on_send)
+    send_btn.pack(side=tk.RIGHT)
+    entry.bind("<Return>", _on_send)
+
+    def _on_toggle_voice():
+        try:
+            controller.toggle_voice_mode()
+        except Exception as exc:
+            err_var.set(str(exc))
+        _render()
+
+    mode_btn.configure(command=_on_toggle_voice)
+    interrupt_btn.configure(command=lambda: (controller.interrupt(), _render()))
+
+    def _open_settings():
+        win = tk.Toplevel(root)
+        win.title("Voice Settings")
+        win.geometry("460x430")
+        win.configure(bg="#181d26")
+
+        cfg = orchestrator.config
+        in_devs = ["Default"] + [d.name for d in list_input_devices()]
+        out_devs = ["Default"] + [d.name for d in list_output_devices()]
+        lang_opts = controller.language_options()
+        lang_labels = [lbl for _, lbl in lang_opts]
+        lang_codes = [code for code, _ in lang_opts]
+        voice_names = sorted({cfg.voice} | {v["name"] for v in LocalTTS.list_voices()})
+
+        fields_data: list[tuple[str, Any]] = []
+
+        def _row(label_text: str, widget_fn):
+            row = tk.Frame(win, bg="#181d26", pady=4, padx=14)
+            row.pack(fill=tk.X)
+            tk.Label(row, text=label_text, fg="#cbd5e1", bg="#181d26", width=18, anchor="w").pack(side=tk.LEFT)
+            w = widget_fn(row)
+            w.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            fields_data.append((label_text, w))
+
+        in_var = tk.StringVar(value=str(cfg.input_device or "Default"))
+        out_var = tk.StringVar(value=str(cfg.output_device or "Default"))
+        lang_idx = lang_codes.index(cfg.language) if cfg.language in lang_codes else 0
+        lang_var = tk.StringVar(value=lang_labels[lang_idx])
+        voice_var = tk.StringVar(value=cfg.voice)
+        rate_var = tk.IntVar(value=cfg.speech_rate_wpm)
+        vol_var = tk.DoubleVar(value=cfg.volume)
+        style_var = tk.StringVar(value=cfg.response_style)
+        resp_var = tk.BooleanVar(value=cfg.voice_responses_enabled)
+
+        _row("Input Device", lambda p: ttk.Combobox(p, textvariable=in_var, values=in_devs, state="readonly"))
+        _row("Output Device", lambda p: ttk.Combobox(p, textvariable=out_var, values=out_devs, state="readonly"))
+        _row("Language", lambda p: ttk.Combobox(p, textvariable=lang_var, values=lang_labels, state="readonly"))
+        _row("Voice", lambda p: ttk.Combobox(p, textvariable=voice_var, values=voice_names, state="readonly"))
+        _row("Response Style", lambda p: ttk.Combobox(p, textvariable=style_var, values=list(RESPONSE_STYLES), state="readonly"))
+        _row("Speed (WPM)", lambda p: tk.Scale(p, from_=110, to=300, orient=tk.HORIZONTAL, variable=rate_var, bg="#181d26", fg="#f8fafc"))
+        _row("Volume", lambda p: tk.Scale(p, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, variable=vol_var, bg="#181d26", fg="#f8fafc"))
+
+        chk_row = tk.Frame(win, bg="#181d26", pady=6, padx=14)
+        chk_row.pack(fill=tk.X)
+        tk.Checkbutton(
+            chk_row,
+            text="Enable spoken voice responses",
+            variable=resp_var,
+            bg="#181d26",
+            fg="#f8fafc",
+            selectcolor="#11141a",
+        ).pack(anchor="w")
+
+        def _save():
+            sel_lang = lang_codes[lang_labels.index(lang_var.get())]
+            try:
+                controller.apply_settings(
+                    input_device=None if in_var.get() == "Default" else in_var.get(),
+                    output_device=None if out_var.get() == "Default" else out_var.get(),
+                    language=sel_lang,
+                    voice=voice_var.get(),
+                    response_style=style_var.get(),
+                    speech_rate_wpm=int(rate_var.get()),
+                    volume=float(vol_var.get()),
+                    voice_responses_enabled=bool(resp_var.get()),
+                )
+            except Exception as exc:
+                err_var.set(str(exc))
+            win.destroy()
+            _render()
+
+        ttk.Button(win, text="Save Settings", command=_save).pack(pady=14)
+
+    def _open_permissions():
+        win = tk.Toplevel(root)
+        win.title("RIYA Permissions & Trust")
+        win.geometry("680x560")
+        win.configure(bg="#181d26")
+
+        catalog = controller.permission_catalog()
+        keys = [spec.permission_key for spec in catalog]
+        spec_by_key = {spec.permission_key: spec for spec in catalog}
+
+        key_var = tk.StringVar(value=keys[0] if keys else "")
+        scope_var = tk.StringVar(value="*")
+        life_var = tk.StringVar(value="one_time")
+        ttl_var = tk.StringVar(value="300")
+        # Security: persistent approval checkbox ALWAYS starts unchecked (never pre-selected).
+        persistent_ack_var = tk.BooleanVar(value=False)
+        status_msg_var = tk.StringVar(value="")
+
+        form = tk.Frame(win, bg="#181d26", padx=14, pady=10)
+        form.pack(fill=tk.X)
+
+        tk.Label(form, text="Capability:", fg="#cbd5e1", bg="#181d26").grid(row=0, column=0, sticky="w", pady=4)
+        key_combo = ttk.Combobox(form, textvariable=key_var, values=keys, state="readonly", width=28)
+        key_combo.grid(row=0, column=1, sticky="ew", padx=6)
+
+        tk.Label(form, text="Lifetime:", fg="#cbd5e1", bg="#181d26").grid(row=0, column=2, sticky="w", pady=4)
+        life_combo = ttk.Combobox(
+            form,
+            textvariable=life_var,
+            values=["one_time", "session", "time_limited", "persistent"],
+            state="readonly",
+            width=16,
+        )
+        life_combo.grid(row=0, column=3, sticky="ew", padx=6)
+
+        tk.Label(form, text="Scope:", fg="#cbd5e1", bg="#181d26").grid(row=1, column=0, sticky="w", pady=4)
+        tk.Entry(form, textvariable=scope_var, bg="#11141a", fg="#f8fafc").grid(row=1, column=1, sticky="ew", padx=6)
+
+        tk.Label(form, text="TTL (sec):", fg="#cbd5e1", bg="#181d26").grid(row=1, column=2, sticky="w", pady=4)
+        tk.Entry(form, textvariable=ttl_var, bg="#11141a", fg="#f8fafc", width=12).grid(row=1, column=3, sticky="ew", padx=6)
+
+        desc_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=desc_var, fg="#fbbf24", bg="#181d26", anchor="w", wraplength=640).pack(fill=tk.X, padx=14)
+
+        tk.Checkbutton(
+            win,
+            text="I explicitly confirm granting PERSISTENT permission (unchecked by default)",
+            variable=persistent_ack_var,
+            bg="#181d26",
+            fg="#f8fafc",
+            selectcolor="#11141a",
+        ).pack(anchor="w", padx=14, pady=4)
+
+        tk.Label(win, textvariable=status_msg_var, fg="#fca5a5", bg="#181d26", anchor="w").pack(fill=tk.X, padx=14)
+
+        box = tk.Text(win, bg="#0d1015", fg="#e2e8f0", height=18, relief=tk.FLAT, padx=10, pady=8)
+        box.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
+
+        def _refresh_perm_view(*_args):
+            spec = spec_by_key.get(key_var.get())
+            if spec is not None:
+                sens = "[SENSITIVE] " if spec.sensitive else ""
+                desc_var.set(f"{sens}{spec.category}: {spec.description}")
+            box.configure(state=tk.NORMAL)
+            box.delete("1.0", tk.END)
+            try:
+                grants = controller.list_permissions()
+                box.insert(tk.END, "=== Active User Permission Rules ===\n")
+                if not grants:
+                    box.insert(tk.END, "  (No explicit grants yet; protected capabilities use default-deny.)\n")
+                for g in grants:
+                    exp = f" expires={g.expires_at}" if g.expires_at else ""
+                    box.insert(
+                        tk.END,
+                        f"  - {g.permission_key} [{g.decision.value}] lifetime={g.lifetime.value} scope={g.resource_scope}{exp}\n",
+                    )
+                box.insert(tk.END, "\n=== Recent Audit Log ===\n")
+                for ev in controller.audit_history(limit=15):
+                    box.insert(
+                        tk.END,
+                        f"  #{ev.audit_id} {ev.created_at} {ev.permission_key} ({ev.resource_or_tool}) -> {ev.decision}: {ev.reason}\n",
+                    )
+            except Exception as exc:
+                box.insert(tk.END, f"Permission error: {exc}\n")
+            box.configure(state=tk.DISABLED)
+
+        def _apply(decision: str):
+            try:
+                life = life_var.get()
+                ttl = float(ttl_var.get()) if life == "time_limited" else None
+                if decision == "deny":
+                    controller.deny_permission(
+                        key_var.get(),
+                        resource_scope=scope_var.get() or "*",
+                        lifetime="session" if life == "one_time" else life,
+                        ttl_seconds=ttl,
+                    )
+                else:
+                    controller.grant_permission(
+                        key_var.get(),
+                        decision=decision,
+                        lifetime=life,
+                        resource_scope=scope_var.get() or "*",
+                        ttl_seconds=ttl,
+                        explicit_user_approval=bool(persistent_ack_var.get()),
+                    )
+                persistent_ack_var.set(False)
+                status_msg_var.set(f"Updated {key_var.get()} -> {decision} ({life}).")
+            except Exception as exc:
+                status_msg_var.set(f"Error: {exc}")
+            _refresh_perm_view()
+
+        def _revoke():
+            try:
+                cnt = controller.revoke_permission(key_var.get())
+                status_msg_var.set(f"Revoked {cnt} rule(s) for {key_var.get()}.")
+            except Exception as exc:
+                status_msg_var.set(f"Error: {exc}")
+            _refresh_perm_view()
+
+        def _reset():
+            try:
+                cnt = controller.reset_permissions()
+                status_msg_var.set(f"Reset {cnt} active permission rule(s).")
+            except Exception as exc:
+                status_msg_var.set(f"Error: {exc}")
+            _refresh_perm_view()
+
+        btn_row = tk.Frame(win, bg="#181d26", padx=14, pady=6)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="Grant Allow", command=lambda: _apply("allow")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Require Confirm", command=lambda: _apply("confirm")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Deny Rule", command=lambda: _apply("deny")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Revoke Key", command=_revoke).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Reset All", command=_reset).pack(side=tk.RIGHT, padx=4)
+
+        key_combo.bind("<<ComboboxSelected>>", _refresh_perm_view)
+        _refresh_perm_view()
+
+    def _open_memories():
+        win = tk.Toplevel(root)
+        win.title("RIYA Memories (User Isolated)")
+        win.geometry("620x460")
+        win.configure(bg="#181d26")
+
+        info_var = tk.StringVar(value="Memories stored strictly for the signed-in user.")
+        tk.Label(win, textvariable=info_var, fg="#cbd5e1", bg="#181d26", anchor="w").pack(
+            fill=tk.X, padx=14, pady=8
+        )
+        box = tk.Text(win, bg="#0d1015", fg="#e2e8f0", relief=tk.FLAT, padx=12, pady=10)
+        box.pack(fill=tk.BOTH, expand=True, padx=14, pady=6)
+
+        def _refresh_mem():
+            box.configure(state=tk.NORMAL)
+            box.delete("1.0", tk.END)
+            try:
+                rows = controller.list_memories()
+                if not rows:
+                    box.insert(tk.END, "(No stored memories for your profile yet.)\n")
+                for row in rows:
+                    box.insert(
+                        tk.END,
+                        f"• [{row.get('category', 'general')}] {row.get('key')} = {row.get('value')}\n",
+                    )
+            except Exception as exc:
+                box.insert(tk.END, f"Memory access blocked or unavailable: {exc}\n")
+            box.configure(state=tk.DISABLED)
+
+        btn_f = tk.Frame(win, bg="#181d26", pady=8, padx=14)
+        btn_f.pack(fill=tk.X)
+        ttk.Button(btn_f, text="Refresh", command=_refresh_mem).pack(side=tk.LEFT)
+        ttk.Button(btn_f, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        _refresh_mem()
+
+    def _open_diagnostics():
+        win = tk.Toplevel(root)
+        win.title("RIYA System Status & Diagnostics")
+        win.geometry("680x500")
+        win.configure(bg="#181d26")
+
+        box = tk.Text(win, bg="#0d1015", fg="#e2e8f0", relief=tk.FLAT, padx=12, pady=10)
+        box.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+
+        def _refresh_diag():
+            box.configure(state=tk.NORMAL)
+            box.delete("1.0", tk.END)
+            if coordinator is not None:
+                report = coordinator.diagnostics.run_all(
+                    identity_manager=coordinator._identity_manager,
+                    permission_manager=coordinator._permission_manager,
+                    identity=orchestrator._resolve_active_identity(),
+                    assistant=getattr(orchestrator, "assistant", None),
+                    selected_model_path=getattr(coordinator, "selected_model_path", None),
+                    ai_verified=getattr(coordinator, "ai_inference_verified", False),
+                )
+                for chk in report.checks:
+                    box.insert(
+                        tk.END,
+                        f"[{chk.status.value.upper()}] {chk.name} ({chk.category}): {chk.summary}\n"
+                        f"    {chk.detail}\n",
+                    )
+                    if chk.recovery_action:
+                        box.insert(tk.END, f"    Recovery: {chk.recovery_action}\n")
+            else:
+                ai_ok, ai_msg = controller.ai_status_summary()
+                snap = controller.snapshot()
+                box.insert(tk.END, f"User: {controller.current_user_label()}\n")
+                box.insert(tk.END, f"{ai_msg} (loaded={ai_ok})\n")
+                box.insert(tk.END, f"Voice Mode: {snap.mode} | State: {snap.voice_state.value}\n")
+                box.insert(tk.END, f"Input devices: {len(list_input_devices())} | Output devices: {len(list_output_devices())}\n")
+            box.configure(state=tk.DISABLED)
+
+        btn_f = tk.Frame(win, bg="#181d26", pady=8, padx=14)
+        btn_f.pack(fill=tk.X)
+        ttk.Button(btn_f, text="Re-run Checks", command=_refresh_diag).pack(side=tk.LEFT)
+        ttk.Button(btn_f, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        _refresh_diag()
+
+    tick_after_id: list[str | None] = [None]
+
+    def _cancel_tick() -> None:
+        if tick_after_id[0] is not None:
+            try:
+                root.after_cancel(tick_after_id[0])
+            except Exception:
+                pass
+            tick_after_id[0] = None
+
+    def _on_logout():
+        if not messagebox.askyesno("Logout", "Sign out of your current RIYA profile and close voice mode?"):
+            return
+        exit_action["reason"] = "logout"
+        _cancel_tick()
+        orchestrator.close()
+        controller.clear_transcript_history()
+        if callable(on_logout):
+            on_logout()
+        if owns_root:
+            root.destroy()
+        else:
+            root.quit()
+
+    settings_btn.configure(command=_open_settings)
+    perms_btn.configure(command=_open_permissions)
+    memories_btn.configure(command=_open_memories)
+    diag_btn.configure(command=_open_diagnostics)
+    logout_btn.configure(command=_on_logout)
+
+    last_rendered_count = -1
+
+    def _render() -> None:
+        nonlocal last_rendered_count
+        snap = controller.snapshot()
+        user_var.set(controller.current_user_label())
+        ai_ok, ai_text = controller.ai_status_summary()
+        ai_var.set(ai_text)
+        ai_lbl.configure(fg="#10b981" if ai_ok else "#fbbf24")
+        status_var.set("Processing..." if busy_state["thinking"] else snap.status_label)
+        send_btn.configure(state=tk.DISABLED if busy_state["thinking"] else tk.NORMAL)
+        err_var.set(snap.error_message or "")
+
+        if snap.microphone_active:
+            mic_var.set("MIC LIVE")
+            mic_lbl.configure(fg="#10b981", bg="#14332a")
+        else:
+            mic_var.set("MIC OFF")
+            mic_lbl.configure(fg="#98a2b3", bg="#232a36")
+
+        mode_btn_var.set("Stop Voice" if snap.mode == "voice" else "Start Voice")
+        interrupt_btn.configure(state=tk.NORMAL if snap.can_interrupt else tk.DISABLED)
+
+        # Draw 24-bar audio waveform without excessive redraw cost.
+        canvas.delete("all")
+        w = max(240, canvas.winfo_width() or 780)
+        h = 72
+        bar_w = max(4, (w - 40) // (len(snap.waveform_bars) * 2))
+        gap = bar_w
+        color = "#38bdf8" if snap.assistant_speaking else ("#34d399" if snap.microphone_active else "#475569")
+        start_x = (w - len(snap.waveform_bars) * (bar_w + gap)) // 2
+        for idx, amp in enumerate(snap.waveform_bars):
+            bh = max(4, int(amp * (h - 14)))
+            x0 = start_x + idx * (bar_w + gap)
+            y0 = (h - bh) // 2
+            canvas.create_rectangle(x0, y0, x0 + bar_w, y0 + bh, fill=color, outline="")
+
+        if len(snap.transcript) != last_rendered_count:
+            last_rendered_count = len(snap.transcript)
+            transcript_box.configure(state=tk.NORMAL)
+            transcript_box.delete("1.0", tk.END)
+            for item in snap.transcript:
+                tag = "user" if item.role == "user" else "assistant"
+                speaker = "You" if item.role == "user" else "RIYA"
+                transcript_box.insert(tk.END, f"{speaker} [{item.modality}]: ", (tag,))
+                transcript_box.insert(tk.END, f"{item.text}\n", (tag,))
+            transcript_box.see(tk.END)
+            transcript_box.configure(state=tk.DISABLED)
+
+    def _tick() -> None:
+        drained = False
+        while True:
+            try:
+                ui_events.get_nowait()
+                drained = True
+            except queue.Empty:
+                break
+        if drained or orchestrator.state in ACTIVE_STATES:
+            _render()
+        # Low-power interval when idle; smooth 15 fps only while active.
+        interval_ms = 66 if orchestrator.state in ACTIVE_STATES else 350
+        tick_after_id[0] = root.after(interval_ms, _tick)
+
+    def _on_close() -> None:
+        exit_action["reason"] = "closed"
+        _cancel_tick()
+        orchestrator.close()
+        controller.clear_transcript_history()
+        if owns_root:
+            root.destroy()
+        else:
+            root.quit()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+    _render()
+    tick_after_id[0] = root.after(100, _tick)
+    if owns_root:
+        root.mainloop()
+    else:
+        root.mainloop()
+    return exit_action["reason"]

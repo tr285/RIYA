@@ -1,0 +1,484 @@
+from datetime import datetime
+import os
+from pathlib import Path
+import re
+import subprocess
+from typing import Sequence
+
+
+_OPEN_BIN = "/usr/bin/open"
+_OSASCRIPT_BIN = "/usr/bin/osascript"
+_SCREENCAPTURE_BIN = "/usr/sbin/screencapture"
+_PMSET_BIN = "/usr/bin/pmset"
+_SW_VERS_BIN = "/usr/bin/sw_vers"
+_UNAME_BIN = "/usr/bin/uname"
+
+_ALLOWED_EXECUTABLES = frozenset({
+    _OPEN_BIN,
+    _OSASCRIPT_BIN,
+    _SCREENCAPTURE_BIN,
+    _PMSET_BIN,
+    _SW_VERS_BIN,
+    _UNAME_BIN,
+})
+
+_DEFAULT_TIMEOUT_SECONDS = 10.0
+_APP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,127}$")
+
+_CLOSE_APPLICATION_SCRIPT = [
+    "on run argv",
+    "set targetApp to item 1 of argv",
+    'tell application "System Events"',
+    "if not (exists process targetApp) then",
+    'return "NOT_RUNNING"',
+    "end if",
+    "end tell",
+    "tell application targetApp to quit",
+    "repeat 10 times",
+    'tell application "System Events"',
+    "if not (exists process targetApp) then",
+    'return "CLOSED"',
+    "end if",
+    "end tell",
+    "delay 0.1",
+    "end repeat",
+    'return "STILL_RUNNING"',
+    "end run",
+]
+
+_SET_VOLUME_SCRIPT = [
+    "on run argv",
+    "set targetLevel to (item 1 of argv) as integer",
+    "set volume output volume targetLevel",
+    "end run",
+]
+
+
+def validate_app_name(app_name: str) -> str:
+    """Validate and normalize a macOS application name."""
+
+    if not isinstance(app_name, str):
+        raise ValueError("Application name must be a string.")
+
+    cleaned = app_name.strip()
+
+    if not cleaned or len(cleaned) > 128 or ".." in cleaned:
+        raise ValueError("Invalid application name.")
+
+    if not _APP_NAME_PATTERN.fullmatch(cleaned):
+        raise ValueError("Application name contains unsupported characters.")
+
+    return cleaned
+
+
+def _run_executable(
+    executable: str,
+    args: Sequence[str] = (),
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Run an allowlisted system executable safely without a shell."""
+
+    if (
+        not isinstance(executable, str)
+        or not os.path.isabs(executable)
+        or executable not in _ALLOWED_EXECUTABLES
+    ):
+        raise ValueError(f"Executable is not permitted: {executable!r}")
+
+    return subprocess.run(
+        [executable, *args],
+        capture_output=True,
+        text=True,
+        shell=False,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _run_osascript(
+    script_lines: Sequence[str],
+    script_args: Sequence[str] = (),
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Execute static AppleScript lines, passing dynamic values via argv."""
+
+    cmd_args: list[str] = []
+    for line in script_lines:
+        cmd_args.extend(["-e", line])
+
+    if script_args:
+        cmd_args.append("--")
+        cmd_args.extend(script_args)
+
+    return _run_executable(_OSASCRIPT_BIN, cmd_args, timeout=timeout)
+
+
+def _is_permission_error(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return (
+        "-1743" in lowered
+        or "not authorized" in lowered
+        or "not permitted" in lowered
+        or "permission denied" in lowered
+    )
+
+
+def _is_missing_app_error(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return (
+        "-600" in lowered
+        or "-1728" in lowered
+        or "isn't running" in lowered
+        or "not running" in lowered
+        or "can't get application" in lowered
+        or "unable to find application" in lowered
+    )
+
+
+def open_application(app_name: str) -> str:
+    """Open a macOS application safely."""
+
+    cleaned = validate_app_name(app_name)
+
+    try:
+        result = _run_executable(
+            _OPEN_BIN,
+            ["-a", cleaned],
+            timeout=10.0,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Timed out trying to open {cleaned}."
+    except OSError:
+        return f"I couldn't open {cleaned}."
+
+    if result.returncode != 0:
+        stderr = result.stderr or ""
+        if _is_permission_error(stderr):
+            return f"Permission denied: RIYA is not authorized to open {cleaned}."
+        if _is_missing_app_error(stderr):
+            return f"I couldn't find the application '{cleaned}'."
+        return f"I couldn't open {cleaned}."
+
+    return f"Opened {cleaned}."
+
+
+def close_application(app_name: str) -> str:
+    """Close a macOS application safely via parameterized AppleScript argv."""
+
+    cleaned = validate_app_name(app_name)
+
+    try:
+        result = _run_osascript(
+            _CLOSE_APPLICATION_SCRIPT,
+            [cleaned],
+            timeout=10.0,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Timed out waiting for {cleaned} to close."
+    except OSError:
+        return f"I couldn't close {cleaned}."
+
+    if result.returncode != 0:
+        stderr = result.stderr or ""
+        if _is_permission_error(stderr):
+            return f"Permission denied: RIYA is not authorized to close {cleaned}."
+        if _is_missing_app_error(stderr):
+            return f"{cleaned} is not running or could not be found."
+        return f"I couldn't close {cleaned}."
+
+    status = (result.stdout or "").strip()
+
+    if status == "CLOSED":
+        return f"Closed {cleaned}."
+
+    if status == "NOT_RUNNING":
+        return f"{cleaned} is not running or could not be found."
+
+    if status == "STILL_RUNNING":
+        return f"I couldn't close {cleaned}; it is still running."
+
+    return f"I couldn't confirm that {cleaned} closed."
+
+
+def take_screenshot() -> str:
+    """Take a screenshot and save it to the Desktop."""
+
+    target = Path.home() / "Desktop" / "riya_screenshot.png"
+
+    if target.is_symlink():
+        return "I couldn't take the screenshot safely."
+
+    try:
+        result = _run_executable(
+            _SCREENCAPTURE_BIN,
+            ["-x", str(target)],
+            timeout=10.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out taking the screenshot."
+    except OSError:
+        return "I couldn't take the screenshot."
+
+    if result.returncode != 0:
+        stderr = result.stderr or ""
+        if _is_permission_error(stderr):
+            return "Permission denied: RIYA is not authorized to capture the screen."
+        return "I couldn't take the screenshot."
+
+    return f"Screenshot saved to {target}."
+
+
+def current_time() -> str:
+    """Return the current local time."""
+
+    return datetime.now().strftime(
+        "It is %I:%M %p."
+    )
+
+
+def set_volume(level: int) -> str:
+    """Set macOS output volume from 0 to 100."""
+
+    if isinstance(level, bool) or not isinstance(level, int):
+        raise ValueError("Volume level must be an integer.")
+
+    clamped = max(0, min(100, level))
+
+    try:
+        result = _run_osascript(
+            _SET_VOLUME_SCRIPT,
+            [str(clamped)],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out setting the volume."
+    except OSError:
+        return "I couldn't set the volume."
+
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return "Permission denied: RIYA is not authorized to change system volume."
+        return "I couldn't set the volume."
+
+    return f"Volume set to {clamped}%."
+
+
+def mute_volume() -> str:
+    """Mute macOS audio."""
+
+    try:
+        result = _run_osascript(
+            ["set volume output muted true"],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out muting the volume."
+    except OSError:
+        return "I couldn't mute the volume."
+
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return "Permission denied: RIYA is not authorized to mute system volume."
+        return "I couldn't mute the volume."
+
+    return "Volume muted."
+
+
+def unmute_volume() -> str:
+    """Unmute macOS audio."""
+
+    try:
+        result = _run_osascript(
+            ["set volume output muted false"],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out unmuting the volume."
+    except OSError:
+        return "I couldn't unmute the volume."
+
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return "Permission denied: RIYA is not authorized to unmute system volume."
+        return "I couldn't unmute the volume."
+
+    return "Volume unmuted."
+
+
+def battery_status() -> str:
+    """Get the current Mac battery status."""
+
+    try:
+        result = _run_executable(
+            _PMSET_BIN,
+            ["-g", "batt"],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out reading battery status."
+    except OSError:
+        return "I couldn't read the battery status."
+
+    if result.returncode != 0:
+        return "I couldn't read the battery status."
+
+    return result.stdout.strip()
+
+
+def system_information() -> str:
+    """Get basic macOS system information."""
+
+    try:
+        macos = _run_executable(
+            _SW_VERS_BIN,
+            timeout=5.0,
+        )
+        machine = _run_executable(
+            _UNAME_BIN,
+            ["-m"],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out reading system information."
+    except OSError:
+        return "I couldn't read system information."
+
+    if macos.returncode != 0 or machine.returncode != 0:
+        return "I couldn't read system information."
+
+    return (
+        f"{macos.stdout.strip()}\n"
+        f"Architecture: {machine.stdout.strip()}"
+    )
+
+
+def lock_screen() -> str:
+    """Lock the Mac screen."""
+
+    try:
+        result = _run_osascript(
+            [
+                'tell application "System Events" to keystroke "q" '
+                "using {control down, command down}"
+            ],
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return "Timed out locking the screen."
+    except OSError:
+        return "I couldn't lock the screen."
+
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return "Permission denied: RIYA is not authorized to lock the screen."
+        return "I couldn't lock the screen."
+
+    return "Screen locked."
+
+
+_RUNNING_APPS_SCRIPT = [
+    'tell application "System Events"',
+    "set appList to name of every application process whose background only is false",
+    "set AppleScript's text item delimiters to linefeed",
+    "return appList as text",
+    "end tell",
+]
+
+_APP_STATE_SCRIPT = [
+    "on run argv",
+    "set targetApp to item 1 of argv",
+    'tell application "System Events"',
+    "if not (exists process targetApp) then",
+    'return "not_running"',
+    "end if",
+    "set isFront to frontmost of process targetApp",
+    "if isFront then",
+    'return "frontmost"',
+    "end if",
+    'return "running"',
+    "end tell",
+    "end run",
+]
+
+_FOCUS_APP_SCRIPT = [
+    "on run argv",
+    "set targetApp to item 1 of argv",
+    'tell application "System Events"',
+    "if not (exists process targetApp) then",
+    'return "NOT_RUNNING"',
+    "end if",
+    "end tell",
+    "tell application targetApp to activate",
+    'return "FOCUSED"',
+    "end run",
+]
+
+
+def list_installed_applications() -> list[str]:
+    """List installed macOS .app bundles cleanly without shell execution."""
+    names: set[str] = set()
+    for base_dir in (
+        Path("/Applications"),
+        Path("/System/Applications"),
+        Path("/System/Applications/Utilities"),
+    ):
+        try:
+            if not base_dir.is_dir():
+                continue
+            for entry in base_dir.iterdir():
+                if entry.suffix.lower() == ".app":
+                    names.add(entry.stem)
+        except OSError:
+            continue
+    return sorted(names)
+
+
+def list_running_applications() -> list[str]:
+    """List currently running non-background macOS applications."""
+    try:
+        result = _run_osascript(_RUNNING_APPS_SCRIPT, timeout=5.0)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def get_application_state(app_name: str) -> str:
+    """Return whether a validated macOS application is not_running, running, or frontmost."""
+    cleaned = validate_app_name(app_name)
+    try:
+        result = _run_osascript(_APP_STATE_SCRIPT, [cleaned], timeout=5.0)
+    except subprocess.TimeoutExpired:
+        return f"Timed out checking state for {cleaned}."
+    except OSError:
+        return f"I couldn't inspect state for {cleaned}."
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return f"Permission denied checking state for {cleaned}."
+        return f"I couldn't inspect state for {cleaned}."
+    state = (result.stdout or "").strip() or "unknown"
+    return f"{cleaned}: {state}"
+
+
+def focus_application(app_name: str) -> str:
+    """Bring a running validated macOS application to the foreground."""
+    cleaned = validate_app_name(app_name)
+    try:
+        result = _run_osascript(_FOCUS_APP_SCRIPT, [cleaned], timeout=5.0)
+    except subprocess.TimeoutExpired:
+        return f"Timed out focusing {cleaned}."
+    except OSError:
+        return f"I couldn't focus {cleaned}."
+    if result.returncode != 0:
+        if _is_permission_error(result.stderr or ""):
+            return f"Permission denied focusing {cleaned}."
+        if _is_missing_app_error(result.stderr or ""):
+            return f"{cleaned} is not installed."
+        return f"I couldn't focus {cleaned}."
+    status = (result.stdout or "").strip()
+    if status == "NOT_RUNNING":
+        return f"{cleaned} is not running."
+    return f"Focused {cleaned}."

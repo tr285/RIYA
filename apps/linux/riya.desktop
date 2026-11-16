@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=RIYA
+GenericName=Offline Personal AI Assistant
+Comment=Universal offline-first personal AI assistant with local neural intelligence and voice
+Exec=riya --ui %U
+Icon=riya
+Terminal=false
+Categories=Utility;AudioVideo;ArtificialIntelligence;Office;
+Keywords=AI;Assistant;Voice;Offline;Local;Llama;Whisper;Chat;
+StartupNotify=true
+StartupWMClass=RIYA
+MimeType=x-scheme-handler/riya;

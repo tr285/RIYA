@@ -1,0 +1,36 @@
+import re
+import subprocess
+
+
+_SAY_BIN = "/usr/bin/say"
+_VOICE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
+
+
+class LocalTTS:
+    """Local text-to-speech engine for RIYA."""
+
+    def __init__(self, voice: str = "Samantha"):
+        if not isinstance(voice, str) or not _VOICE_PATTERN.fullmatch(voice.strip()):
+            raise ValueError("Invalid TTS voice name.")
+        self.voice = voice.strip()
+
+    def speak(self, text: str) -> None:
+        """Speak text using the local operating-system voice."""
+
+        if not isinstance(text, str) or not text.strip():
+            return
+
+        subprocess.run(
+            [
+                _SAY_BIN,
+                "-v",
+                self.voice,
+                "-f",
+                "-",
+            ],
+            input=text,
+            text=True,
+            shell=False,
+            check=True,
+            timeout=30,
+        )

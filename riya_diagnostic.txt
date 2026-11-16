@@ -1,0 +1,4435 @@
+==================================================
+RIYA PROJECT DIAGNOSTIC REPORT
+==================================================
+
+===== SYSTEM =====
+ProductName:		macOS
+ProductVersion:		26.7
+BuildVersion:		25G229
+arm64
+Python 3.13.9
+
+===== GIT STATUS =====
+ M core/agent/assistant.py
+ M core/agent/planner.py
+ M core/ai/local_runtime.py
+ M core/ai/native/bridge/riya_llama.cpp
+ M core/ai/native/llama_runtime.py
+ M core/config/settings.py
+ M core/memory/intent.py
+ M data/riya.db
+?? core/agent/assistant.py.bak
+?? core/ai/local_runtime.py.bak
+?? core/ai/local_runtime.py.before_metal_fix
+?? core/ai/native/bridge/riya_llama.cpp.bak
+?? core/ai/native/bridge/riya_llama.cpp.before_metal_fix
+?? core/ai/native/llama_runtime.py.before_metal_fix
+?? core/config/settings.py.bak
+?? core/memory/intent.py.bak
+?? riya_diagnostic.txt
+?? tests/
+
+===== PROJECT STRUCTURE =====
+core/__init__.py
+core/agent/__init__.py
+core/agent/agent.py
+core/agent/assistant.py
+core/agent/command_router.py
+core/agent/context.py
+core/agent/executor.py
+core/agent/intent.py
+core/agent/planner.py
+core/agent/semantic.py
+core/agent/tool_decision.py
+core/agent/tool_executor.py
+core/agent/tool_registry.py
+core/ai/__init__.py
+core/ai/local_runtime.py
+core/ai/native/__init__.py
+core/ai/native/llama_runtime.py
+core/ai/native/llama.cpp/CMakePresets.json
+core/ai/native/llama.cpp/convert_hf_to_gguf_update.py
+core/ai/native/llama.cpp/convert_hf_to_gguf.py
+core/ai/native/llama.cpp/convert_llama_ggml_to_gguf.py
+core/ai/native/llama.cpp/convert_lora_to_gguf.py
+core/ai/native/llama.cpp/pyrightconfig.json
+core/ai/runtime.py
+core/automation/__init__.py
+core/browser/__init__.py
+core/config/settings.py
+core/device/__init__.py
+core/device/macos.py
+core/device/platform.py
+core/main.py
+core/memory/__init__.py
+core/memory/database.py
+core/memory/intent.py
+core/memory/manager.py
+core/memory/service.py
+core/security/__init__.py
+core/security/manager.py
+core/tools/__init__.py
+core/tools/filesystem/__init__.py
+core/tools/filesystem/files.py
+core/tools/memory.py
+core/tools/system/__init__.py
+core/tools/system/macos.py
+core/voice/__init__.py
+core/voice/assistant.py
+core/voice/microphone.py
+core/voice/stt.py
+core/voice/tts.py
+tests/__init__.py
+tests/test_confirmation_flow.py
+tests/test_memory_database.py
+tests/test_memory_intent.py
+tests/test_memory_service.py
+
+===== ASSISTANT IMPLEMENTATION =====
+from core.agent.context import ConversationContext
+from core.agent.executor import CommandExecutor
+from core.agent.intent import IntentDetector, IntentType
+from core.agent.planner import AgentPlanner
+from core.agent.semantic import SemanticToolEngine
+
+from core.memory.intent import MemoryIntentType
+from core.memory.service import MemoryService
+
+from core.agent.agent import RiyaAgent
+from core.ai.local_runtime import LocalLlamaRuntime
+
+
+class RIYAAssistant:
+    """
+    Main RIYA application interface.
+
+    Public interface:
+
+        assistant = RIYAAssistant()
+        assistant.process("...")
+        assistant.close()
+
+    Architecture:
+
+        User
+          ↓
+        Memory
+          ↓
+        Deterministic Router
+          ↓
+        Semantic Tool Retrieval
+          ↓
+        AI Planner
+          ↓
+        Security
+          ↓
+        Tool Execution
+          ↓
+        Verification
+          ↓
+        RIYA Response
+    """
+
+    def __init__(self):
+
+        # =====================================================
+        # RIYA AGENT
+        # =====================================================
+
+        self.agent = RiyaAgent()
+
+        # =====================================================
+        # LOCAL SEMANTIC ENGINE
+        # =====================================================
+
+        self.semantic = SemanticToolEngine(
+            self.agent.tools,
+            top_k=8,
+        )
+
+        # =====================================================
+        # LOCAL AI
+        # =====================================================
+
+        self.ai = LocalLlamaRuntime(
+            context_size=4096,
+            max_tokens=256,
+        )
+
+        # =====================================================
+        # MODEL
+        # =====================================================
+
+        self.model_path = self._find_model()
+
+        self.ai.load_model(
+            str(self.model_path)
+        )
+
+        # =====================================================
+        # CORE COMPONENTS
+        # =====================================================
+
+        self.intent_detector = IntentDetector()
+
+        self.command_executor = CommandExecutor(
+            self.agent
+        )
+
+        self.memory = MemoryService()
+
+        # =====================================================
+        # AI PLANNER + SEMANTIC ENGINE
+        # =====================================================
+
+        self.planner = AgentPlanner(
+            self.ai,
+            self.agent.tools,
+            semantic_engine=self.semantic,
+        )
+
+        # =====================================================
+        # CONVERSATION CONTEXT
+        # =====================================================
+
+        self.context = ConversationContext(
+            max_messages=12
+        )
+
+        # =====================================================
+        # PENDING CONFIRMATION
+        # =====================================================
+
+        self.pending_action = None
+
+    # =========================================================
+    # MODEL LOCATION
+    # =========================================================
+
+    def _find_model(self):
+
+        from pathlib import Path
+
+        candidates = [
+
+            # -------------------------------------------------
+            # Project model
+            # -------------------------------------------------
+
+            Path.home()
+            / "Projects"
+            / "RIYA"
+            / "models"
+            / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+
+            # -------------------------------------------------
+            # Hugging Face cache
+            # -------------------------------------------------
+
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--lmstudio-community--Qwen3-4B-Instruct-2507-GGUF"
+            / "snapshots",
+        ]
+
+        # -----------------------------------------------------
+        # Direct model file
+        # -----------------------------------------------------
+
+        for candidate in candidates:
+
+            if candidate.is_file():
+
+                return candidate
+
+        # -----------------------------------------------------
+        # Search Hugging Face snapshots
+        # -----------------------------------------------------
+
+        hf_snapshots = candidates[-1]
+
+        if hf_snapshots.exists():
+
+            for snapshot in hf_snapshots.iterdir():
+
+                if not snapshot.is_dir():
+                    continue
+
+                model_file = (
+                    snapshot
+                    / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+                )
+
+                if model_file.exists():
+
+                    return model_file
+
+        raise FileNotFoundError(
+            "RIYA local Qwen3 model was not found.\n"
+            "Expected either:\n"
+            f"  {candidates[0]}\n"
+            "or the existing Hugging Face cache."
+        )
+
+    # =========================================================
+    # MAIN PROCESSING
+    # =========================================================
+
+    def process(
+        self,
+        user_input: str,
+    ) -> str:
+
+        user_input = user_input.strip()
+
+        # -----------------------------------------------------
+        # Empty input
+        # -----------------------------------------------------
+
+        if not user_input:
+
+            return (
+                "Please tell me what you'd like me to do."
+            )
+
+        # -----------------------------------------------------
+        # Pending confirmation
+        # -----------------------------------------------------
+
+        if self.pending_action is not None:
+
+            return self._handle_confirmation(
+                user_input
+            )
+
+        # =====================================================
+        # MEMORY SYSTEM
+        # =====================================================
+
+        memory_intent = self.memory.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Recall
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.RECALL
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "I couldn't find that memory."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # List memories
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.LIST
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "RIYA has no stored memories."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Remember
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.REMEMBER
+        ):
+
+            action = (
+                self.memory.build_remember_action(
+                    memory_intent
+                )
+            )
+
+            self.pending_action = {
+                "tool": action["tool"],
+                "parameters": action["parameters"],
+            }
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            value = (
+                action["parameters"]["value"]
+            )
+
+            response = (
+                f"I'll remember '{value}' "
+                f"under '{category}' as '{key}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Forget
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.FORGET
+        ):
+
+            action = (
+                self.memory.build_forget_action(
+                    memory_intent
+                )
+            )
+
+            self.pending_action = {
+                "tool": action["tool"],
+                "parameters": action["parameters"],
+            }
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            response = (
+                f"I'll forget the memory "
+                f"'{key}' under '{category}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # DETERMINISTIC COMMAND ROUTER
+        # =====================================================
+
+        intent = self.intent_detector.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Exit
+        # -----------------------------------------------------
+
+        if intent.type == IntentType.EXIT:
+
+            return "Goodbye."
+
+        # -----------------------------------------------------
+        # Simple deterministic command
+        # -----------------------------------------------------
+
+        if intent.type != IntentType.CHAT:
+
+            try:
+
+                result = (
+                    self.command_executor.execute(
+                        intent
+                    )
+                )
+
+                response = self._format_result(
+                    result
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            except Exception as exc:
+
+                response = (
+                    "I couldn't complete that action: "
+                    f"{exc}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+        # =====================================================
+        # SEMANTIC + AI PLANNER
+        # =====================================================
+
+        try:
+
+            plan = self.planner.create_plan(
+                user_input
+            )
+
+        except Exception:
+
+            plan = None
+
+        # =====================================================
+        # NORMAL CONVERSATION
+        # =====================================================
+
+        if plan is None or not plan.steps:
+
+            response = self.ai.generate(
+                user_input,
+                conversation_context=(
+                    self.context.format_for_prompt()
+                ),
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # MULTI-STEP EXECUTION
+        # =====================================================
+
+        results = []
+
+        for step in plan.steps:
+
+            try:
+
+                result = self.agent.execute(
+                    step.action,
+                    **step.parameters,
+                )
+
+            except Exception as exc:
+
+                response = (
+                    "I couldn't complete the full task. "
+                    f"The operation "
+                    f"'{step.action}' failed: {exc}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Confirmation required
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                == "confirmation_required"
+            ):
+
+                self.pending_action = {
+                    "tool": result.get(
+                        "tool",
+                        step.action,
+                    ),
+                    "parameters": result.get(
+                        "parameters",
+                        step.parameters,
+                    ),
+                }
+
+                response = (
+                    f"{result.get('reason', 'This action requires confirmation.')} "
+                    "Proceed?"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Execution failure
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                in {
+                    "failed",
+                    "verification_failed",
+                }
+            ):
+
+                reason = result.get(
+                    "reason",
+                    result.get(
+                        "error",
+                        "Unknown failure.",
+                    ),
+                )
+
+                response = (
+                    f"I couldn't complete "
+                    f"'{step.description or step.action}'. "
+                    f"{reason}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            # -------------------------------------------------
+            # Successful result
+            # -------------------------------------------------
+
+            results.append(
+                {
+                    "action": step.action,
+                    "description": step.description,
+                    "result": result,
+                }
+            )
+
+        # =====================================================
+        # FINAL RESULT
+        # =====================================================
+
+        response = self._summarize_results(
+            results
+        )
+
+        self._update_context(
+            user_input,
+            response,
+        )
+
+        return response
+
+    # =========================================================
+    # CONFIRMATION
+    # =========================================================
+
+    def _handle_confirmation(
+        self,
+        user_input: str,
+    ) -> str:
+
+        normalized = (
+            user_input.lower()
+            .strip()
+            .rstrip(".!?")
+        )
+
+        yes_words = {
+            "yes",
+            "y",
+            "yeah",
+            "yep",
+            "sure",
+            "ok",
+            "okay",
+            "confirm",
+            "do it",
+            "proceed",
+            "go ahead",
+            "please proceed",
+            "continue",
+        }
+
+        no_words = {
+            "no",
+            "n",
+            "nope",
+            "cancel",
+            "stop",
+            "don't",
+            "dont",
+        }
+
+        # -----------------------------------------------------
+        # Cancel
+        # -----------------------------------------------------
+
+        if normalized in no_words:
+
+            self.pending_action = None
+
+            response = (
+                "Okay, I cancelled that action."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Invalid confirmation
+        # -----------------------------------------------------
+
+        if normalized not in yes_words:
+
+            return (
+                "Please say yes to proceed "
+                "or no to cancel."
+            )
+
+        # -----------------------------------------------------
+        # Execute confirmed action
+        # -----------------------------------------------------
+
+        action = self.pending_action
+
+        self.pending_action = None
+
+        try:
+
+            result = self.agent.execute(
+                action["tool"],
+                confirm=True,
+                **action["parameters"],
+            )
+
+            response = self._format_result(
+                result
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        except Exception as exc:
+
+            response = (
+                "I couldn't complete the "
+                f"confirmed action: {exc}"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+    # =========================================================
+    # RESULT FORMATTING
+    # =========================================================
+
+    def _format_result(
+        self,
+        result,
+    ) -> str:
+
+        # -----------------------------------------------------
+        # Plain string
+        # -----------------------------------------------------
+
+        if isinstance(result, str):
+
+            return result.strip()
+
+        # -----------------------------------------------------
+        # Structured result
+        # -----------------------------------------------------
+
+        if isinstance(result, dict):
+
+            status = result.get(
+                "status"
+            )
+
+            # -------------------------------------------------
+            # Confirmation
+            # -------------------------------------------------
+
+            if status == "confirmation_required":
+
+                self.pending_action = {
+                    "tool": result.get(
+                        "tool"
+                    ),
+                    "parameters": result.get(
+                        "parameters",
+                        {},
+                    ),
+                }
+
+                return (
+                    f"{result.get('reason', 'Confirmation required.')} "
+                    "Proceed?"
+                )
+
+            # -------------------------------------------------
+            # Failed
+            # -------------------------------------------------
+
+            if status == "failed":
+
+                return (
+                    "I couldn't complete the action. "
+                    f"{result.get('error', 'Unknown error.')}"
+                )
+
+            # -------------------------------------------------
+            # Verification failed
+            # -------------------------------------------------
+
+            if status == "verification_failed":
+
+                return (
+                    "The action was attempted, "
+                    "but I could not verify that it "
+                    "completed successfully. "
+                    f"{result.get('reason', '')}"
+                ).strip()
+
+            # -------------------------------------------------
+            # Successful
+            # -------------------------------------------------
+
+            if status == "success":
+
+                actual_result = result.get(
+                    "result"
+                )
+
+                if isinstance(
+                    actual_result,
+                    str,
+                ):
+
+                    return actual_result.strip()
+
+                if actual_result is not None:
+
+                    return str(
+                        actual_result
+                    )
+
+                verification = result.get(
+                    "verification"
+                )
+
+                if isinstance(
+                    verification,
+                    dict,
+                ):
+
+                    reason = verification.get(
+                        "reason"
+                    )
+
+                    if reason:
+
+                        return str(
+                            reason
+                        )
+
+                return (
+                    "The action completed successfully."
+                )
+
+            # -------------------------------------------------
+            # Unknown dictionary
+            # -------------------------------------------------
+
+            return str(result)
+
+        return str(result)
+
+    # =========================================================
+    # MULTI-STEP SUMMARY
+    # =========================================================
+
+    def _summarize_results(
+        self,
+        results,
+    ) -> str:
+
+        if not results:
+
+            return (
+                "The task completed."
+            )
+
+        successful = []
+
+        for item in results:
+
+            raw_result = item.get(
+                "result"
+            )
+
+            # -------------------------------------------------
+            # Structured ToolExecutor result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                dict,
+            ):
+
+                status = raw_result.get(
+                    "status"
+                )
+
+                if status == "success":
+
+                    actual_result = (
+                        raw_result.get(
+                            "result"
+                        )
+                    )
+
+                    if actual_result is not None:
+
+                        text = str(
+                            actual_result
+                        ).strip()
+
+                        if text:
+
+                            successful.append(
+                                text
+                            )
+
+                        continue
+
+                    verification = (
+                        raw_result.get(
+                            "verification"
+                        )
+                    )
+
+                    if isinstance(
+                        verification,
+                        dict,
+                    ):
+
+                        reason = (
+                            verification.get(
+                                "reason"
+                            )
+                        )
+
+                        if reason:
+
+                            successful.append(
+                                str(
+                                    reason
+                                ).strip()
+                            )
+
+                continue
+
+            # -------------------------------------------------
+            # Plain string result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                str,
+            ):
+
+                cleaned = (
+                    raw_result.strip()
+                )
+
+                if cleaned:
+
+                    successful.append(
+                        cleaned
+                    )
+
+        # -----------------------------------------------------
+        # No readable result
+        # -----------------------------------------------------
+
+        if not successful:
+
+            return (
+                "Done. The requested actions "
+                "were completed and verified."
+            )
+
+        # -----------------------------------------------------
+        # One result
+        # -----------------------------------------------------
+
+        if len(successful) == 1:
+
+            return successful[0]
+
+        # -----------------------------------------------------
+        # Multiple results
+        # -----------------------------------------------------
+
+        lines = [
+            "Done. I completed the requested actions:"
+        ]
+
+        for result in successful:
+
+            lines.append(
+                f"• {result}"
+            )
+
+        return "\n".join(
+            lines
+        )
+
+    # =========================================================
+    # CONVERSATION CONTEXT
+    # =========================================================
+
+    def _update_context(
+        self,
+        user_input: str,
+        response: str,
+    ) -> None:
+
+        self.context.add_user(
+            user_input
+        )
+
+        if response:
+
+            self.context.add_assistant(
+                response
+            )
+
+    # =========================================================
+    # SHUTDOWN
+    # =========================================================
+
+    def close(self):
+
+        if self.ai is not None:
+
+            try:
+
+                self.ai.unload_model()
+
+            except Exception:
+
+                pass
+===== AGENT MODULES =====
+
+--- core/agent/__init__.py ---
+
+--- core/agent/agent.py ---
+from core.agent.planner import Plan
+from core.agent.tool_registry import ToolRegistry
+from core.agent.tool_executor import ToolExecutor
+
+from core.device.macos import MacOSPlatform
+
+from core.tools.filesystem.files import (
+    list_files,
+    find_files,
+    create_folder,
+    read_file,
+    write_file,
+)
+
+from core.tools.memory import (
+    remember,
+    recall_memory,
+    list_memories,
+    forget_memory,
+)
+
+
+class RiyaAgent:
+    """
+    RIYA's central agent.
+
+    Responsibilities:
+
+    - Register available tools
+    - Provide tools to the planner
+    - Execute tools through ToolExecutor
+    - Keep security centralized
+    - Support multi-step plans
+    """
+
+    def __init__(self):
+
+        # =====================================================
+        # CORE TOOL SYSTEM
+        # =====================================================
+
+        self.tools = ToolRegistry()
+
+        self.executor = ToolExecutor(
+            self.tools
+        )
+
+        # =====================================================
+        # PLATFORM
+        # =====================================================
+
+        self.platform = MacOSPlatform()
+
+        # =====================================================
+        # REGISTER TOOLS
+        # =====================================================
+
+        self._register_platform_tools()
+
+        self._register_filesystem_tools()
+
+        self._register_memory_tools()
+
+    # =========================================================
+    # PLATFORM TOOLS
+    # =========================================================
+
+    def _register_platform_tools(self):
+
+        self.tools.register(
+            name="open_application",
+            description=(
+                "Open an application on the Mac."
+            ),
+            function=self.platform.open_application,
+            parameters={
+                "app_name",
+            },
+        )
+
+        self.tools.register(
+            name="close_application",
+            description=(
+                "Close an application on the Mac."
+            ),
+            function=self.platform.close_application,
+            parameters={
+                "app_name",
+            },
+        )
+
+        self.tools.register(
+            name="take_screenshot",
+            description=(
+                "Take a screenshot of the current screen."
+            ),
+            function=self.platform.take_screenshot,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="current_time",
+            description=(
+                "Get the current local time."
+            ),
+            function=self.platform.current_time,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="set_volume",
+            description=(
+                "Set the Mac system volume."
+            ),
+            function=self.platform.set_volume,
+            parameters={
+                "level",
+            },
+        )
+
+        self.tools.register(
+            name="mute_volume",
+            description=(
+                "Mute the Mac system volume."
+            ),
+            function=self.platform.mute_volume,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="unmute_volume",
+            description=(
+                "Unmute the Mac system volume."
+            ),
+            function=self.platform.unmute_volume,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="battery_status",
+            description=(
+                "Get the current Mac battery status."
+            ),
+            function=self.platform.battery_status,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="system_information",
+            description=(
+                "Get system information about the Mac."
+            ),
+            function=self.platform.system_information,
+            parameters=set(),
+        )
+
+        self.tools.register(
+            name="lock_screen",
+            description=(
+                "Lock the Mac screen."
+            ),
+            function=self.platform.lock_screen,
+            parameters=set(),
+        )
+
+    # =========================================================
+    # FILESYSTEM TOOLS
+    # =========================================================
+
+    def _register_filesystem_tools(self):
+
+        self.tools.register(
+            name="list_files",
+            description=(
+                "List files and folders inside a directory."
+            ),
+            function=list_files,
+            parameters={
+                "path",
+            },
+        )
+
+        self.tools.register(
+            name="find_files",
+            description=(
+                "Find files or folders by name."
+            ),
+            function=find_files,
+            parameters={
+                "name",
+                "path",
+            },
+        )
+
+        self.tools.register(
+            name="create_folder",
+            description=(
+                "Create a new folder."
+            ),
+            function=create_folder,
+            parameters={
+                "path",
+            },
+        )
+
+        self.tools.register(
+            name="read_file",
+            description=(
+                "Read the contents of a text file."
+            ),
+            function=read_file,
+            parameters={
+                "path",
+            },
+        )
+
+        self.tools.register(
+            name="write_file",
+            description=(
+                "Write text content to a file."
+            ),
+            function=write_file,
+            parameters={
+                "path",
+                "content",
+            },
+        )
+
+    # =========================================================
+    # MEMORY TOOLS
+    # =========================================================
+
+    def _register_memory_tools(self):
+
+        self.tools.register(
+            name="remember",
+            description=(
+                "Store a user memory."
+            ),
+            function=remember,
+            parameters={
+                "category",
+                "key",
+                "value",
+            },
+        )
+
+        self.tools.register(
+            name="recall_memory",
+            description=(
+                "Recall a specific stored memory."
+            ),
+            function=recall_memory,
+            parameters={
+                "category",
+                "key",
+            },
+        )
+
+        self.tools.register(
+            name="list_memories",
+            description=(
+                "List stored memories."
+            ),
+            function=list_memories,
+            parameters={
+                "category",
+            },
+        )
+
+        self.tools.register(
+            name="forget_memory",
+            description=(
+                "Delete a stored memory."
+            ),
+            function=forget_memory,
+            parameters={
+                "category",
+                "key",
+            },
+        )
+
+    # =========================================================
+    # PLANNING
+    # =========================================================
+
+    def plan(
+        self,
+        goal: str,
+    ) -> Plan:
+
+        return Plan(
+            goal=goal
+        )
+
+    def create_ai_plan(
+        self,
+        goal: str,
+        ai_runtime,
+    ):
+
+        from core.agent.planner import (
+            AgentPlanner,
+        )
+
+        planner = AgentPlanner(
+            ai_runtime,
+            self.tools,
+        )
+
+        return planner.create_plan(
+            goal
+        )
+
+    # =========================================================
+    # TOOL INFORMATION
+    # =========================================================
+
+    def available_tools(self):
+
+        return self.tools.list_tools()
+
+    # =========================================================
+    # SINGLE TOOL EXECUTION
+    # =========================================================
+
+    def execute(
+        self,
+        tool_name: str,
+        confirm: bool = False,
+        **parameters,
+    ):
+        """
+        Execute a single RIYA tool.
+
+        All execution goes through ToolExecutor,
+        including security and verification.
+        """
+
+        return self.executor.execute(
+            tool_name,
+            confirm=confirm,
+            **parameters,
+        )
+
+    # =========================================================
+    # MULTI-STEP PLAN EXECUTION
+    # =========================================================
+
+    def execute_plan(
+        self,
+        plan,
+        confirm: bool = False,
+    ):
+        """
+        Execute a complete multi-step RIYA plan.
+
+        ToolExecutor handles:
+
+        - security
+        - confirmation
+        - execution
+        - verification
+        - failure handling
+        """
+
+        return self.executor.execute_plan(
+            plan,
+            confirm=confirm,
+        )
+
+    # =========================================================
+    # SIMPLE DECISION + EXECUTION
+    # =========================================================
+
+    def decide_and_execute(
+        self,
+        request: str,
+        ai_runtime,
+    ):
+        """
+        Use the AI decision engine for a request.
+
+        Returns None when no tool is required.
+        """
+
+        from core.agent.tool_decision import (
+            ToolDecisionEngine,
+        )
+
+        decision_engine = ToolDecisionEngine(
+            ai_runtime,
+            self.tools,
+        )
+
+        decision = decision_engine.decide(
+            request
+        )
+
+        if decision.tool is None:
+            return None
+
+        return self.execute(
+            decision.tool,
+            **decision.parameters,
+        )
+--- core/agent/command_router.py ---
+from core.agent.intent import Intent, IntentType
+
+
+class CommandRouter:
+    """Convert user text into a RIYA intent."""
+
+    def route(self, text: str) -> Intent:
+        text = text.strip()
+        lower = text.lower()
+
+        # Exit
+        if lower in {"exit", "quit", "stop", "goodbye"}:
+            return Intent(IntentType.EXIT)
+
+        # Open application
+        if lower.startswith("open "):
+            app_name = text[5:].strip()
+
+            if app_name:
+                return Intent(
+                    IntentType.OPEN_APPLICATION,
+                    {"app_name": app_name},
+                )
+
+        # Close application
+        if lower.startswith("close "):
+            app_name = text[6:].strip()
+
+            if app_name:
+                return Intent(
+                    IntentType.CLOSE_APPLICATION,
+                    {"app_name": app_name},
+                )
+
+        # Create folder
+        if lower.startswith("create folder "):
+            folder_name = text[14:].strip()
+
+            if folder_name:
+                return Intent(
+                    IntentType.CREATE_FOLDER,
+                    {"folder_name": folder_name},
+                )
+
+        # List files
+        if lower in {
+            "list files",
+            "show files",
+            "show my files",
+        }:
+            return Intent(IntentType.LIST_FILES)
+
+        # Screenshot
+        if lower in {
+            "screenshot",
+            "take screenshot",
+            "take a screenshot",
+            "capture screen",
+        }:
+            return Intent(IntentType.SCREENSHOT)
+
+        # Current time
+        if lower in {
+            "time",
+            "what time is it",
+            "what is the time",
+            "current time",
+        }:
+            return Intent(IntentType.CURRENT_TIME)
+
+        # Everything else → AI conversation
+        return Intent(IntentType.CHAT)
+--- core/agent/context.py ---
+from dataclasses import dataclass
+
+
+@dataclass
+class ConversationMessage:
+    role: str
+    content: str
+
+
+class ConversationContext:
+    """
+    Short-term conversation context.
+
+    This data lives only for the current RIYA process/session.
+    It is NOT written to the persistent memory database.
+    """
+
+    def __init__(self, max_messages: int = 12):
+        if max_messages < 2:
+            raise ValueError(
+                "max_messages must be at least 2."
+            )
+
+        self.max_messages = max_messages
+        self._messages: list[ConversationMessage] = []
+
+    def add_user(self, content: str) -> None:
+        self._add(
+            role="user",
+            content=content,
+        )
+
+    def add_assistant(self, content: str) -> None:
+        self._add(
+            role="assistant",
+            content=content,
+        )
+
+    def _add(
+        self,
+        role: str,
+        content: str,
+    ) -> None:
+
+        content = content.strip()
+
+        if not content:
+            return
+
+        self._messages.append(
+            ConversationMessage(
+                role=role,
+                content=content,
+            )
+        )
+
+        self._trim()
+
+    def _trim(self) -> None:
+        if len(self._messages) <= self.max_messages:
+            return
+
+        self._messages = self._messages[
+            -self.max_messages:
+        ]
+
+    def messages(self) -> list[ConversationMessage]:
+        return list(self._messages)
+
+    def clear(self) -> None:
+        self._messages.clear()
+
+    def __len__(self) -> int:
+        return len(self._messages)
+
+    def format_for_prompt(self) -> str:
+        if not self._messages:
+            return ""
+
+        lines = []
+
+        for message in self._messages:
+            if message.role == "user":
+                speaker = "User"
+            else:
+                speaker = "RIYA"
+
+            lines.append(
+                f"{speaker}: {message.content}"
+            )
+
+        return "\n".join(lines)
+--- core/agent/executor.py ---
+from core.agent.intent import IntentType
+
+
+class CommandExecutor:
+    """
+    Compatibility adapter for RIYA's command router.
+
+    All real actions are delegated to RiyaAgent so that execution
+    passes through the central tool registry and security layer.
+    """
+
+    def __init__(self, agent=None):
+        self.agent = agent
+
+    def set_agent(self, agent):
+        self.agent = agent
+
+    def execute(self, intent):
+        if self.agent is None:
+            raise RuntimeError(
+                "CommandExecutor is not connected to RiyaAgent."
+            )
+
+        intent_type = intent.type
+
+        # Some older Intent implementations store arguments
+        # differently. Normalize them here.
+        parameters = getattr(intent, "parameters", None)
+
+        if parameters is None:
+            parameters = {}
+
+            # Compatibility with Intent objects that use
+            # dedicated attributes instead of parameters.
+            if hasattr(intent, "app_name"):
+                parameters["app_name"] = intent.app_name
+
+            if hasattr(intent, "path"):
+                parameters["path"] = intent.path
+
+            if hasattr(intent, "directory"):
+                parameters["directory"] = intent.directory
+
+        if intent_type == IntentType.OPEN_APPLICATION:
+            app_name = parameters.get("app_name")
+
+            if not app_name:
+                raise ValueError(
+                    "No application name was provided."
+                )
+
+            return self.agent.execute(
+                "open_application",
+                app_name=app_name,
+            )
+
+        if intent_type == IntentType.CLOSE_APPLICATION:
+            app_name = parameters.get("app_name")
+
+            if not app_name:
+                raise ValueError(
+                    "No application name was provided."
+                )
+
+            return self.agent.execute(
+                "close_application",
+                app_name=app_name,
+            )
+
+        if intent_type == IntentType.CREATE_FOLDER:
+            path = parameters.get("path")
+
+            if not path:
+                raise ValueError(
+                    "No folder path was provided."
+                )
+
+            return self.agent.execute(
+                "create_folder",
+                path=path,
+            )
+
+        if intent_type == IntentType.LIST_FILES:
+            path = parameters.get(
+                "path",
+                parameters.get("directory", "."),
+            )
+
+            return self.agent.execute(
+                "list_files",
+                path=path,
+            )
+
+        if intent_type == IntentType.SCREENSHOT:
+            return self.agent.execute(
+                "take_screenshot"
+            )
+
+        if intent_type == IntentType.CURRENT_TIME:
+            return self.agent.execute(
+                "current_time"
+            )
+
+        if intent_type == IntentType.EXIT:
+            return "Goodbye."
+
+        if intent_type == IntentType.CHAT:
+            return None
+
+        raise ValueError(
+            f"Unsupported RIYA intent: {intent_type}"
+        )
+--- core/agent/intent.py ---
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class IntentType(str, Enum):
+    CHAT = "chat"
+
+    OPEN_APPLICATION = "open_application"
+    CLOSE_APPLICATION = "close_application"
+
+    CREATE_FOLDER = "create_folder"
+    LIST_FILES = "list_files"
+
+    SCREENSHOT = "screenshot"
+    CURRENT_TIME = "current_time"
+
+    EXIT = "exit"
+
+
+@dataclass
+class Intent:
+    type: IntentType
+    parameters: dict = field(default_factory=dict)
+
+
+class IntentDetector:
+    """
+    Deterministic detector for simple, unambiguous commands.
+
+    Natural-language commands that may contain multiple actions
+    are deliberately routed to CHAT so RIYA's AI planner can
+    decompose them into multiple tool actions.
+    """
+
+    # =========================================================
+    # EXIT COMMANDS
+    # =========================================================
+
+    EXIT_COMMANDS = {
+        "exit",
+        "quit",
+        "bye",
+        "goodbye",
+        "close riya",
+        "stop riya",
+    }
+
+    # =========================================================
+    # SCREENSHOT COMMANDS
+    # =========================================================
+
+    SCREENSHOT_COMMANDS = {
+        "screenshot",
+        "take screenshot",
+        "take a screenshot",
+        "capture screen",
+        "capture the screen",
+        "capture my screen",
+        "take a screen capture",
+        "capture a screenshot",
+    }
+
+    # =========================================================
+    # CURRENT TIME COMMANDS
+    # =========================================================
+
+    CURRENT_TIME_COMMANDS = {
+        "time",
+        "current time",
+        "what time is it",
+        "what is the time",
+        "tell me the time",
+        "what's the time",
+        "whats the time",
+        "can you tell me the time",
+    }
+
+    # =========================================================
+    # APPLICATION VERBS
+    # =========================================================
+
+    OPEN_VERBS = (
+        "open ",
+        "launch ",
+        "start ",
+        "run ",
+    )
+
+    CLOSE_VERBS = (
+        "close ",
+        "quit ",
+        "exit ",
+        "stop ",
+    )
+
+    # =========================================================
+    # FOLDER COMMANDS
+    # =========================================================
+
+    CREATE_FOLDER_PREFIXES = (
+        "create a folder called ",
+        "create a folder named ",
+        "create folder called ",
+        "create folder named ",
+        "make a folder called ",
+        "make a folder named ",
+        "make folder called ",
+        "make folder named ",
+    )
+
+    # =========================================================
+    # FILE LISTING COMMANDS
+    # =========================================================
+
+    LIST_FILES_PREFIXES = (
+        "show files in ",
+        "list files in ",
+        "show me files in ",
+        "list files from ",
+        "show the files in ",
+        "display files in ",
+        "display the files in ",
+    )
+
+    # =========================================================
+    # MAIN DETECTOR
+    # =========================================================
+
+    def detect(
+        self,
+        text: str,
+    ) -> Intent:
+
+        text = text.strip()
+
+        if not text:
+            return Intent(
+                IntentType.CHAT
+            )
+
+        normalized = self._normalize(
+            text
+        )
+
+        # -----------------------------------------------------
+        # Exit
+        # -----------------------------------------------------
+
+        if normalized in self.EXIT_COMMANDS:
+
+            return Intent(
+                IntentType.EXIT
+            )
+
+        # -----------------------------------------------------
+        # Multi-action request
+        #
+        # These must go to the AI planner.
+        # -----------------------------------------------------
+
+        if self._is_multi_action_request(
+            normalized
+        ):
+
+            return Intent(
+                IntentType.CHAT
+            )
+
+        # -----------------------------------------------------
+        # Screenshot
+        # -----------------------------------------------------
+
+        if normalized in self.SCREENSHOT_COMMANDS:
+
+            return Intent(
+                IntentType.SCREENSHOT
+            )
+
+        # -----------------------------------------------------
+        # Current time
+        # -----------------------------------------------------
+
+        if normalized in self.CURRENT_TIME_COMMANDS:
+
+            return Intent(
+                IntentType.CURRENT_TIME
+            )
+
+        # -----------------------------------------------------
+        # Open application
+        # -----------------------------------------------------
+
+        app_name = self._extract_application_name(
+            text,
+            normalized,
+            self.OPEN_VERBS,
+        )
+
+        if app_name:
+
+            return Intent(
+                IntentType.OPEN_APPLICATION,
+                {
+                    "app_name": app_name,
+                },
+            )
+
+        # -----------------------------------------------------
+        # Close application
+        # -----------------------------------------------------
+
+        app_name = self._extract_application_name(
+            text,
+            normalized,
+            self.CLOSE_VERBS,
+        )
+
+        if app_name:
+
+            return Intent(
+                IntentType.CLOSE_APPLICATION,
+                {
+                    "app_name": app_name,
+                },
+            )
+
+        # -----------------------------------------------------
+        # Create folder
+        # -----------------------------------------------------
+
+        for prefix in self.CREATE_FOLDER_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                folder_name = text[
+                    len(prefix):
+                ].strip()
+
+                if folder_name:
+
+                    return Intent(
+                        IntentType.CREATE_FOLDER,
+                        {
+                            "path": folder_name,
+                        },
+                    )
+
+        # -----------------------------------------------------
+        # List files
+        # -----------------------------------------------------
+
+        for prefix in self.LIST_FILES_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                path = text[
+                    len(prefix):
+                ].strip()
+
+                if path:
+
+                    return Intent(
+                        IntentType.LIST_FILES,
+                        {
+                            "path": self._normalize_path_alias(
+                                path
+                            ),
+                        },
+                    )
+
+        # -----------------------------------------------------
+        # No deterministic command found
+        # -----------------------------------------------------
+
+        return Intent(
+            IntentType.CHAT
+        )
+
+    # =========================================================
+    # NORMALIZATION
+    # =========================================================
+
+    def _normalize(
+        self,
+        text: str,
+    ) -> str:
+
+        normalized = text.lower().strip()
+
+        # Remove common punctuation at the end.
+        normalized = normalized.rstrip(
+            "!?.,"
+        )
+
+        # Collapse repeated whitespace.
+        normalized = " ".join(
+            normalized.split()
+        )
+
+        return normalized
+
+    # =========================================================
+    # APPLICATION NAME EXTRACTION
+    # =========================================================
+
+    def _extract_application_name(
+        self,
+        original_text: str,
+        normalized_text: str,
+        verbs,
+    ) -> str | None:
+
+        for verb in verbs:
+
+            if not normalized_text.startswith(
+                verb
+            ):
+                continue
+
+            # Use the original text so application names
+            # retain their original capitalization.
+
+            app_name = original_text[
+                len(verb):
+            ].strip()
+
+            app_name = app_name.rstrip(
+                "!?.,"
+            ).strip()
+
+            if not app_name:
+                return None
+
+            # -------------------------------------------------
+            # Natural-language suffixes
+            #
+            # Example:
+            # "Open Safari for me"
+            # → Safari
+            # -------------------------------------------------
+
+            suffixes = (
+                " for me",
+                " please",
+                " for me please",
+            )
+
+            lowered_name = app_name.lower()
+
+            for suffix in suffixes:
+
+                if lowered_name.endswith(
+                    suffix
+                ):
+
+                    app_name = app_name[
+                        : -len(suffix)
+                    ].strip()
+
+                    break
+
+            if app_name:
+                return app_name
+
+            return None
+
+        return None
+
+    # =========================================================
+    # MULTI-ACTION DETECTION
+    # =========================================================
+
+    def _is_multi_action_request(
+        self,
+        normalized: str,
+    ) -> bool:
+
+        # -----------------------------------------------------
+        # Explicit action separators
+        # -----------------------------------------------------
+
+        markers = (
+            " and ",
+            " then ",
+            " after that ",
+            " followed by ",
+            " next ",
+        )
+
+        if any(
+            marker in normalized
+            for marker in markers
+        ):
+
+            return True
+
+        # -----------------------------------------------------
+        # Comma-separated commands
+        #
+        # Example:
+        # "Open Safari, take a screenshot"
+        # -----------------------------------------------------
+
+        if "," in normalized:
+
+            command_words = (
+                "open ",
+                "launch ",
+                "start ",
+                "close ",
+                "quit ",
+                "take ",
+                "capture ",
+                "set ",
+                "mute",
+                "unmute",
+                "create ",
+                "make ",
+                "show ",
+                "list ",
+            )
+
+            parts = [
+                part.strip()
+                for part in normalized.split(",")
+                if part.strip()
+            ]
+
+            if len(parts) >= 2:
+
+                command_like_parts = 0
+
+                for part in parts:
+
+                    if part.startswith(
+                        command_words
+                    ):
+
+                        command_like_parts += 1
+
+                if command_like_parts >= 2:
+
+                    return True
+
+        return False
+
+    # =========================================================
+    # PATH ALIASES
+    # =========================================================
+
+    def _normalize_path_alias(
+        self,
+        path: str,
+    ) -> str:
+
+        aliases = {
+            "desktop": "~/Desktop",
+            "my desktop": "~/Desktop",
+
+            "documents": "~/Documents",
+            "my documents": "~/Documents",
+
+            "downloads": "~/Downloads",
+            "my downloads": "~/Downloads",
+
+            "home": "~",
+            "home folder": "~",
+            "home directory": "~",
+        }
+
+        normalized = self._normalize(
+            path
+        )
+
+        return aliases.get(
+            normalized,
+            path,
+        )
+--- core/agent/planner.py ---
+from dataclasses import dataclass, field
+import inspect
+import json
+from typing import Any
+
+
+@dataclass
+class PlanStep:
+    """One validated action in a RIYA plan."""
+
+    action: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+
+@dataclass
+class Plan:
+    """A complete plan created for a user request."""
+
+    goal: str
+    steps: list[PlanStep] = field(default_factory=list)
+
+
+class AgentPlanner:
+    """
+    Convert natural-language requests into validated tool plans.
+
+    The planner never executes tools. All execution remains
+    under RIYA's existing ToolExecutor and security system.
+    """
+
+    def __init__(
+        self,
+        ai_runtime,
+        tool_registry,
+        semantic_engine=None,
+        max_steps: int = 8,
+    ):
+        self.ai = ai_runtime
+        self.tools = tool_registry
+        self.semantic = semantic_engine
+        self.max_steps = max(1, min(max_steps, 8))
+
+    def create_plan(self, user_request: str) -> Plan:
+        request = user_request.strip()
+
+        if not request:
+            return Plan(goal="", steps=[])
+
+        tool_descriptions = self._get_tool_descriptions(request)
+
+        prompt = f"""
+You are RIYA's planning engine.
+
+Convert the user's request into a safe sequence of tool actions.
+
+USER REQUEST:
+{request}
+
+AVAILABLE REGISTERED TOOLS:
+{tool_descriptions}
+
+RETURN ONLY VALID JSON in this exact format:
+
+{{
+  "steps": [
+    {{
+      "action": "registered_tool_name",
+      "parameters": {{}},
+      "description": "Short explanation of this action"
+    }}
+  ]
+}}
+
+RULES:
+
+1. Use only tools listed under AVAILABLE REGISTERED TOOLS.
+2. Never invent a tool or parameter.
+3. Use the exact parameter names provided by the tool.
+4. Every action must be a registered tool.
+5. Include all required parameters.
+6. Break multi-action requests into ordered steps.
+7. Do not create unnecessary steps.
+8. Do not execute any action.
+9. Never include Python, shell commands, or executable code.
+10. If the request is ordinary conversation and requires no tool,
+    return an empty steps array.
+11. Maximum steps: {self.max_steps}.
+12. Return JSON only. No Markdown or explanation.
+
+JSON:
+"""
+
+        response = self.ai.generate(prompt)
+        data = self._parse_json(response)
+
+        if not isinstance(data, dict):
+            raise ValueError("Planner response must be a JSON object.")
+
+        raw_steps = data.get("steps", [])
+
+        if not isinstance(raw_steps, list):
+            raise ValueError("Planner steps must be a JSON array.")
+
+        if len(raw_steps) > self.max_steps:
+            raise ValueError(
+                f"Planner returned too many steps. Maximum: {self.max_steps}"
+            )
+
+        validated_steps = []
+
+        for index, raw_step in enumerate(raw_steps, start=1):
+            validated_steps.append(
+                self._validate_step(raw_step, index)
+            )
+
+        return Plan(
+            goal=request,
+            steps=validated_steps,
+        )
+
+    def _get_tool_descriptions(self, request: str) -> str:
+        if self.semantic is not None:
+            descriptions = self.semantic.relevant_tool_descriptions(
+                request
+            )
+
+            if descriptions.strip():
+                return descriptions
+
+        lines = []
+
+        for tool in self.tools.list_tools():
+            parameters = ", ".join(sorted(tool.parameters))
+
+            lines.append(
+                f"- {tool.name}({parameters}): {tool.description}"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_json(response: str) -> dict:
+        if not isinstance(response, str) or not response.strip():
+            raise ValueError("RIYA returned an empty planning response.")
+
+        start = response.find("{")
+
+        if start == -1:
+            raise ValueError(
+                f"RIYA returned no JSON plan: {response}"
+            )
+
+        try:
+            data, _ = json.JSONDecoder().raw_decode(response[start:])
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"RIYA returned invalid planning JSON: {exc}"
+            ) from exc
+
+        return data
+
+    def _validate_step(self, raw_step: Any, index: int) -> PlanStep:
+        if not isinstance(raw_step, dict):
+            raise ValueError(
+                f"Plan step {index} must be a JSON object."
+            )
+
+        action = raw_step.get("action")
+        parameters = raw_step.get("parameters", {})
+        description = raw_step.get("description", "")
+
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError(
+                f"Plan step {index} has an invalid action."
+            )
+
+        action = action.strip()
+
+        if not isinstance(parameters, dict):
+            raise ValueError(
+                f"Parameters for step {index} must be an object."
+            )
+
+        if not all(isinstance(key, str) for key in parameters):
+            raise ValueError(
+                f"Parameter names in step {index} must be strings."
+            )
+
+        if not isinstance(description, str):
+            raise ValueError(
+                f"Description for step {index} must be a string."
+            )
+
+        tool = self.tools.get(action)
+
+        if tool is None:
+            raise ValueError(
+                f"Planner selected an unregistered tool: {action}"
+            )
+
+        # Reject parameters not explicitly allowed by the registry.
+        self.tools.validate_parameters(action, parameters)
+
+        # Check required function arguments as well.
+        try:
+            signature = inspect.signature(tool.function)
+
+            required = {
+                parameter.name
+                for parameter in signature.parameters.values()
+                if parameter.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+                and parameter.default is inspect.Parameter.empty
+            }
+
+            missing = required - set(parameters)
+
+            if missing:
+                raise ValueError(
+                    f"Missing required parameters for '{action}': "
+                    f"{sorted(missing)}"
+                )
+
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(
+                "Missing required parameters"
+            ):
+                raise
+
+        return PlanStep(
+            action=action,
+            parameters=parameters,
+            description=description.strip() or action,
+        )
+
+--- core/agent/semantic.py ---
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+
+@dataclass
+class SemanticMatch:
+    tool_name: str
+    description: str
+    score: float
+
+
+class SemanticToolEngine:
+    """
+    RIYA local semantic understanding engine.
+
+    Uses a pretrained embedding model to determine which
+    RIYA tools are semantically relevant to a user request.
+
+    Important:
+
+        Embeddings DO NOT execute tools.
+
+    They only retrieve the tools that are most relevant.
+
+    Execution remains controlled by:
+
+        SecurityManager
+            ↓
+        ToolExecutor
+            ↓
+        Verification
+    """
+
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+    def __init__(
+        self,
+        tool_registry,
+        model_name: str = MODEL_NAME,
+        top_k: int = 5,
+    ):
+        self.tools = tool_registry
+        self.top_k = max(1, top_k)
+
+        self.model = self._load_model(
+            model_name
+        )
+
+        self._tool_texts = []
+        self._tool_names = []
+        self._tool_embeddings = None
+
+        self._build_index()
+
+    # =========================================================
+    # MODEL
+    # =========================================================
+
+    def _load_model(
+        self,
+        model_name: str,
+    ):
+        """
+        Load the pretrained embedding model.
+
+        First execution may download the model.
+        Later executions use the local cache.
+        """
+
+        try:
+            return SentenceTransformer(
+                model_name
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "RIYA could not load the local "
+                "embedding model.\n\n"
+                "The first run requires internet access "
+                "to download the pretrained model.\n"
+                "After that, RIYA can use the cached model "
+                "offline.\n\n"
+                f"Original error: {exc}"
+            ) from exc
+
+    # =========================================================
+    # BUILD TOOL INDEX
+    # =========================================================
+
+    def _build_index(self):
+        """
+        Convert RIYA's registered tools into embeddings.
+        """
+
+        tools = self.tools.list_tools()
+
+        if not tools:
+            raise RuntimeError(
+                "RIYA has no tools available for "
+                "semantic indexing."
+            )
+
+        self._tool_texts = []
+        self._tool_names = []
+
+        for tool in tools:
+
+            text = self._build_tool_text(
+                tool
+            )
+
+            self._tool_texts.append(
+                text
+            )
+
+            self._tool_names.append(
+                tool.name
+            )
+
+        self._tool_embeddings = (
+            self.model.encode(
+                self._tool_texts,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+        )
+
+    # =========================================================
+    # TOOL DESCRIPTION
+    # =========================================================
+
+    def _build_tool_text(
+        self,
+        tool,
+    ) -> str:
+        """
+        Build semantic information for a tool.
+
+        This is NOT a list of command rules.
+
+        It describes what the capability means.
+        """
+
+        parameters = ", ".join(
+            sorted(tool.parameters)
+        )
+
+        return (
+            f"Tool: {tool.name}. "
+            f"Capability: {tool.description}. "
+            f"Parameters: {parameters}."
+        )
+
+    # =========================================================
+    # RETRIEVE
+    # =========================================================
+
+    def retrieve(
+        self,
+        user_request: str,
+        top_k: int | None = None,
+    ) -> list[SemanticMatch]:
+        """
+        Retrieve the most semantically relevant tools.
+        """
+
+        request = user_request.strip()
+
+        if not request:
+            return []
+
+        if self._tool_embeddings is None:
+            self._build_index()
+
+        k = top_k or self.top_k
+
+        k = min(
+            k,
+            len(self._tool_names),
+        )
+
+        query_embedding = (
+            self.model.encode(
+                request,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+        )
+
+        scores = np.dot(
+            self._tool_embeddings,
+            query_embedding,
+        )
+
+        ranked_indices = np.argsort(
+            scores
+        )[::-1][:k]
+
+        matches = []
+
+        for index in ranked_indices:
+
+            tool_name = (
+                self._tool_names[index]
+            )
+
+            tool = self.tools.get(
+                tool_name
+            )
+
+            matches.append(
+                SemanticMatch(
+                    tool_name=tool_name,
+                    description=tool.description,
+                    score=float(
+                        scores[index]
+                    ),
+                )
+            )
+
+        return matches
+
+    # =========================================================
+    # BEST TOOL
+    # =========================================================
+
+    def best_match(
+        self,
+        user_request: str,
+    ) -> SemanticMatch | None:
+
+        matches = self.retrieve(
+            user_request,
+            top_k=1,
+        )
+
+        if not matches:
+            return None
+
+        return matches[0]
+
+    # =========================================================
+    # RELEVANT TOOL TEXT
+    # =========================================================
+
+    def relevant_tool_descriptions(
+        self,
+        user_request: str,
+        top_k: int | None = None,
+    ) -> str:
+        """
+        Return the most relevant tools in a format that
+        Qwen3 can use for structured planning.
+        """
+
+        matches = self.retrieve(
+            user_request,
+            top_k=top_k,
+        )
+
+        if not matches:
+            return ""
+
+        lines = []
+
+        for match in matches:
+
+            tool = self.tools.get(
+                match.tool_name
+            )
+
+            parameters = ", ".join(
+                sorted(tool.parameters)
+            )
+
+            if parameters:
+
+                lines.append(
+                    f"- {tool.name}"
+                    f"({parameters}): "
+                    f"{tool.description}"
+                    f" [semantic_score="
+                    f"{match.score:.3f}]"
+                )
+
+            else:
+
+                lines.append(
+                    f"- {tool.name}(): "
+                    f"{tool.description}"
+                    f" [semantic_score="
+                    f"{match.score:.3f}]"
+                )
+
+        return "\n".join(
+            lines
+        )
+--- core/agent/tool_decision.py ---
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class ToolDecision:
+    """A structured decision made by RIYA's AI."""
+
+    tool: str | None
+    parameters: dict[str, Any]
+    reason: str = ""
+
+
+class ToolDecisionEngine:
+    """Convert natural-language requests into safe tool decisions."""
+
+    def __init__(self, ai_runtime, tool_registry):
+        self.ai = ai_runtime
+        self.tools = tool_registry
+
+    def _tool_descriptions(self) -> str:
+        """Build the tool list sent to the local model."""
+
+        descriptions = []
+
+        for tool in self.tools.list_tools():
+            descriptions.append(
+                f"- {tool.name}: {tool.description}"
+            )
+
+        return "\n".join(descriptions)
+
+    def decide(self, request: str) -> ToolDecision:
+        """Ask the local AI which registered tool should handle a request."""
+
+        prompt = f"""
+You are RIYA's tool decision engine.
+
+Your job is ONLY to decide whether the user's request
+should use one of the available tools.
+
+Available tools:
+{self._tool_descriptions()}
+
+User request:
+{request}
+
+Return ONLY valid JSON in this exact format:
+
+{{
+  "tool": "tool_name_or_null",
+  "parameters": {{}},
+  "reason": "short explanation"
+}}
+
+Rules:
+- Use only tools from the available tool list.
+- Never invent a tool.
+- Never invent parameters that the tool does not need.
+- If no tool is appropriate, use null for "tool".
+- Do not execute anything.
+- Do not include markdown.
+"""
+
+        response = self.ai.generate(prompt)
+
+        return self._parse_response(response)
+
+    def _parse_response(self, response: str) -> ToolDecision:
+        """Extract, parse, and validate the first JSON object."""
+
+        response = response.strip()
+
+        start = response.find("{")
+
+        if start == -1:
+            raise ValueError(
+                f"RIYA returned no JSON tool decision: {response}"
+            )
+
+        depth = 0
+        end = None
+
+        for index in range(start, len(response)):
+            if response[index] == "{":
+                depth += 1
+
+            elif response[index] == "}":
+                depth -= 1
+
+                if depth == 0:
+                    end = index + 1
+                    break
+
+        if end is None:
+            raise ValueError(
+                f"RIYA returned incomplete JSON: {response}"
+            )
+
+        json_text = response[start:end]
+
+        try:
+            data = json.loads(json_text)
+
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"RIYA returned invalid tool JSON: {json_text}"
+            ) from exc
+
+        tool_name = data.get("tool")
+        parameters = data.get("parameters", {})
+        reason = data.get("reason", "")
+
+        if tool_name is not None and not self.tools.has(tool_name):
+            raise ValueError(
+                f"RIYA selected an unavailable tool: {tool_name}"
+            )
+
+        if not isinstance(parameters, dict):
+            raise ValueError(
+                "RIYA tool parameters must be an object."
+            )
+
+        # Normalize common parameter naming variations.
+        if tool_name == "set_volume":
+            if "level" not in parameters and "volume" in parameters:
+                parameters["level"] = parameters.pop("volume")
+
+        return ToolDecision(
+            tool=tool_name,
+            parameters=parameters,
+            reason=reason,
+        )
+--- core/agent/tool_executor.py ---
+from core.agent.tool_registry import ToolRegistry
+from core.security.manager import SecurityManager
+
+
+class ToolExecutor:
+    """
+    Central execution layer for RIYA.
+
+    Responsibilities:
+    - Validate tools
+    - Validate parameters
+    - Apply security rules
+    - Handle confirmation
+    - Execute tools
+    - Verify important actions
+    - Execute multi-step plans safely
+    """
+
+    def __init__(self, registry: ToolRegistry):
+        self.registry = registry
+        self.security = SecurityManager()
+
+    # =========================================================
+    # SINGLE TOOL EXECUTION
+    # =========================================================
+
+    def execute(
+        self,
+        tool_name: str,
+        confirm: bool = False,
+        **parameters,
+    ):
+        """
+        Execute one RIYA tool.
+
+        Returns a structured result.
+        """
+
+        # -----------------------------------------------------
+        # 1. Find tool
+        # -----------------------------------------------------
+
+        tool = self.registry.get(tool_name)
+
+        if tool is None:
+            raise ValueError(
+                f"RIYA does not have a tool named "
+                f"'{tool_name}'."
+            )
+
+        # -----------------------------------------------------
+        # 2. Validate parameters
+        # -----------------------------------------------------
+
+        self.registry.validate_parameters(
+            tool_name,
+            parameters,
+        )
+
+        # -----------------------------------------------------
+        # 3. Security check
+        # -----------------------------------------------------
+
+        decision = self.security.check(
+            tool_name
+        )
+
+        if not decision.allowed:
+            raise PermissionError(
+                f"RIYA blocked '{tool_name}': "
+                f"{decision.reason}"
+            )
+
+        # -----------------------------------------------------
+        # 4. Confirmation
+        # -----------------------------------------------------
+
+        if (
+            decision.requires_confirmation
+            and not confirm
+        ):
+            return {
+                "status": "confirmation_required",
+                "tool": tool_name,
+                "parameters": parameters,
+                "reason": decision.reason,
+            }
+
+        # -----------------------------------------------------
+        # 5. Execute tool
+        # -----------------------------------------------------
+
+        try:
+            result = tool.function(
+                **parameters
+            )
+
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "tool": tool_name,
+                "parameters": parameters,
+                "error": str(exc),
+            }
+
+        # -----------------------------------------------------
+        # 6. Verify execution
+        # -----------------------------------------------------
+
+        verification = self.verify(
+            tool_name,
+            parameters,
+            result,
+        )
+
+        if not verification["success"]:
+            return {
+                "status": "verification_failed",
+                "tool": tool_name,
+                "parameters": parameters,
+                "result": result,
+                "reason": verification["reason"],
+            }
+
+        # -----------------------------------------------------
+        # 7. Successful execution
+        # -----------------------------------------------------
+
+        return {
+            "status": "success",
+            "tool": tool_name,
+            "parameters": parameters,
+            "result": result,
+            "verification": verification,
+        }
+
+    # =========================================================
+    # MULTI-STEP PLAN EXECUTION
+    # =========================================================
+
+    def execute_plan(
+        self,
+        plan,
+        confirm: bool = False,
+    ):
+        """
+        Execute a RIYA multi-step plan.
+
+        Execution stops when:
+        - confirmation is required
+        - a tool fails
+        - verification fails
+        """
+
+        results = []
+
+        for step in plan.steps:
+
+            # -------------------------------------------------
+            # Internal planning step
+            # -------------------------------------------------
+
+            if step.action == "understand":
+
+                results.append({
+                    "status": "success",
+                    "action": "understand",
+                    "description": step.description,
+                    "result": "Task understood.",
+                })
+
+                continue
+
+            # -------------------------------------------------
+            # Execute step
+            # -------------------------------------------------
+
+            result = self.execute(
+                step.action,
+                confirm=confirm,
+                **step.parameters,
+            )
+
+            step_result = {
+                "action": step.action,
+                "description": step.description,
+                "result": result,
+            }
+
+            results.append(step_result)
+
+            # -------------------------------------------------
+            # Confirmation required
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                == "confirmation_required"
+            ):
+                break
+
+            # -------------------------------------------------
+            # Execution failure
+            # -------------------------------------------------
+
+            if (
+                isinstance(result, dict)
+                and result.get("status")
+                in {
+                    "failed",
+                    "verification_failed",
+                }
+            ):
+                break
+
+        return results
+
+    # =========================================================
+    # VERIFICATION
+    # =========================================================
+
+    def verify(
+        self,
+        tool_name: str,
+        parameters: dict,
+        result,
+    ) -> dict:
+        """
+        Verify that an important action actually happened.
+        """
+
+        # -----------------------------------------------------
+        # Open application
+        # -----------------------------------------------------
+
+        if tool_name == "open_application":
+
+            app_name = parameters.get(
+                "app_name"
+            )
+
+            if not app_name:
+                return {
+                    "success": False,
+                    "reason": (
+                        "Application name was missing."
+                    ),
+                }
+
+            return self._verify_application_running(
+                app_name
+            )
+
+        # -----------------------------------------------------
+        # Close application
+        # -----------------------------------------------------
+
+        if tool_name == "close_application":
+
+            app_name = parameters.get(
+                "app_name"
+            )
+
+            if not app_name:
+                return {
+                    "success": False,
+                    "reason": (
+                        "Application name was missing."
+                    ),
+                }
+
+            return self._verify_application_closed(
+                app_name
+            )
+
+        # -----------------------------------------------------
+        # Screenshot
+        # -----------------------------------------------------
+
+        if tool_name == "take_screenshot":
+
+            return self._verify_screenshot(
+                result
+            )
+
+        # -----------------------------------------------------
+        # Create folder
+        # -----------------------------------------------------
+
+        if tool_name == "create_folder":
+
+            path = parameters.get(
+                "path"
+            )
+
+            return self._verify_path_exists(
+                path,
+                expected_type="directory",
+            )
+
+        # -----------------------------------------------------
+        # Write file
+        # -----------------------------------------------------
+
+        if tool_name == "write_file":
+
+            path = parameters.get(
+                "path"
+            )
+
+            return self._verify_path_exists(
+                path,
+                expected_type="file",
+            )
+
+        # -----------------------------------------------------
+        # Delete file
+        # -----------------------------------------------------
+
+        if tool_name == "delete_file":
+
+            path = parameters.get(
+                "path"
+            )
+
+            return self._verify_path_missing(
+                path
+            )
+
+        # -----------------------------------------------------
+        # Delete folder
+        # -----------------------------------------------------
+
+        if tool_name == "delete_folder":
+
+            path = parameters.get(
+                "path"
+            )
+
+            return self._verify_path_missing(
+                path
+            )
+
+        # -----------------------------------------------------
+        # Other tools
+        # -----------------------------------------------------
+
+        if isinstance(result, dict):
+
+            if result.get("status") == "failed":
+                return {
+                    "success": False,
+                    "reason": result.get(
+                        "error",
+                        "Tool execution failed.",
+                    ),
+                }
+
+        return {
+            "success": True,
+            "reason": "Tool completed successfully.",
+        }
+
+    # =========================================================
+    # VERIFY APPLICATION RUNNING
+    # =========================================================
+
+    def _verify_application_running(
+        self,
+        app_name: str,
+    ):
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "pgrep",
+                    "-x",
+                    app_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+
+            if result.returncode == 0:
+                return {
+                    "success": True,
+                    "reason": (
+                        f"{app_name} is running."
+                    ),
+                }
+
+            return {
+                "success": False,
+                "reason": (
+                    f"{app_name} could not be "
+                    "verified as running."
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "reason": (
+                    "Application verification failed: "
+                    f"{exc}"
+                ),
+            }
+
+    # =========================================================
+    # VERIFY APPLICATION CLOSED
+    # =========================================================
+
+    def _verify_application_closed(
+        self,
+        app_name: str,
+    ):
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "pgrep",
+                    "-x",
+                    app_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": True,
+                    "reason": (
+                        f"{app_name} is no longer running."
+                    ),
+                }
+
+            return {
+                "success": False,
+                "reason": (
+                    f"{app_name} is still running."
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "reason": (
+                    "Application verification failed: "
+                    f"{exc}"
+                ),
+            }
+
+    # =========================================================
+    # VERIFY SCREENSHOT
+    # =========================================================
+
+    def _verify_screenshot(
+        self,
+        result,
+    ):
+        from pathlib import Path
+
+        if not isinstance(result, str):
+            return {
+                "success": False,
+                "reason": (
+                    "Screenshot tool did not return "
+                    "a file path."
+                ),
+            }
+
+        possible_path = None
+
+        # -----------------------------------------------------
+        # Try paths contained in the tool result
+        # -----------------------------------------------------
+
+        for token in result.split():
+
+            cleaned = token.strip(
+                ".,:;()[]{}'\""
+            )
+
+            candidate = Path(
+                cleaned
+            ).expanduser()
+
+            if (
+                cleaned.startswith("/")
+                and candidate.exists()
+            ):
+                possible_path = candidate
+                break
+
+        # -----------------------------------------------------
+        # Search Desktop for recent screenshot
+        # -----------------------------------------------------
+
+        if possible_path is None:
+
+            desktop = (
+                Path.home()
+                / "Desktop"
+            )
+
+            if desktop.exists():
+
+                screenshots = sorted(
+                    desktop.glob(
+                        "*screenshot*.png"
+                    ),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+
+                if screenshots:
+                    possible_path = (
+                        screenshots[0]
+                    )
+
+        # -----------------------------------------------------
+        # Could not verify
+        # -----------------------------------------------------
+
+        if possible_path is None:
+            return {
+                "success": False,
+                "reason": (
+                    "Screenshot was reported as created, "
+                    "but RIYA could not verify the file."
+                ),
+            }
+
+        # -----------------------------------------------------
+        # File must exist
+        # -----------------------------------------------------
+
+        if not possible_path.is_file():
+            return {
+                "success": False,
+                "reason": (
+                    f"Screenshot file does not exist: "
+                    f"{possible_path}"
+                ),
+            }
+
+        # -----------------------------------------------------
+        # File must not be empty
+        # -----------------------------------------------------
+
+        if possible_path.stat().st_size == 0:
+            return {
+                "success": False,
+                "reason": (
+                    f"Screenshot file is empty: "
+                    f"{possible_path}"
+                ),
+            }
+
+        return {
+            "success": True,
+            "reason": (
+                f"Screenshot verified: "
+                f"{possible_path}"
+            ),
+        }
+
+    # =========================================================
+    # VERIFY PATH EXISTS
+    # =========================================================
+
+    def _verify_path_exists(
+        self,
+        path: str | None,
+        expected_type: str,
+    ):
+        from pathlib import Path
+
+        if not path:
+            return {
+                "success": False,
+                "reason": "Path was missing.",
+            }
+
+        resolved = (
+            Path(path)
+            .expanduser()
+            .resolve()
+        )
+
+        if not resolved.exists():
+            return {
+                "success": False,
+                "reason": (
+                    f"Path was not created: "
+                    f"{resolved}"
+                ),
+            }
+
+        if expected_type == "directory":
+
+            if not resolved.is_dir():
+                return {
+                    "success": False,
+                    "reason": (
+                        f"Expected a directory but "
+                        f"found: {resolved}"
+                    ),
+                }
+
+        if expected_type == "file":
+
+            if not resolved.is_file():
+                return {
+                    "success": False,
+                    "reason": (
+                        f"Expected a file but "
+                        f"found: {resolved}"
+                    ),
+                }
+
+        return {
+            "success": True,
+            "reason": (
+                f"Verified: {resolved}"
+            ),
+        }
+
+    # =========================================================
+    # VERIFY PATH IS MISSING
+    # =========================================================
+
+    def _verify_path_missing(
+        self,
+        path: str | None,
+    ):
+        from pathlib import Path
+
+        if not path:
+            return {
+                "success": False,
+                "reason": "Path was missing.",
+            }
+
+        resolved = (
+            Path(path)
+            .expanduser()
+            .resolve()
+        )
+
+        if resolved.exists():
+            return {
+                "success": False,
+                "reason": (
+                    f"Path still exists: "
+                    f"{resolved}"
+                ),
+            }
+
+        return {
+            "success": True,
+            "reason": (
+                f"Verified missing: "
+                f"{resolved}"
+            ),
+        }
+--- core/agent/tool_registry.py ---
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
+
+
+@dataclass
+class Tool:
+    """A capability available to RIYA."""
+
+    name: str
+    description: str
+    function: Callable
+    parameters: set[str]
+
+
+class ToolRegistry:
+    """Registry of tools available to the RIYA agent."""
+
+    def __init__(self):
+        self._tools: Dict[str, Tool] = {}
+
+    def register(
+        self,
+        name: str,
+        description: str,
+        function: Callable,
+        parameters: Optional[set[str]] = None,
+    ) -> None:
+        """Register a tool and its accepted parameters."""
+
+        if name in self._tools:
+            raise ValueError(
+                f"Tool already registered: {name}"
+            )
+
+        self._tools[name] = Tool(
+            name=name,
+            description=description,
+            function=function,
+            parameters=parameters or set(),
+        )
+
+    def get(self, name: str) -> Optional[Tool]:
+        """Get a registered tool."""
+
+        return self._tools.get(name)
+
+    def list_tools(self) -> list[Tool]:
+        """Return all registered tools."""
+
+        return list(self._tools.values())
+
+    def has(self, name: str) -> bool:
+        """Check whether a tool exists."""
+
+        return name in self._tools
+
+    def validate_parameters(
+        self,
+        name: str,
+        parameters: dict,
+    ) -> None:
+        """Validate parameters before tool execution."""
+
+        tool = self.get(name)
+
+        if tool is None:
+            raise ValueError(
+                f"Unknown RIYA tool: {name}"
+            )
+
+        unexpected = set(parameters) - tool.parameters
+
+        if unexpected:
+            raise ValueError(
+                f"Unexpected parameters for '{name}': "
+                f"{sorted(unexpected)}. "
+                f"Allowed: {sorted(tool.parameters)}"
+            )
+===== MEMORY INTENT =====
+from dataclasses import dataclass
+from enum import Enum
+
+
+class MemoryIntentType(str, Enum):
+
+    NONE = "none"
+    REMEMBER = "remember"
+    RECALL = "recall"
+    FORGET = "forget"
+    LIST = "list"
+
+
+@dataclass
+class MemoryIntent:
+
+    type: MemoryIntentType
+    category: str | None = None
+    key: str | None = None
+    value: str | None = None
+
+
+class MemoryIntentDetector:
+
+    REMEMBER_PREFIXES = (
+        "remember that ",
+        "remember ",
+        "save that ",
+        "save ",
+        "store that ",
+        "store ",
+        "keep in mind that ",
+        "keep in mind ",
+        "don't forget that ",
+        "dont forget that ",
+    )
+
+    RECALL_PREFIXES = (
+        "what do you remember about ",
+        "what do you remember ",
+        "do you remember ",
+        "recall ",
+        "tell me what you remember about ",
+    )
+
+    FORGET_PREFIXES = (
+        "forget that ",
+        "forget ",
+        "remove the memory of ",
+        "delete the memory of ",
+    )
+
+    LIST_PHRASES = {
+        "list my memories",
+        "show my memories",
+        "show me my memories",
+        "what do you remember about me",
+        "what do you remember about me?",
+        "what do you know about me",
+        "what do you know about me?",
+    }
+
+    def detect(
+        self,
+        text: str,
+    ) -> MemoryIntent:
+
+        text = text.strip()
+
+        if not text:
+            return MemoryIntent(
+                MemoryIntentType.NONE
+            )
+
+        normalized = text.lower()
+
+        # PERSONAL MEMORY RECALL
+        personal_question = normalized.rstrip(" ?.!")
+
+        personal_recall_questions = {
+            "what is my name",
+            "what's my name",
+            "what is my full name",
+            "who am i",
+            "tell me my name",
+            "do you know my name",
+        }
+
+        if personal_question in personal_recall_questions:
+            return MemoryIntent(
+                type=MemoryIntentType.RECALL,
+                category="personal",
+                key="my_name",
+            )
+
+        # LIST
+        if normalized in self.LIST_PHRASES:
+
+            return MemoryIntent(
+                MemoryIntentType.LIST
+            )
+
+        # REMEMBER
+        for prefix in self.REMEMBER_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return (
+                        self._build_remember_intent(
+                            content
+                        )
+                    )
+
+        # FORGET
+        for prefix in self.FORGET_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.FORGET
+                        ),
+                        category="general",
+                        key=self._make_key(
+                            content
+                        ),
+                    )
+
+        # RECALL
+        for prefix in self.RECALL_PREFIXES:
+
+            if normalized.startswith(prefix):
+
+                content = text[
+                    len(prefix):
+                ].strip()
+
+                if content:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.RECALL
+                        ),
+                        category="general",
+                        key=self._make_key(
+                            content
+                        ),
+                    )
+
+        return MemoryIntent(
+            MemoryIntentType.NONE
+        )
+
+    def _build_remember_intent(
+        self,
+        content: str,
+    ) -> MemoryIntent:
+
+        category = "general"
+
+        key = self._make_key(
+            content
+        )
+
+        value = content
+
+        lowered = content.lower()
+
+        # ------------------------------------------
+        # "X is Y"
+        # ------------------------------------------
+
+        markers = (
+            " is ",
+            " are ",
+            " = ",
+        )
+
+        for marker in markers:
+
+            index = lowered.find(marker)
+
+            if index > 0:
+
+                left = content[
+                    :index
+                ].strip()
+
+                right = content[
+                    index + len(marker):
+                ].strip()
+
+                if left and right:
+
+                    key = self._make_key(
+                        left
+                    )
+
+                    value = right
+
+                    category = (
+                        self._infer_category(
+                            left
+                        )
+                    )
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.REMEMBER
+                        ),
+                        category=category,
+                        key=key,
+                        value=value,
+                    )
+
+        # ------------------------------------------
+        # "I prefer X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i prefer "
+        ):
+
+            value = content[
+                len("I prefer "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="preferred",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "I like X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i like "
+        ):
+
+            value = content[
+                len("I like "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="likes",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "I don't like X"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "i don't like "
+        ):
+
+            value = content[
+                len("I don't like "):
+            ].strip()
+
+            return MemoryIntent(
+                type=(
+                    MemoryIntentType.REMEMBER
+                ),
+                category="preferences",
+                key="dislikes",
+                value=value,
+            )
+
+        # ------------------------------------------
+        # "My favorite X is Y"
+        # ------------------------------------------
+
+        if lowered.startswith(
+            "my favorite "
+        ):
+
+            marker = " is "
+
+            index = lowered.find(
+                marker
+            )
+
+            if index > 0:
+
+                left = content[
+                    len("My favorite "):
+                    index
+                ].strip()
+
+                right = content[
+                    index + len(marker):
+                ].strip()
+
+                if left and right:
+
+                    return MemoryIntent(
+                        type=(
+                            MemoryIntentType.REMEMBER
+                        ),
+                        category="preferences",
+                        key=(
+                            "favorite_"
+                            + self._make_key(
+                                left
+                            )
+                        ),
+                        value=right,
+                    )
+
+        return MemoryIntent(
+            type=MemoryIntentType.REMEMBER,
+            category=category,
+            key=key,
+            value=value,
+        )
+
+    def _infer_category(
+        self,
+        text: str,
+    ) -> str:
+
+        lowered = text.lower()
+
+        if any(
+            word in lowered
+            for word in (
+                "favorite",
+                "favourite",
+                "prefer",
+                "preference",
+                "like",
+                "dislike",
+            )
+        ):
+            return "preferences"
+
+        if any(
+            word in lowered
+            for word in (
+                "project",
+                "application",
+                "app",
+                "software",
+            )
+        ):
+            return "projects"
+
+        if any(
+            word in lowered
+            for word in (
+                "job",
+                "work",
+                "company",
+                "office",
+            )
+        ):
+            return "work"
+
+        if any(
+            word in lowered
+            for word in (
+                "name",
+                "birthday",
+                "location",
+                "city",
+            )
+        ):
+            return "personal"
+
+        return "general"
+
+    def _make_key(
+        self,
+        text: str,
+    ) -> str:
+
+        words = []
+
+        for word in text.lower().split():
+
+            cleaned = "".join(
+                character
+                for character in word
+                if character.isalnum()
+            )
+
+            if cleaned:
+                words.append(
+                    cleaned
+                )
+
+        if not words:
+            return "memory"
+
+        return "_".join(
+            words[:8]
+        )
+===== TOOL IMPLEMENTATIONS =====
+
+--- core/tools/__init__.py ---
+
+--- core/tools/memory.py ---
+from core.memory.manager import MemoryManager
+
+
+_memory = MemoryManager()
+
+
+def remember(
+    category: str,
+    key: str,
+    value: str,
+) -> str:
+
+    return _memory.remember(
+        category=category,
+        key=key,
+        value=value,
+    )
+
+
+def recall_memory(
+    category: str,
+    key: str,
+) -> str:
+
+    value = _memory.recall(
+        category=category,
+        key=key,
+    )
+
+    if value is None:
+        return (
+            f"I don't have a memory for "
+            f"'{key}' in '{category}'."
+        )
+
+    return value
+
+
+def list_memories(
+    category: str | None = None,
+) -> str:
+
+    memories = _memory.list_memories(
+        category=category
+    )
+
+    if not memories:
+        return (
+            "RIYA has no stored memories."
+        )
+
+    lines = []
+
+    for memory in memories:
+
+        lines.append(
+            f"{memory['category']}: "
+            f"{memory['key']} = "
+            f"{memory['value']}"
+        )
+
+    return "\n".join(lines)
+
+
+def forget_memory(
+    category: str,
+    key: str,
+) -> str:
+
+    deleted = _memory.forget(
+        category=category,
+        key=key,
+    )
+
+    if not deleted:
+        return (
+            f"I don't have a memory for "
+            f"'{key}' in '{category}'."
+        )
+
+    return (
+        f"Forgot '{key}' from "
+        f"'{category}'."
+    )
+===== SCREENSHOT AND ROUTING REFERENCES =====
+core/tools/system/macos.py:40:def take_screenshot() -> str:
+core/tools/system/macos.py:41:    """Take a screenshot and save it to the Desktop."""
+core/tools/system/macos.py:44:        "~/Desktop/riya_screenshot.png"
+core/tools/system/macos.py:54:        return "I couldn't take the screenshot."
+core/tools/system/macos.py:56:    return f"Screenshot saved to {path}."
+core/memory/intent.py:5:class MemoryIntentType(str, Enum):
+core/memory/intent.py:15:class MemoryIntent:
+core/memory/intent.py:17:    type: MemoryIntentType
+core/memory/intent.py:23:class MemoryIntentDetector:
+core/memory/intent.py:66:    ) -> MemoryIntent:
+core/memory/intent.py:71:            return MemoryIntent(
+core/memory/intent.py:72:                MemoryIntentType.NONE
+core/memory/intent.py:90:            return MemoryIntent(
+core/memory/intent.py:91:                type=MemoryIntentType.RECALL,
+core/memory/intent.py:99:            return MemoryIntent(
+core/memory/intent.py:100:                MemoryIntentType.LIST
+core/memory/intent.py:115:                        self._build_remember_intent(
+core/memory/intent.py:131:                    return MemoryIntent(
+core/memory/intent.py:133:                            MemoryIntentType.FORGET
+core/memory/intent.py:152:                    return MemoryIntent(
+core/memory/intent.py:154:                            MemoryIntentType.RECALL
+core/memory/intent.py:162:        return MemoryIntent(
+core/memory/intent.py:163:            MemoryIntentType.NONE
+core/memory/intent.py:166:    def _build_remember_intent(
+core/memory/intent.py:169:    ) -> MemoryIntent:
+core/memory/intent.py:219:                    return MemoryIntent(
+core/memory/intent.py:221:                            MemoryIntentType.REMEMBER
+core/memory/intent.py:240:            return MemoryIntent(
+core/memory/intent.py:242:                    MemoryIntentType.REMEMBER
+core/memory/intent.py:261:            return MemoryIntent(
+core/memory/intent.py:263:                    MemoryIntentType.REMEMBER
+core/memory/intent.py:282:            return MemoryIntent(
+core/memory/intent.py:284:                    MemoryIntentType.REMEMBER
+core/memory/intent.py:318:                    return MemoryIntent(
+core/memory/intent.py:320:                            MemoryIntentType.REMEMBER
+core/memory/intent.py:332:        return MemoryIntent(
+core/memory/intent.py:333:            type=MemoryIntentType.REMEMBER,
+core/memory/service.py:1:from core.memory.intent import (
+core/memory/service.py:2:    MemoryIntent,
+core/memory/service.py:3:    MemoryIntentDetector,
+core/memory/service.py:4:    MemoryIntentType,
+core/memory/service.py:22:            MemoryIntentDetector()
+core/memory/service.py:30:    ) -> MemoryIntent:
+core/memory/service.py:38:        intent: MemoryIntent,
+core/memory/service.py:42:            intent.type
+core/memory/service.py:43:            == MemoryIntentType.RECALL
+core/memory/service.py:47:                intent.category
+core/memory/service.py:52:                intent.key
+core/memory/service.py:98:            intent.type
+core/memory/service.py:99:            == MemoryIntentType.LIST
+core/memory/service.py:108:        intent: MemoryIntent,
+core/memory/service.py:112:            intent.type
+core/memory/service.py:113:            != MemoryIntentType.REMEMBER
+core/memory/service.py:116:                "Memory intent is not "
+core/memory/service.py:124:                    intent.category
+core/memory/service.py:128:                    intent.key
+core/memory/service.py:132:                    intent.value
+core/memory/service.py:140:        intent: MemoryIntent,
+core/memory/service.py:144:            intent.type
+core/memory/service.py:145:            != MemoryIntentType.FORGET
+core/memory/service.py:148:                "Memory intent is not "
+core/memory/service.py:156:                    intent.category
+core/memory/service.py:160:                    intent.key
+core/security/manager.py:20:        "take_screenshot",
+core/agent/intent.py:5:class IntentType(str, Enum):
+core/agent/intent.py:14:    SCREENSHOT = "screenshot"
+core/agent/intent.py:21:class Intent:
+core/agent/intent.py:22:    type: IntentType
+core/agent/intent.py:26:class IntentDetector:
+core/agent/intent.py:31:    are deliberately routed to CHAT so RIYA's AI planner can
+core/agent/intent.py:49:    # SCREENSHOT COMMANDS
+core/agent/intent.py:52:    SCREENSHOT_COMMANDS = {
+core/agent/intent.py:53:        "screenshot",
+core/agent/intent.py:54:        "take screenshot",
+core/agent/intent.py:55:        "take a screenshot",
+core/agent/intent.py:60:        "capture a screenshot",
+core/agent/intent.py:132:    ) -> Intent:
+core/agent/intent.py:137:            return Intent(
+core/agent/intent.py:138:                IntentType.CHAT
+core/agent/intent.py:151:            return Intent(
+core/agent/intent.py:152:                IntentType.EXIT
+core/agent/intent.py:158:        # These must go to the AI planner.
+core/agent/intent.py:165:            return Intent(
+core/agent/intent.py:166:                IntentType.CHAT
+core/agent/intent.py:170:        # Screenshot
+core/agent/intent.py:173:        if normalized in self.SCREENSHOT_COMMANDS:
+core/agent/intent.py:175:            return Intent(
+core/agent/intent.py:176:                IntentType.SCREENSHOT
+core/agent/intent.py:185:            return Intent(
+core/agent/intent.py:186:                IntentType.CURRENT_TIME
+core/agent/intent.py:201:            return Intent(
+core/agent/intent.py:202:                IntentType.OPEN_APPLICATION,
+core/agent/intent.py:220:            return Intent(
+core/agent/intent.py:221:                IntentType.CLOSE_APPLICATION,
+core/agent/intent.py:241:                    return Intent(
+core/agent/intent.py:242:                        IntentType.CREATE_FOLDER,
+core/agent/intent.py:262:                    return Intent(
+core/agent/intent.py:263:                        IntentType.LIST_FILES,
+core/agent/intent.py:275:        return Intent(
+core/agent/intent.py:276:            IntentType.CHAT
+core/agent/intent.py:401:        # "Open Safari, take a screenshot"
+core/agent/planner.py:24:class AgentPlanner:
+core/agent/planner.py:28:    The planner never executes tools. All execution remains
+core/agent/planner.py:35:        tool_registry,
+core/agent/planner.py:40:        self.tools = tool_registry
+core/agent/planner.py:98:            raise ValueError("Planner response must be a JSON object.")
+core/agent/planner.py:103:            raise ValueError("Planner steps must be a JSON array.")
+core/agent/planner.py:107:                f"Planner returned too many steps. Maximum: {self.max_steps}"
+core/agent/planner.py:199:                f"Planner selected an unregistered tool: {action}"
+core/agent/semantic.py:41:        tool_registry,
+core/agent/semantic.py:45:        self.tools = tool_registry
+core/agent/assistant.py:3:from core.agent.intent import IntentDetector, IntentType
+core/agent/assistant.py:4:from core.agent.planner import AgentPlanner
+core/agent/assistant.py:7:from core.memory.intent import MemoryIntentType
+core/agent/assistant.py:34:        AI Planner
+core/agent/assistant.py:85:        self.intent_detector = IntentDetector()
+core/agent/assistant.py:94:        # AI PLANNER + SEMANTIC ENGINE
+core/agent/assistant.py:97:        self.planner = AgentPlanner(
+core/agent/assistant.py:223:        memory_intent = self.memory.detect(
+core/agent/assistant.py:232:            memory_intent.type
+core/agent/assistant.py:233:            == MemoryIntentType.RECALL
+core/agent/assistant.py:237:                memory_intent
+core/agent/assistant.py:256:            memory_intent.type
+core/agent/assistant.py:257:            == MemoryIntentType.LIST
+core/agent/assistant.py:261:                memory_intent
+core/agent/assistant.py:280:            memory_intent.type
+core/agent/assistant.py:281:            == MemoryIntentType.REMEMBER
+core/agent/assistant.py:286:                    memory_intent
+core/agent/assistant.py:325:            memory_intent.type
+core/agent/assistant.py:326:            == MemoryIntentType.FORGET
+core/agent/assistant.py:331:                    memory_intent
+core/agent/assistant.py:365:        intent = self.intent_detector.detect(
+core/agent/assistant.py:373:        if intent.type == IntentType.EXIT:
+core/agent/assistant.py:381:        if intent.type != IntentType.CHAT:
+core/agent/assistant.py:387:                        intent
+core/agent/assistant.py:417:        # SEMANTIC + AI PLANNER
+core/agent/assistant.py:422:            plan = self.planner.create_plan(
+core/agent/assistant.py:460:                result = self.agent.execute(
+core/agent/assistant.py:655:            result = self.agent.execute(
+core/agent/tool_decision.py:18:    def __init__(self, ai_runtime, tool_registry):
+core/agent/tool_decision.py:20:        self.tools = tool_registry
+core/agent/agent.py:1:from core.agent.planner import Plan
+core/agent/agent.py:2:from core.agent.tool_registry import ToolRegistry
+core/agent/agent.py:30:    - Provide tools to the planner
+core/agent/agent.py:93:            name="take_screenshot",
+core/agent/agent.py:95:                "Take a screenshot of the current screen."
+core/agent/agent.py:97:            function=self.platform.take_screenshot,
+core/agent/agent.py:302:        from core.agent.planner import (
+core/agent/agent.py:303:            AgentPlanner,
+core/agent/agent.py:306:        planner = AgentPlanner(
+core/agent/agent.py:311:        return planner.create_plan(
+core/agent/command_router.py:1:from core.agent.intent import Intent, IntentType
+core/agent/command_router.py:5:    """Convert user text into a RIYA intent."""
+core/agent/command_router.py:7:    def route(self, text: str) -> Intent:
+core/agent/command_router.py:13:            return Intent(IntentType.EXIT)
+core/agent/command_router.py:20:                return Intent(
+core/agent/command_router.py:21:                    IntentType.OPEN_APPLICATION,
+core/agent/command_router.py:30:                return Intent(
+core/agent/command_router.py:31:                    IntentType.CLOSE_APPLICATION,
+core/agent/command_router.py:40:                return Intent(
+core/agent/command_router.py:41:                    IntentType.CREATE_FOLDER,
+core/agent/command_router.py:51:            return Intent(IntentType.LIST_FILES)
+core/agent/command_router.py:53:        # Screenshot
+core/agent/command_router.py:55:            "screenshot",
+core/agent/command_router.py:56:            "take screenshot",
+core/agent/command_router.py:57:            "take a screenshot",
+core/agent/command_router.py:60:            return Intent(IntentType.SCREENSHOT)
+core/agent/command_router.py:69:            return Intent(IntentType.CURRENT_TIME)
+core/agent/command_router.py:72:        return Intent(IntentType.CHAT)
+core/agent/tool_executor.py:1:from core.agent.tool_registry import ToolRegistry
+core/agent/tool_executor.py:278:        # Screenshot
+core/agent/tool_executor.py:281:        if tool_name == "take_screenshot":
+core/agent/tool_executor.py:283:            return self._verify_screenshot(
+core/agent/tool_executor.py:459:    # VERIFY SCREENSHOT
+core/agent/tool_executor.py:462:    def _verify_screenshot(
+core/agent/tool_executor.py:472:                    "Screenshot tool did not return "
+core/agent/tool_executor.py:501:        # Search Desktop for recent screenshot
+core/agent/tool_executor.py:513:                screenshots = sorted(
+core/agent/tool_executor.py:515:                        "*screenshot*.png"
+core/agent/tool_executor.py:521:                if screenshots:
+core/agent/tool_executor.py:523:                        screenshots[0]
+core/agent/tool_executor.py:534:                    "Screenshot was reported as created, "
+core/agent/tool_executor.py:547:                    f"Screenshot file does not exist: "
+core/agent/tool_executor.py:560:                    f"Screenshot file is empty: "
+core/agent/tool_executor.py:568:                f"Screenshot verified: "
+core/agent/executor.py:1:from core.agent.intent import IntentType
+core/agent/executor.py:18:    def execute(self, intent):
+core/agent/executor.py:24:        intent_type = intent.type
+core/agent/executor.py:26:        # Some older Intent implementations store arguments
+core/agent/executor.py:28:        parameters = getattr(intent, "parameters", None)
+core/agent/executor.py:33:            # Compatibility with Intent objects that use
+core/agent/executor.py:35:            if hasattr(intent, "app_name"):
+core/agent/executor.py:36:                parameters["app_name"] = intent.app_name
+core/agent/executor.py:38:            if hasattr(intent, "path"):
+core/agent/executor.py:39:                parameters["path"] = intent.path
+core/agent/executor.py:41:            if hasattr(intent, "directory"):
+core/agent/executor.py:42:                parameters["directory"] = intent.directory
+core/agent/executor.py:44:        if intent_type == IntentType.OPEN_APPLICATION:
+core/agent/executor.py:52:            return self.agent.execute(
+core/agent/executor.py:57:        if intent_type == IntentType.CLOSE_APPLICATION:
+core/agent/executor.py:65:            return self.agent.execute(
+core/agent/executor.py:70:        if intent_type == IntentType.CREATE_FOLDER:
+core/agent/executor.py:78:            return self.agent.execute(
+core/agent/executor.py:83:        if intent_type == IntentType.LIST_FILES:
+core/agent/executor.py:89:            return self.agent.execute(
+core/agent/executor.py:94:        if intent_type == IntentType.SCREENSHOT:
+core/agent/executor.py:95:            return self.agent.execute(
+core/agent/executor.py:96:                "take_screenshot"
+core/agent/executor.py:99:        if intent_type == IntentType.CURRENT_TIME:
+core/agent/executor.py:100:            return self.agent.execute(
+core/agent/executor.py:104:        if intent_type == IntentType.EXIT:
+core/agent/executor.py:107:        if intent_type == IntentType.CHAT:
+core/agent/executor.py:111:            f"Unsupported RIYA intent: {intent_type}"
+core/ai/native/llama.cpp/conversion/hy_v4.py:147:        # so swiglu_clamp_shexp is intentionally not written). 0.0 disables the clamp.
+core/device/macos.py:6:    take_screenshot,
+core/device/macos.py:26:    def take_screenshot(self) -> str:
+core/device/macos.py:27:        return take_screenshot()
+core/device/platform.py:21:    def take_screenshot(self) -> str:
+tests/test_memory_service.py:16:        intent = self.service.detect("What is my name?")
+tests/test_memory_service.py:17:        result = self.service.execute_safe(intent)
+tests/test_memory_service.py:33:        intent = self.service.detect("What is my name?")
+tests/test_memory_service.py:34:        result = self.service.execute_safe(intent)
+tests/test_memory_service.py:43:        intent = self.service.detect("List my memories")
+tests/test_memory_service.py:44:        result = self.service.execute_safe(intent)
+tests/test_memory_intent.py:3:from core.memory.intent import MemoryIntentDetector, MemoryIntentType
+tests/test_memory_intent.py:9:        self.detector = MemoryIntentDetector()
+tests/test_memory_intent.py:23:                intent = self.detector.detect(question)
+tests/test_memory_intent.py:25:                self.assertEqual(intent.type, MemoryIntentType.RECALL)
+tests/test_memory_intent.py:26:                self.assertEqual(intent.category, "personal")
+tests/test_memory_intent.py:27:                self.assertEqual(intent.key, "my_name")
+tests/test_confirmation_flow.py:21:        self.assistant.agent.execute.return_value = {
+tests/test_confirmation_flow.py:33:        self.assistant.agent.execute.assert_called_once_with(
+tests/test_confirmation_flow.py:46:        self.assistant.agent.execute.assert_not_called()
+tests/test_confirmation_flow.py:54:        self.assistant.agent.execute.assert_not_called()
+
+===== TEST RESULTS =====
+test_no_cancels_action (test_confirmation_flow.TestConfirmationFlow.test_no_cancels_action) ... ok
+test_unclear_response_keeps_pending_action (test_confirmation_flow.TestConfirmationFlow.test_unclear_response_keeps_pending_action) ... ok
+test_yes_executes_action (test_confirmation_flow.TestConfirmationFlow.test_yes_executes_action) ... ok
+test_memory_persists_after_reopening_database (test_memory_database.TestMemoryDatabase.test_memory_persists_after_reopening_database) ... ok
+test_missing_memory_returns_none (test_memory_database.TestMemoryDatabase.test_missing_memory_returns_none) ... ok
+test_save_and_recall (test_memory_database.TestMemoryDatabase.test_save_and_recall) ... ok
+test_update_existing_memory (test_memory_database.TestMemoryDatabase.test_update_existing_memory) ... ok
+test_personal_name_questions (test_memory_intent.TestPersonalMemoryRecall.test_personal_name_questions) ... ok
+test_exact_memory_recall (test_memory_service.TestMemoryService.test_exact_memory_recall) ... ok
+test_list_memories (test_memory_service.TestMemoryService.test_list_memories) ... ok
+test_recall_fallback_search (test_memory_service.TestMemoryService.test_recall_fallback_search) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.009s
+
+OK
+
+===== END OF REPORT =====

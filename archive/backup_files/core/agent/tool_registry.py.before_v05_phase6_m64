@@ -1,0 +1,689 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import inspect
+import re
+from typing import Any, Callable, Dict, Optional
+
+from core.security.manager import RiskLevel
+
+
+MAX_PARAM_STRING_LENGTH = 200_000
+_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+_PARAM_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+RESERVED_TOOL_PARAMETERS = frozenset(
+    {
+        "confirmation_token",
+        "user_id",
+        "session_id",
+        "owner_id",
+        "auth_token",
+        "identity",
+        "permission",
+        "permissions",
+        "permission_override",
+        "policy",
+        "approved",
+        "grant",
+        "bypass_confirmation",
+        "sudo",
+    }
+)
+
+FORBIDDEN_PERMISSION_ADMIN_TOOLS = frozenset(
+    {
+        "grant_permission",
+        "set_permission",
+        "allow_permission",
+        "override_permission",
+        "revoke_permission",
+        "deny_permission",
+        "reset_permissions",
+        "switch_user",
+        "login_user",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ParameterSchema:
+    """Type, nullability, size, and range constraints for a tool parameter."""
+
+    types: tuple[type, ...] = (str,)
+    required: bool = True
+    allow_none: bool = False
+    allow_empty: bool = False
+    max_length: int = 1024
+    min_value: int | float | None = None
+    max_value: int | float | None = None
+    allow_newlines: bool = False
+
+
+BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, ParameterSchema]] = {
+    "open_application": {
+        "app_name": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    "close_application": {
+        "app_name": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    "take_screenshot": {},
+    "current_time": {},
+    "set_volume": {
+        "level": ParameterSchema((int,), required=True, min_value=0, max_value=100),
+    },
+    "mute_volume": {},
+    "unmute_volume": {},
+    "battery_status": {},
+    "system_information": {},
+    "storage_status": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+    },
+    "network_status": {},
+    "check_application": {
+        "app_name": ParameterSchema((str,), required=False, allow_empty=True, max_length=128),
+    },
+    "platform_capabilities": {},
+    "lock_screen": {},
+    "clipboard_read": {},
+    "clipboard_write": {
+        "text": ParameterSchema(
+            (str,), required=True, allow_empty=True, max_length=MAX_PARAM_STRING_LENGTH, allow_newlines=True
+        ),
+    },
+    "send_notification": {
+        "title": ParameterSchema((str,), required=True, allow_empty=False, max_length=120),
+        "message": ParameterSchema((str,), required=True, allow_empty=False, max_length=500),
+        "subtitle": ParameterSchema((str,), required=False, allow_empty=True, max_length=120),
+    },
+    "active_window_info": {},
+    "list_files": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+    },
+    "inspect_file_metadata": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+    },
+    "find_files": {
+        "name": ParameterSchema((str,), required=True, allow_empty=False, max_length=256),
+        "path": ParameterSchema(
+            (str,), required=False, allow_none=True, allow_empty=False, max_length=1024
+        ),
+    },
+    "create_folder": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "read_file": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "write_file": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "content": ParameterSchema(
+            (str,), required=True, allow_empty=True, max_length=MAX_PARAM_STRING_LENGTH, allow_newlines=True
+        ),
+    },
+    "remember": {
+        "category": ParameterSchema((str,), required=True, allow_empty=False, max_length=64),
+        "key": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+        "value": ParameterSchema(
+            (str,), required=True, allow_empty=False, max_length=2000, allow_newlines=True
+        ),
+    },
+    "recall_memory": {
+        "category": ParameterSchema((str,), required=True, allow_empty=False, max_length=64),
+        "key": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    "list_memories": {
+        "category": ParameterSchema(
+            (str,), required=False, allow_none=True, allow_empty=False, max_length=64
+        ),
+    },
+    "forget_memory": {
+        "category": ParameterSchema((str,), required=True, allow_empty=False, max_length=64),
+        "key": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    "search_memory": {
+        "query": ParameterSchema((str,), required=True, allow_empty=False, max_length=256),
+        "category": ParameterSchema(
+            (str,), required=False, allow_none=True, allow_empty=False, max_length=64
+        ),
+        "limit": ParameterSchema((int,), required=False, min_value=1, max_value=25),
+    },
+    "calculate": {
+        "expression": ParameterSchema((str,), required=True, allow_empty=False, max_length=256),
+    },
+    "python_sandbox": {
+        "code": ParameterSchema(
+            (str,), required=True, allow_empty=False, max_length=8000, allow_newlines=True
+        ),
+        "timeout_seconds": ParameterSchema((int, float), required=False, min_value=0.5, max_value=15.0),
+    },
+    "terminal_command": {
+        "command": ParameterSchema((str,), required=True, allow_empty=False, max_length=64),
+        "args": ParameterSchema((str,), required=False, allow_empty=True, max_length=512),
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+    },
+    "local_db_query": {
+        "sql": ParameterSchema(
+            (str,), required=True, allow_empty=False, max_length=2000, allow_newlines=True
+        ),
+        "db_name": ParameterSchema((str,), required=False, allow_empty=False, max_length=64),
+    },
+    "browser_open_local": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "browser_inspect_page": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "browser_extract_links": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "browser_fetch_url": {
+        "url": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "browser_submit_form": {
+        "url": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "fields_json": ParameterSchema(
+            (str,), required=True, allow_empty=False, max_length=4096, allow_newlines=False
+        ),
+    },
+    "desktop_list_apps": {
+        "filter_text": ParameterSchema((str,), required=False, allow_empty=True, max_length=128),
+    },
+    "desktop_running_apps": {},
+    "desktop_app_state": {
+        "app_name": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    "desktop_focus_app": {
+        "app_name": ParameterSchema((str,), required=True, allow_empty=False, max_length=128),
+    },
+    # ---- Milestone 6.3: Intelligent File Management ----
+    "search_files_advanced": {
+        "query": ParameterSchema((str,), required=False, allow_empty=True, max_length=512),
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+        "category": ParameterSchema((str,), required=False, allow_empty=False, allow_none=True, max_length=64),
+        "sort_by": ParameterSchema((str,), required=False, allow_empty=False, allow_none=True, max_length=32),
+        "limit": ParameterSchema((int,), required=False, min_value=1, max_value=200),
+        "recursive": ParameterSchema((bool,), required=False),
+        "include_hidden": ParameterSchema((bool,), required=False),
+        "modified_within_days": ParameterSchema((int,), required=False, allow_none=True, min_value=1, max_value=3650),
+        "min_size_bytes": ParameterSchema((int,), required=False, allow_none=True, min_value=0),
+        "max_size_bytes": ParameterSchema((int,), required=False, allow_none=True, min_value=0),
+    },
+    "extract_document_text": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "max_chars": ParameterSchema((int,), required=False, min_value=100, max_value=100_000),
+    },
+    "summarize_document": {
+        "path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "focus": ParameterSchema((str,), required=False, allow_empty=True, max_length=256),
+    },
+    "find_duplicate_files": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+        "recursive": ParameterSchema((bool,), required=False),
+        "min_size_bytes": ParameterSchema((int,), required=False, min_value=1),
+    },
+    "file_insights": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+        "top_n": ParameterSchema((int,), required=False, min_value=1, max_value=50),
+    },
+    "copy_file": {
+        "source_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "destination_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "move_file": {
+        "source_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "destination_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "rename_file": {
+        "source_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+        "new_name": ParameterSchema((str,), required=True, allow_empty=False, max_length=255),
+    },
+    "delete_file": {
+        "source_path": ParameterSchema((str,), required=True, allow_empty=False, max_length=1024),
+    },
+    "organize_files": {
+        "path": ParameterSchema((str,), required=False, allow_empty=False, max_length=1024),
+        "strategy": ParameterSchema((str,), required=False, allow_empty=False, max_length=32),
+        "execute": ParameterSchema((bool,), required=False),
+        "custom_rules_json": ParameterSchema((str,), required=False, allow_empty=True, max_length=4096, allow_newlines=False),
+    },
+}
+
+
+@dataclass(frozen=True)
+class ToolPermission:
+    """Declarative permission and risk contract associated with a tool."""
+
+    permission_key: str
+    risk_level: RiskLevel = RiskLevel.LOW
+    requires_confirmation: bool = False
+    sandboxed: bool = True
+    notes: str = ""
+
+
+class ToolValidator:
+    """Custom runtime parameter validator attached to a ToolDefinition."""
+
+    def __init__(self, check_fn: Callable[[dict[str, Any]], None] | None = None):
+        self._check_fn = check_fn
+
+    def validate(self, parameters: dict[str, Any]) -> None:
+        if self._check_fn is not None:
+            self._check_fn(parameters)
+
+
+@dataclass
+class ToolDefinition:
+    """Rich metadata definition for registering a capability into ToolRegistry."""
+
+    name: str
+    description: str
+    function: Callable
+    parameters: set[str] = field(default_factory=set)
+    parameter_schemas: dict[str, ParameterSchema] = field(default_factory=dict)
+    permission: ToolPermission | None = None
+    risk_level: RiskLevel = RiskLevel.LOW
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+    category: str = "general"
+    offline_safe: bool = True
+    validator: ToolValidator | None = None
+
+
+@dataclass
+class ToolResult:
+    """Structured tool execution result helper."""
+
+    status: str
+    tool: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    result: Any = None
+    verification: dict[str, Any] | None = None
+    reason: str = ""
+    error: str = ""
+    risk_level: str = RiskLevel.LOW.value
+    duration_ms: float = 0.0
+    timed_out: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": self.status,
+            "tool": self.tool,
+            "parameters": self.parameters,
+            "risk_level": self.risk_level,
+            "duration_ms": self.duration_ms,
+        }
+        if self.result is not None:
+            payload["result"] = self.result
+        if self.verification is not None:
+            payload["verification"] = self.verification
+        if self.reason:
+            payload["reason"] = self.reason
+        if self.error:
+            payload["error"] = self.error
+        if self.timed_out:
+            payload["timed_out"] = True
+        return payload
+
+
+@dataclass
+class Tool:
+    """A capability available to RIYA."""
+
+    name: str
+    description: str
+    function: Callable
+    parameters: set[str]
+    parameter_schemas: dict[str, ParameterSchema] = field(default_factory=dict)
+    risk_level: RiskLevel = RiskLevel.LOW
+    permission: ToolPermission | None = None
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+    category: str = "general"
+    offline_safe: bool = True
+    validator: ToolValidator | None = None
+
+    def to_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            function=self.function,
+            parameters=set(self.parameters),
+            parameter_schemas=dict(self.parameter_schemas),
+            permission=self.permission,
+            risk_level=self.risk_level,
+            input_schema=dict(self.input_schema),
+            output_schema=dict(self.output_schema),
+            timeout_seconds=self.timeout_seconds,
+            category=self.category,
+            offline_safe=self.offline_safe,
+            validator=self.validator,
+        )
+
+
+def _check_string_safety(
+    name: str,
+    param_name: str,
+    value: str,
+    *,
+    allow_empty: bool,
+    max_length: int,
+    allow_newlines: bool,
+) -> None:
+    if len(value) > max_length:
+        raise ValueError(
+            f"Parameter '{param_name}' for '{name}' exceeds maximum length ({max_length})."
+        )
+
+    if not allow_empty and not value.strip():
+        raise ValueError(
+            f"Parameter '{param_name}' for '{name}' cannot be empty."
+        )
+
+    for char in value:
+        code = ord(char)
+        if code == 0 or code == 127:
+            raise ValueError(
+                f"Parameter '{param_name}' for '{name}' contains disallowed control characters."
+            )
+        if code < 32:
+            if allow_newlines and char in ("\n", "\r", "\t"):
+                continue
+            raise ValueError(
+                f"Parameter '{param_name}' for '{name}' contains disallowed control characters."
+            )
+
+
+class ToolRegistry:
+    """Registry of tools available to the RIYA agent."""
+
+    def __init__(self):
+        self._tools: Dict[str, Tool] = {}
+
+    def register(
+        self,
+        name: str,
+        description: str,
+        function: Callable,
+        parameters: Optional[set[str]] = None,
+        parameter_schemas: Optional[dict[str, ParameterSchema]] = None,
+        *,
+        risk_level: RiskLevel = RiskLevel.LOW,
+        permission: Optional[ToolPermission] = None,
+        input_schema: Optional[dict[str, Any]] = None,
+        output_schema: Optional[dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+        category: str = "general",
+        offline_safe: bool = True,
+        validator: Optional[ToolValidator] = None,
+    ) -> None:
+        """Register a tool, its accepted parameters, and validation schemas."""
+
+        if not isinstance(name, str) or not _TOOL_NAME_PATTERN.fullmatch(name):
+            raise ValueError(f"Invalid tool name: {name!r}")
+
+        if name in FORBIDDEN_PERMISSION_ADMIN_TOOLS:
+            raise ValueError(
+                f"Privilege/permission management action '{name}' cannot be registered as an AI tool."
+            )
+
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"Invalid description for tool: {name}")
+
+        if not callable(function):
+            raise ValueError(f"Tool function for '{name}' must be callable.")
+
+        if name in self._tools:
+            raise ValueError(
+                f"Tool already registered: {name}"
+            )
+
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError(f"Invalid timeout_seconds for '{name}': {timeout_seconds!r}")
+
+        normalized_parameters = (
+            set(parameters) if parameters is not None else set()
+        )
+
+        for param_name in normalized_parameters:
+            if not isinstance(param_name, str) or not _PARAM_NAME_PATTERN.fullmatch(param_name):
+                raise ValueError(f"Invalid parameter name: {param_name!r}")
+
+        reserved = sorted(RESERVED_TOOL_PARAMETERS & normalized_parameters)
+        if reserved:
+            raise ValueError(
+                f"Reserved security/identity parameters cannot be registered as tool parameters: {reserved}"
+            )
+
+        resolved_schemas: dict[str, ParameterSchema] = {}
+        if parameter_schemas is not None:
+            if set(parameter_schemas) != normalized_parameters:
+                raise ValueError(
+                    f"parameter_schemas keys must match declared parameters for '{name}'."
+                )
+            resolved_schemas = dict(parameter_schemas)
+        else:
+            builtin = BUILTIN_TOOL_SCHEMAS.get(name)
+            if builtin is not None and set(builtin) == normalized_parameters:
+                resolved_schemas = dict(builtin)
+
+        self._tools[name] = Tool(
+            name=name,
+            description=description,
+            function=function,
+            parameters=normalized_parameters,
+            parameter_schemas=resolved_schemas,
+            risk_level=permission.risk_level if permission is not None else risk_level,
+            permission=permission,
+            input_schema=dict(input_schema or {}),
+            output_schema=dict(output_schema or {}),
+            timeout_seconds=float(timeout_seconds) if timeout_seconds is not None else None,
+            category=category,
+            offline_safe=offline_safe,
+            validator=validator,
+        )
+
+    def register_definition(self, definition: ToolDefinition) -> None:
+        """Register a capability using a structured ToolDefinition contract."""
+        self.register(
+            name=definition.name,
+            description=definition.description,
+            function=definition.function,
+            parameters=set(definition.parameters),
+            parameter_schemas=dict(definition.parameter_schemas) if definition.parameter_schemas else None,
+            risk_level=definition.risk_level,
+            permission=definition.permission,
+            input_schema=definition.input_schema,
+            output_schema=definition.output_schema,
+            timeout_seconds=definition.timeout_seconds,
+            category=definition.category,
+            offline_safe=definition.offline_safe,
+            validator=definition.validator,
+        )
+
+    def get(self, name: str) -> Optional[Tool]:
+        """Get a registered tool."""
+
+        if not isinstance(name, str):
+            return None
+
+        return self._tools.get(name)
+
+    def list_tools(self) -> list[Tool]:
+        """Return all registered tools."""
+
+        return list(self._tools.values())
+
+    def has(self, name: str) -> bool:
+        """Check whether a tool exists."""
+
+        return isinstance(name, str) and name in self._tools
+
+    def validate_parameters(
+        self,
+        name: str,
+        parameters: dict[str, Any],
+    ) -> None:
+        """Validate parameter names, required fields, types, bounds, and safety."""
+
+        tool = self.get(name)
+
+        if tool is None:
+            raise ValueError(
+                f"Unknown RIYA tool: {name}"
+            )
+
+        if not isinstance(parameters, dict):
+            raise ValueError(f"Parameters for '{name}' must be an object.")
+
+        if not all(isinstance(key, str) for key in parameters):
+            raise ValueError(f"Parameter names for '{name}' must be strings.")
+
+        reserved = sorted(RESERVED_TOOL_PARAMETERS & set(parameters))
+        if reserved:
+            raise ValueError(
+                f"Reserved security/identity parameters cannot be supplied as tool parameters: {reserved}"
+            )
+
+        unexpected = set(parameters) - tool.parameters
+
+        if unexpected:
+            raise ValueError(
+                f"Unexpected parameters for '{name}': "
+                f"{sorted(unexpected)}. "
+                f"Allowed: {sorted(tool.parameters)}"
+            )
+
+        # Check required parameters from explicit schemas or Python signature.
+        if tool.parameter_schemas:
+            required = {
+                param_name
+                for param_name, schema in tool.parameter_schemas.items()
+                if schema.required
+            }
+        else:
+            required = self._required_signature_parameters(tool.function)
+
+        missing = required - set(parameters)
+        if missing:
+            raise ValueError(
+                f"Missing required parameters for '{name}': {sorted(missing)}"
+            )
+
+        # Validate values strictly.
+        for param_name, value in parameters.items():
+            schema = tool.parameter_schemas.get(param_name)
+            if schema is not None:
+                self._validate_with_schema(name, param_name, value, schema)
+            else:
+                self._validate_generic_value(name, param_name, value, tool.function)
+
+        if tool.validator is not None:
+            tool.validator.validate(parameters)
+
+    @staticmethod
+    def _required_signature_parameters(function: Callable) -> set[str]:
+        try:
+            signature = inspect.signature(function)
+        except (TypeError, ValueError):
+            return set()
+
+        return {
+            param.name
+            for param in signature.parameters.values()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            and param.default is inspect.Parameter.empty
+        }
+
+    @staticmethod
+    def _validate_with_schema(
+        tool_name: str,
+        param_name: str,
+        value: Any,
+        schema: ParameterSchema,
+    ) -> None:
+        if value is None:
+            if schema.allow_none:
+                return
+            raise ValueError(
+                f"Parameter '{param_name}' for '{tool_name}' cannot be null."
+            )
+
+        if isinstance(value, bool) and bool not in schema.types:
+            raise ValueError(
+                f"Invalid type for parameter '{param_name}' in '{tool_name}': boolean is not allowed."
+            )
+
+        if not isinstance(value, schema.types):
+            expected = ", ".join(t.__name__ for t in schema.types)
+            raise ValueError(
+                f"Parameter '{param_name}' for '{tool_name}' must be of type {expected}."
+            )
+
+        if isinstance(value, str):
+            _check_string_safety(
+                tool_name,
+                param_name,
+                value,
+                allow_empty=schema.allow_empty,
+                max_length=schema.max_length,
+                allow_newlines=schema.allow_newlines,
+            )
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if schema.min_value is not None and value < schema.min_value:
+                raise ValueError(
+                    f"Parameter '{param_name}' for '{tool_name}' must be >= {schema.min_value}."
+                )
+            if schema.max_value is not None and value > schema.max_value:
+                raise ValueError(
+                    f"Parameter '{param_name}' for '{tool_name}' must be <= {schema.max_value}."
+                )
+
+    @staticmethod
+    def _validate_generic_value(
+        tool_name: str,
+        param_name: str,
+        value: Any,
+        function: Callable,
+    ) -> None:
+        if value is None:
+            try:
+                param = inspect.signature(function).parameters.get(param_name)
+                if param is not None and param.default is None:
+                    return
+            except (TypeError, ValueError):
+                pass
+            raise ValueError(
+                f"Parameter '{param_name}' for '{tool_name}' cannot be null."
+            )
+
+        if isinstance(value, (dict, list, set, tuple)):
+            raise ValueError(
+                f"Nested or collection value is not allowed for parameter '{param_name}' in '{tool_name}'."
+            )
+
+        if not isinstance(value, (str, int, float, bool)):
+            raise ValueError(
+                f"Unsupported value type for parameter '{param_name}' in '{tool_name}'."
+            )
+
+        if isinstance(value, str):
+            _check_string_safety(
+                tool_name,
+                param_name,
+                value,
+                allow_empty=True,
+                max_length=MAX_PARAM_STRING_LENGTH,
+                allow_newlines=True,
+            )

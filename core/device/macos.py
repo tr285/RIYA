@@ -1,21 +1,1120 @@
-from core.device.platform import PlatformInterface
+"""Native macOS (Apple Silicon & Intel) platform adapter and sub-adapters for RIYA."""
 
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import platform as _py_platform
+import sys
+from typing import Any, Sequence
+
+from core.device.platform import (
+    ApplicationAdapter,
+    CapabilityDescriptor,
+    ClipboardAdapter,
+    FilesystemAdapter,
+    NotificationAdapter,
+    PlatformAdapter,
+    PlatformCapabilities,
+    PlatformInfo,
+    PlatformOperationResult,
+    SystemInformationAdapter,
+    WindowManagerAdapter,
+)
+from core.tools.filesystem.files import (
+    FilesystemAccessError,
+    find_files,
+    inspect_file_metadata,
+    inspect_file_metadata_structured,
+    list_files,
+)
 from core.tools.system.macos import (
-    open_application,
-    close_application,
-    take_screenshot,
-    current_time,
-    set_volume,
-    mute_volume,
-    unmute_volume,
+    active_window_info,
     battery_status,
-    system_information,
+    check_application,
+    clipboard_read,
+    clipboard_read_structured,
+    clipboard_write,
+    clipboard_write_structured,
+    close_application,
+    current_time,
+    discover_installed_applications,
+    focus_application,
+    get_active_window_structured,
+    get_application_details as _get_application_details,
+    get_application_resources as _get_application_resources,
+    get_application_state,
+    get_battery_status_structured,
+    get_detailed_system_info,
+    get_network_status_structured,
+    get_running_applications_structured as _get_running_apps_structured,
+    get_storage_info_structured,
+    launch_and_verify_application,
+    list_installed_applications,
+    list_running_applications,
     lock_screen,
+    mute_volume,
+    network_status,
+    open_application,
+    open_browser_url as _open_browser_url,
+    resolve_application_bundle,
+    search_applications as _search_applications,
+    send_notification,
+    send_notification_structured,
+    set_volume,
+    storage_status,
+    system_information,
+    take_screenshot,
+    terminate_application as _terminate_application,
+    unmute_volume,
 )
 
 
-class MacOSPlatform(PlatformInterface):
-    """macOS implementation of RIYA's platform capabilities."""
+_MACOS_CAPABILITY_DESCRIPTORS: tuple[CapabilityDescriptor, ...] = (
+    CapabilityDescriptor(
+        capability="system_info",
+        supported=True,
+        required_permission="system.info",
+        description="Read macOS version, build, architecture, CPU cores, and memory availability.",
+    ),
+    CapabilityDescriptor(
+        capability="storage_info",
+        supported=True,
+        required_permission="system.info",
+        description="Inspect macOS volume capacity, used space, and available storage.",
+    ),
+    CapabilityDescriptor(
+        capability="battery_status",
+        supported=True,
+        required_permission="system.info",
+        description="Read Mac battery percentage, power source, and charging state via pmset.",
+    ),
+    CapabilityDescriptor(
+        capability="network_status",
+        supported=True,
+        required_permission="system.info",
+        description="Inspect local network interfaces and RIYA offline-first status.",
+    ),
+    CapabilityDescriptor(
+        capability="app_discovery",
+        supported=True,
+        required_permission="system.info",
+        description="Discover installed .app bundles, bundle identifiers, versions, and paths.",
+    ),
+    CapabilityDescriptor(
+        capability="app_launch",
+        supported=True,
+        required_permission="system.open_app",
+        description="Launch a validated macOS application and verify its running process.",
+    ),
+    CapabilityDescriptor(
+        capability="app_close",
+        supported=True,
+        required_permission="system.close_app",
+        description="Quit a running macOS application via parameterized AppleScript and verify closure.",
+    ),
+    CapabilityDescriptor(
+        capability="app_focus",
+        supported=True,
+        required_permission="desktop.automate",
+        description="Bring a running macOS application to the foreground.",
+    ),
+    CapabilityDescriptor(
+        capability="app_search",
+        supported=True,
+        required_permission="system.info",
+        description="Search installed applications with fuzzy and relevance scoring.",
+    ),
+    CapabilityDescriptor(
+        capability="app_details",
+        supported=True,
+        required_permission="system.info",
+        description="Inspect detailed application installation metadata, version, and bundle size.",
+    ),
+    CapabilityDescriptor(
+        capability="app_status",
+        supported=True,
+        required_permission="desktop.automate",
+        description="Inspect running applications with process IDs and memory telemetry.",
+    ),
+    CapabilityDescriptor(
+        capability="app_resources",
+        supported=True,
+        required_permission="desktop.automate",
+        description="Inspect application CPU and memory usage.",
+    ),
+    CapabilityDescriptor(
+        capability="app_terminate",
+        supported=True,
+        required_permission="system.close_app",
+        description="Gracefully terminate non-protected running applications with verification.",
+    ),
+    CapabilityDescriptor(
+        capability="url_open",
+        supported=True,
+        required_permission="browser.interact",
+        description="Open validated HTTP/HTTPS URLs in browser.",
+    ),
+    CapabilityDescriptor(
+        capability="file_discovery",
+        supported=True,
+        required_permission="filesystem.read",
+        description="Discover and search files and folders inside permitted roots with O_NOFOLLOW symlink protection.",
+    ),
+    CapabilityDescriptor(
+        capability="file_metadata",
+        supported=True,
+        required_permission="filesystem.read",
+        description="Inspect file size, permissions, and timestamps inside permitted roots respecting macOS TCC.",
+    ),
+    CapabilityDescriptor(
+        capability="clipboard_read",
+        supported=True,
+        required_permission="system.clipboard",
+        description="Read plain text from the macOS pasteboard on explicit user-authorized request.",
+    ),
+    CapabilityDescriptor(
+        capability="clipboard_write",
+        supported=True,
+        required_permission="system.clipboard",
+        description="Write validated text to the macOS pasteboard on explicit user-authorized request.",
+    ),
+    CapabilityDescriptor(
+        capability="local_notification",
+        supported=True,
+        required_permission="system.notification",
+        description="Deliver a local macOS Notification Center alert via parameterized AppleScript.",
+    ),
+    CapabilityDescriptor(
+        capability="window_inspection",
+        supported=True,
+        required_permission="desktop.automate",
+        description="Inspect frontmost application and window metadata where macOS Accessibility allows.",
+    ),
+    CapabilityDescriptor(
+        capability="screenshot",
+        supported=True,
+        required_permission="system.screenshot",
+        description="Capture a macOS screen image to Desktop after explicit confirmation.",
+    ),
+    CapabilityDescriptor(
+        capability="volume_control",
+        supported=True,
+        required_permission="system.volume",
+        description="Set, mute, or unmute macOS output audio volume.",
+    ),
+    CapabilityDescriptor(
+        capability="screen_lock",
+        supported=True,
+        required_permission="system.lock_screen",
+        description="Lock the macOS screen immediately after confirmation.",
+    ),
+    CapabilityDescriptor(
+        capability="unrestricted_shell",
+        supported=False,
+        required_permission="terminal.execute",
+        description="Arbitrary or unrestricted shell execution.",
+        reason_if_unsupported="Forbidden by RIYA security architecture; only allowlisted non-destructive commands are permitted.",
+    ),
+    CapabilityDescriptor(
+        capability="background_clipboard_monitoring",
+        supported=False,
+        required_permission="system.clipboard",
+        description="Continuous background clipboard polling or scraping.",
+        reason_if_unsupported="Forbidden by RIYA privacy architecture; clipboard access is strictly on-demand and permission-gated.",
+    ),
+    CapabilityDescriptor(
+        capability="kernel_extension_loading",
+        supported=False,
+        required_permission="system.info",
+        description="Loading kernel extensions or modifying macOS SIP/TCC databases.",
+        reason_if_unsupported="Forbidden by RIYA security boundaries and macOS System Integrity Protection.",
+    ),
+)
+
+
+class MacOSSystemInformationAdapter(SystemInformationAdapter):
+    """Native macOS system, storage, battery, and network adapter."""
+
+    def get_system_info(self) -> PlatformOperationResult:
+        try:
+            data = get_detailed_system_info()
+            msg = (
+                f"{data['product_name']} {data['os_version']} ({data['architecture']}) | "
+                f"CPU cores: {data['cpu_cores_logical']} | "
+                f"Memory: {data['memory']['available_gib']}/{data['memory']['total_gib']} GiB available | "
+                f"Storage: {data['storage']['available_gib']}/{data['storage']['total_gib']} GiB available"
+            )
+            return PlatformOperationResult(
+                status="success",
+                capability="system_info",
+                platform="macos",
+                operation="get_system_info",
+                supported=True,
+                required_permission="system.info",
+                data=data,
+                message=msg,
+                verified=True,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="system_info",
+                platform="macos",
+                operation="get_system_info",
+                supported=True,
+                required_permission="system.info",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def get_storage_info(self, path: str = "/") -> PlatformOperationResult:
+        try:
+            data = get_storage_info_structured(path)
+            msg = (
+                f"Disk storage ({data['path']}): {data['available_gib']} GiB available "
+                f"of {data['total_gib']} GiB total ({data['percent_used']}% used)."
+            )
+            return PlatformOperationResult(
+                status="success",
+                capability="storage_info",
+                platform="macos",
+                operation="get_storage_info",
+                supported=True,
+                required_permission="system.info",
+                data=data,
+                message=msg,
+                verified=True,
+            )
+        except PermissionError as exc:
+            return PlatformOperationResult(
+                status="denied",
+                capability="storage_info",
+                platform="macos",
+                operation="get_storage_info",
+                supported=True,
+                required_permission="system.info",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="storage_info",
+                platform="macos",
+                operation="get_storage_info",
+                supported=True,
+                required_permission="system.info",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def get_battery_status(self) -> PlatformOperationResult:
+        data = get_battery_status_structured()
+        status = str(data.get("status") or "success")
+        return PlatformOperationResult(
+            status=status,
+            capability="battery_status",
+            platform="macos",
+            operation="get_battery_status",
+            supported=True,
+            required_permission="system.info",
+            data=data,
+            message=str(data.get("raw") or ""),
+            failure_reason="" if status == "success" else str(data.get("raw") or "Battery status unavailable."),
+            verified=(status == "success"),
+        )
+
+    def get_network_status(self) -> PlatformOperationResult:
+        try:
+            data = get_network_status_structured()
+            return PlatformOperationResult(
+                status="success",
+                capability="network_status",
+                platform="macos",
+                operation="get_network_status",
+                supported=True,
+                required_permission="system.info",
+                data=data,
+                message=network_status(),
+                verified=True,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="network_status",
+                platform="macos",
+                operation="get_network_status",
+                supported=True,
+                required_permission="system.info",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+
+class MacOSApplicationAdapter(ApplicationAdapter):
+    """Native macOS application discovery, resolution, verified launch, and quit adapter."""
+
+    def __init__(self, *, search_dirs: Sequence[Path] | None = None):
+        self._search_dirs = tuple(Path(d) for d in search_dirs) if search_dirs is not None else None
+
+    def discover_applications(self, filter_text: str = "") -> PlatformOperationResult:
+        apps = discover_installed_applications(filter_text, search_dirs=self._search_dirs)
+        return PlatformOperationResult(
+            status="success",
+            capability="app_discovery",
+            platform="macos",
+            operation="discover_applications",
+            supported=True,
+            required_permission="system.info",
+            data={"applications": apps, "count": len(apps)},
+            message=f"Discovered {len(apps)} installed macOS application(s).",
+            verified=True,
+        )
+
+    def resolve_application(self, app_name: str) -> PlatformOperationResult:
+        try:
+            info = resolve_application_bundle(app_name, search_dirs=self._search_dirs)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_discovery",
+                platform="macos",
+                operation="resolve_application",
+                supported=True,
+                required_permission="system.info",
+                data={"installed": False, "query": str(app_name)},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        if not info["installed"]:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_discovery",
+                platform="macos",
+                operation="resolve_application",
+                supported=True,
+                required_permission="system.info",
+                data=info,
+                message=info["reason"],
+                failure_reason=info["reason"],
+                verified=False,
+            )
+        return PlatformOperationResult(
+            status="success",
+            capability="app_discovery",
+            platform="macos",
+            operation="resolve_application",
+            supported=True,
+            required_permission="system.info",
+            data=info,
+            message=info["reason"],
+            verified=True,
+        )
+
+    def launch_application(self, app_name: str) -> PlatformOperationResult:
+        try:
+            res = launch_and_verify_application(
+                app_name,
+                background=True,
+                search_dirs=self._search_dirs,
+            )
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_launch",
+                platform="macos",
+                operation="launch_application",
+                supported=True,
+                required_permission="system.open_app",
+                data={"app_name": str(app_name), "verified": False},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        status = str(res.get("status") or "failed")
+        verified = bool(res.get("verified", False))
+        msg = str(res.get("message") or res.get("error") or "")
+        return PlatformOperationResult(
+            status=status,
+            capability="app_launch",
+            platform="macos",
+            operation="launch_application",
+            supported=True,
+            required_permission="system.open_app",
+            data=res,
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=verified,
+        )
+
+    def close_application(self, app_name: str) -> PlatformOperationResult:
+        try:
+            msg = close_application(app_name)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_close",
+                platform="macos",
+                operation="close_application",
+                supported=True,
+                required_permission="system.close_app",
+                data={"app_name": str(app_name)},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        lowered = msg.lower()
+        if msg.startswith("Closed "):
+            status = "success"
+            verified = True
+        elif "permission denied" in lowered:
+            status = "denied"
+            verified = False
+        elif "timed out" in lowered:
+            status = "timed_out"
+            verified = False
+        else:
+            status = "failed"
+            verified = False
+        return PlatformOperationResult(
+            status=status,
+            capability="app_close",
+            platform="macos",
+            operation="close_application",
+            supported=True,
+            required_permission="system.close_app",
+            data={"app_name": app_name, "result": msg},
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=verified,
+        )
+
+    def list_running_applications(self) -> PlatformOperationResult:
+        running = list_running_applications()
+        return PlatformOperationResult(
+            status="success",
+            capability="app_discovery",
+            platform="macos",
+            operation="list_running_applications",
+            supported=True,
+            required_permission="desktop.automate",
+            data={"running_apps": running, "count": len(running)},
+            message=f"Found {len(running)} running macOS application(s).",
+            verified=True,
+        )
+
+    def search_applications(self, query: str) -> PlatformOperationResult:
+        try:
+            matches = _search_applications(query, search_dirs=self._search_dirs)
+            return PlatformOperationResult(
+                status="success",
+                capability="app_search",
+                platform="macos",
+                operation="search_applications",
+                supported=True,
+                required_permission="system.info",
+                data={"query": query, "applications": matches, "count": len(matches)},
+                message=f"Found {len(matches)} matching application(s) for '{query}'.",
+                verified=True,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_search",
+                platform="macos",
+                operation="search_applications",
+                supported=True,
+                required_permission="system.info",
+                data={"query": query},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def get_application_details(self, app_name: str) -> PlatformOperationResult:
+        try:
+            details = _get_application_details(app_name, search_dirs=self._search_dirs)
+            if not details.get("found", False):
+                return PlatformOperationResult(
+                    status="failed",
+                    capability="app_details",
+                    platform="macos",
+                    operation="get_application_details",
+                    supported=True,
+                    required_permission="system.info",
+                    data=details,
+                    message=str(details.get("error") or f"Application '{app_name}' not found."),
+                    failure_reason=str(details.get("error") or f"Application '{app_name}' not found."),
+                    verified=False,
+                )
+            return PlatformOperationResult(
+                status="success",
+                capability="app_details",
+                platform="macos",
+                operation="get_application_details",
+                supported=True,
+                required_permission="system.info",
+                data=details,
+                message=f"Details retrieved for '{details['name']}' ({details.get('bundle_id') or 'no bundle id'}).",
+                verified=True,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_details",
+                platform="macos",
+                operation="get_application_details",
+                supported=True,
+                required_permission="system.info",
+                data={"app_name": app_name},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def get_running_applications_structured(self) -> PlatformOperationResult:
+        try:
+            running = _get_running_apps_structured()
+            return PlatformOperationResult(
+                status="success",
+                capability="app_status",
+                platform="macos",
+                operation="get_running_applications_structured",
+                supported=True,
+                required_permission="desktop.automate",
+                data={"running_applications": running, "count": len(running)},
+                message=f"Found {len(running)} running macOS application(s) with process details.",
+                verified=True,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_status",
+                platform="macos",
+                operation="get_running_applications_structured",
+                supported=True,
+                required_permission="desktop.automate",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def terminate_application(self, app_name: str) -> PlatformOperationResult:
+        try:
+            res = _terminate_application(app_name, search_dirs=self._search_dirs)
+            status = str(res.get("status") or "failed")
+            msg = str(res.get("message") or res.get("error") or "")
+            verified = bool(res.get("verified", False))
+            return PlatformOperationResult(
+                status=status,
+                capability="app_terminate",
+                platform="macos",
+                operation="terminate_application",
+                supported=True,
+                required_permission="system.close_app",
+                data=res,
+                message=msg,
+                failure_reason="" if status == "success" else msg,
+                verified=verified,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_terminate",
+                platform="macos",
+                operation="terminate_application",
+                supported=True,
+                required_permission="system.close_app",
+                data={"app_name": app_name},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def get_application_resources(self, app_name: str) -> PlatformOperationResult:
+        try:
+            res = _get_application_resources(app_name)
+            status = str(res.get("status") or "failed")
+            msg = str(res.get("message") or res.get("error") or "")
+            return PlatformOperationResult(
+                status="success" if status in {"success", "not_running"} else status,
+                capability="app_resources",
+                platform="macos",
+                operation="get_application_resources",
+                supported=True,
+                required_permission="desktop.automate",
+                data=res,
+                message=msg,
+                failure_reason="" if status in {"success", "not_running"} else msg,
+                verified=(status == "success"),
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_resources",
+                platform="macos",
+                operation="get_application_resources",
+                supported=True,
+                required_permission="desktop.automate",
+                data={"app_name": app_name},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def open_url(self, url: str, browser: str | None = None) -> PlatformOperationResult:
+        try:
+            res = _open_browser_url(url, browser=browser)
+            status = str(res.get("status") or "failed")
+            msg = str(res.get("message") or res.get("error") or "")
+            return PlatformOperationResult(
+                status=status,
+                capability="url_open",
+                platform="macos",
+                operation="open_url",
+                supported=True,
+                required_permission="browser.interact",
+                data=res,
+                message=msg,
+                failure_reason="" if status == "success" else msg,
+                verified=(status == "success"),
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="url_open",
+                platform="macos",
+                operation="open_url",
+                supported=True,
+                required_permission="browser.interact",
+                data={"url": url},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+
+class MacOSFilesystemAdapter(FilesystemAdapter):
+    """Sandboxed macOS filesystem adapter enforcing allowed roots, O_NOFOLLOW, and TCC boundaries."""
+
+    def discover_files(self, path: str = ".") -> PlatformOperationResult:
+        try:
+            listing = list_files(path=path)
+            return PlatformOperationResult(
+                status="success",
+                capability="file_discovery",
+                platform="macos",
+                operation="discover_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"path": path, "listing": listing},
+                message=listing,
+                verified=True,
+            )
+        except (FilesystemAccessError, PermissionError) as exc:
+            return PlatformOperationResult(
+                status="denied",
+                capability="file_discovery",
+                platform="macos",
+                operation="discover_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"path": path},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="file_discovery",
+                platform="macos",
+                operation="discover_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"path": path},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def search_files(self, name: str, path: str | None = None) -> PlatformOperationResult:
+        try:
+            output = find_files(name=name, path=path)
+            return PlatformOperationResult(
+                status="success",
+                capability="file_discovery",
+                platform="macos",
+                operation="search_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"name": name, "path": path or ".", "matches": output},
+                message=output,
+                verified=True,
+            )
+        except (FilesystemAccessError, PermissionError) as exc:
+            return PlatformOperationResult(
+                status="denied",
+                capability="file_discovery",
+                platform="macos",
+                operation="search_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"name": name, "path": path or "."},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="file_discovery",
+                platform="macos",
+                operation="search_files",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"name": name, "path": path or "."},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+    def inspect_metadata(self, path: str) -> PlatformOperationResult:
+        try:
+            meta = inspect_file_metadata_structured(path)
+            return PlatformOperationResult(
+                status="success",
+                capability="file_metadata",
+                platform="macos",
+                operation="inspect_metadata",
+                supported=True,
+                required_permission="filesystem.read",
+                data=dict(meta),
+                message=f"Inspected {meta['type']} '{meta['name']}' ({meta['size_bytes']} bytes).",
+                verified=True,
+            )
+        except (FilesystemAccessError, PermissionError) as exc:
+            return PlatformOperationResult(
+                status="denied",
+                capability="file_metadata",
+                platform="macos",
+                operation="inspect_metadata",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"path": path},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        except Exception as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="file_metadata",
+                platform="macos",
+                operation="inspect_metadata",
+                supported=True,
+                required_permission="filesystem.read",
+                data={"path": path},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+
+
+class MacOSClipboardAdapter(ClipboardAdapter):
+    """Explicit permission-controlled macOS pasteboard adapter (never polls in background)."""
+
+    def read_clipboard(self) -> PlatformOperationResult:
+        res = clipboard_read_structured()
+        status = str(res.get("status") or "failed")
+        if status != "success":
+            err = str(res.get("error") or "Failed to read clipboard.")
+            return PlatformOperationResult(
+                status=status,
+                capability="clipboard_read",
+                platform="macos",
+                operation="read_clipboard",
+                supported=True,
+                required_permission="system.clipboard",
+                data={"length": 0},
+                message=err,
+                failure_reason=err,
+                verified=False,
+            )
+        safe_data = {
+            "length": res["length"],
+            "truncated": res["truncated"],
+            "contains_sensitive_pattern": res["contains_sensitive_pattern"],
+            "sha256_prefix": res["sha256_prefix"],
+            "content": (
+                "[REDACTED_CLIPBOARD_SECRET]"
+                if res["contains_sensitive_pattern"]
+                else res["content"]
+            ),
+        }
+        return PlatformOperationResult(
+            status="success",
+            capability="clipboard_read",
+            platform="macos",
+            operation="read_clipboard",
+            supported=True,
+            required_permission="system.clipboard",
+            data=safe_data,
+            message=f"Read {res['length']} character(s) from macOS clipboard.",
+            verified=True,
+        )
+
+    def write_clipboard(self, text: str) -> PlatformOperationResult:
+        try:
+            res = clipboard_write_structured(text)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="clipboard_write",
+                platform="macos",
+                operation="write_clipboard",
+                supported=True,
+                required_permission="system.clipboard",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        status = str(res.get("status") or "failed")
+        msg = str(res.get("message") or res.get("error") or "")
+        return PlatformOperationResult(
+            status=status,
+            capability="clipboard_write",
+            platform="macos",
+            operation="write_clipboard",
+            supported=True,
+            required_permission="system.clipboard",
+            data={
+                "length": res.get("length", 0),
+                "sha256_prefix": res.get("sha256_prefix", ""),
+            },
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=bool(res.get("verified", False)),
+        )
+
+
+class MacOSNotificationAdapter(NotificationAdapter):
+    """Native macOS Notification Center adapter via parameterized AppleScript."""
+
+    def send_notification(
+        self,
+        title: str,
+        message: str,
+        subtitle: str = "",
+    ) -> PlatformOperationResult:
+        try:
+            res = send_notification_structured(title=title, message=message, subtitle=subtitle)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="local_notification",
+                platform="macos",
+                operation="send_notification",
+                supported=True,
+                required_permission="system.notification",
+                data={},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        status = str(res.get("status") or "failed")
+        msg = str(res.get("message") or res.get("error") or "")
+        return PlatformOperationResult(
+            status=status,
+            capability="local_notification",
+            platform="macos",
+            operation="send_notification",
+            supported=True,
+            required_permission="system.notification",
+            data=res,
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=bool(res.get("delivered", False)),
+        )
+
+
+class MacOSWindowManagerAdapter(WindowManagerAdapter):
+    """macOS active application and window metadata adapter with explicit Accessibility reporting."""
+
+    def get_active_window_info(self) -> PlatformOperationResult:
+        res = get_active_window_structured()
+        status = str(res.get("status") or "failed")
+        msg = str(res.get("message") or res.get("error") or "")
+        return PlatformOperationResult(
+            status=status,
+            capability="window_inspection",
+            platform="macos",
+            operation="get_active_window_info",
+            supported=True,
+            required_permission="desktop.automate",
+            data=res,
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=(status == "success"),
+        )
+
+    def focus_application(self, app_name: str) -> PlatformOperationResult:
+        try:
+            msg = focus_application(app_name)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="app_focus",
+                platform="macos",
+                operation="focus_application",
+                supported=True,
+                required_permission="desktop.automate",
+                data={"app_name": str(app_name)},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        lowered = msg.lower()
+        if msg.startswith("Focused "):
+            status = "success"
+        elif "permission denied" in lowered:
+            status = "denied"
+        elif "timed out" in lowered:
+            status = "timed_out"
+        else:
+            status = "failed"
+        return PlatformOperationResult(
+            status=status,
+            capability="app_focus",
+            platform="macos",
+            operation="focus_application",
+            supported=True,
+            required_permission="desktop.automate",
+            data={"app_name": app_name, "result": msg},
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=(status == "success"),
+        )
+
+    def get_application_state(self, app_name: str) -> PlatformOperationResult:
+        try:
+            msg = get_application_state(app_name)
+        except ValueError as exc:
+            return PlatformOperationResult(
+                status="failed",
+                capability="window_inspection",
+                platform="macos",
+                operation="get_application_state",
+                supported=True,
+                required_permission="desktop.automate",
+                data={"app_name": str(app_name)},
+                message=str(exc),
+                failure_reason=str(exc),
+                verified=False,
+            )
+        lowered = msg.lower()
+        if "permission denied" in lowered:
+            status = "denied"
+        elif "timed out" in lowered:
+            status = "timed_out"
+        elif "couldn't" in lowered:
+            status = "failed"
+        else:
+            status = "success"
+        return PlatformOperationResult(
+            status=status,
+            capability="window_inspection",
+            platform="macos",
+            operation="get_application_state",
+            supported=True,
+            required_permission="desktop.automate",
+            data={"app_name": app_name, "state": msg},
+            message=msg,
+            failure_reason="" if status == "success" else msg,
+            verified=(status == "success"),
+        )
+
+
+class MacOSPlatform(PlatformAdapter):
+    """macOS implementation of RIYA's platform capabilities and sub-adapters."""
+
+    platform_name = "macos"
+
+    def __init__(self, *, app_search_dirs: Sequence[Path] | None = None):
+        self._sys_info = MacOSSystemInformationAdapter()
+        self._apps = MacOSApplicationAdapter(search_dirs=app_search_dirs)
+        self._fs = MacOSFilesystemAdapter()
+        self._clipboard = MacOSClipboardAdapter()
+        self._notifications = MacOSNotificationAdapter()
+        self._windows = MacOSWindowManagerAdapter()
+
+    @property
+    def system_info_adapter(self) -> SystemInformationAdapter:
+        return self._sys_info
+
+    @property
+    def application_adapter(self) -> ApplicationAdapter:
+        return self._apps
+
+    @property
+    def filesystem_adapter(self) -> FilesystemAdapter:
+        return self._fs
+
+    @property
+    def clipboard_adapter(self) -> ClipboardAdapter:
+        return self._clipboard
+
+    @property
+    def notification_adapter(self) -> NotificationAdapter:
+        return self._notifications
+
+    @property
+    def window_adapter(self) -> WindowManagerAdapter:
+        return self._windows
+
+    def platform_info(self) -> PlatformInfo:
+        is_mac_host = sys.platform == "darwin" or _py_platform.system().lower() == "darwin"
+        arch = _py_platform.machine() or "arm64"
+        mac_ver = _py_platform.mac_ver()[0] or _py_platform.release()
+        cores = int(os.cpu_count() or 1)
+        return PlatformInfo(
+            os_name="macos",
+            system="Darwin",
+            os_version=mac_ver,
+            build_version=_py_platform.version(),
+            architecture=arch,
+            machine_model="Apple Silicon Mac" if arch == "arm64" else f"Intel Mac ({arch})",
+            cpu_brand=_py_platform.processor() or ("Apple Silicon" if arch == "arm64" else arch),
+            cpu_cores_logical=cores,
+            cpu_cores_physical=cores,
+            is_supported=is_mac_host,
+        )
+
+    def capabilities(self) -> PlatformCapabilities:
+        is_mac_host = sys.platform == "darwin" or _py_platform.system().lower() == "darwin"
+        return PlatformCapabilities(
+            platform_name="macos",
+            platform_available=is_mac_host,
+            descriptors=_MACOS_CAPABILITY_DESCRIPTORS,
+        )
+
+    def platform_capabilities_summary(self) -> str:
+        return json.dumps(self.status_summary(), ensure_ascii=False)
+
+    # ---- PlatformInterface methods (preserving existing tool contracts) ----
 
     def open_application(self, app_name: str) -> str:
         return open_application(app_name)
@@ -46,3 +1145,73 @@ class MacOSPlatform(PlatformInterface):
 
     def lock_screen(self) -> str:
         return lock_screen()
+
+    def list_installed_applications(self) -> list[str]:
+        return list_installed_applications()
+
+    def list_running_applications(self) -> list[str]:
+        return list_running_applications()
+
+    def get_application_state(self, app_name: str) -> str:
+        return get_application_state(app_name)
+
+    def focus_application(self, app_name: str) -> str:
+        return focus_application(app_name)
+
+    # ---- Milestone 6.2 extended tool methods ----
+
+    def storage_status(self, path: str = "/") -> str:
+        return storage_status(path)
+
+    def network_status(self) -> str:
+        return network_status()
+
+    def check_application(self, app_name: str = "") -> str:
+        return check_application(app_name, search_dirs=self._apps._search_dirs)
+
+    def inspect_file_metadata(self, path: str) -> str:
+        return inspect_file_metadata(path)
+
+    def clipboard_read(self) -> str:
+        return clipboard_read()
+
+    def clipboard_write(self, text: str) -> str:
+        return clipboard_write(text)
+
+    def send_notification(self, title: str, message: str, subtitle: str = "") -> str:
+        return send_notification(title=title, message=message, subtitle=subtitle)
+
+    def active_window_info(self) -> str:
+        return active_window_info()
+
+    def get_detailed_system_info(self) -> dict[str, Any]:
+        return get_detailed_system_info()
+
+    def discover_installed_applications(self, filter_text: str = "") -> list[dict[str, Any]]:
+        return discover_installed_applications(filter_text, search_dirs=self._apps._search_dirs)
+
+    def resolve_application_bundle(self, app_name: str) -> dict[str, Any]:
+        return resolve_application_bundle(app_name, search_dirs=self._apps._search_dirs)
+
+    def launch_application_structured(self, app_name: str) -> PlatformOperationResult:
+        return self._apps.launch_application(app_name)
+
+    # ---- Milestone 6.4 extended application control methods ----
+
+    def search_applications(self, query: str) -> list[dict[str, Any]]:
+        return _search_applications(query, search_dirs=self._apps._search_dirs)
+
+    def get_application_details(self, app_name: str) -> dict[str, Any]:
+        return _get_application_details(app_name, search_dirs=self._apps._search_dirs)
+
+    def get_running_applications_structured(self) -> list[dict[str, Any]]:
+        return _get_running_apps_structured()
+
+    def terminate_application(self, app_name: str) -> dict[str, Any]:
+        return _terminate_application(app_name, search_dirs=self._apps._search_dirs)
+
+    def get_application_resources(self, app_name: str) -> dict[str, Any]:
+        return _get_application_resources(app_name)
+
+    def open_url(self, url: str, browser: str | None = None) -> dict[str, Any]:
+        return _open_browser_url(url, browser=browser)

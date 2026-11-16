@@ -1,0 +1,650 @@
+"""Real-time Voice + Text Conversation Orchestrator connected to RIYAAssistant."""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+from typing import Any, Callable
+
+import numpy as np
+
+from core.ai.safety import InferenceCancelledError, strip_unsafe_control_chars
+from core.voice.audio_input import MicrophoneStream
+from core.voice.audio_output import AudioOutputPlayer
+from core.voice.config import VoiceConfig
+from core.voice.errors import VoiceError
+from core.voice.personality import prepare_text_for_speech, split_into_speech_chunks
+from core.voice.session import TranscriptEntry, VoiceSession
+from core.voice.state import ACTIVE_STATES, VoiceState, VoiceStateMachine
+from core.voice.stt import LocalSTT, TranscriptionResult
+from core.voice.tts import LocalTTS
+from core.voice.vad import UtteranceSegmenter
+
+logger = logging.getLogger("riya.voice.orchestrator")
+
+_YES_TOKENS = frozenset(
+    {
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "confirm",
+        "do it",
+        "proceed",
+        "go ahead",
+        "please proceed",
+        "continue",
+    }
+)
+_NO_TOKENS = frozenset({"no", "n", "nope", "cancel", "stop", "don't", "dont"})
+
+
+class VoiceOrchestrator:
+    """Coordinates real-time voice I/O, barge-in, mode switching, and RIYAAssistant."""
+
+    def __init__(
+        self,
+        assistant: Any,
+        config: VoiceConfig | None = None,
+        *,
+        stt: LocalSTT | Any | None = None,
+        tts: LocalTTS | Any | None = None,
+        player: AudioOutputPlayer | None = None,
+        mic_factory: Callable[[VoiceConfig], MicrophoneStream] | None = None,
+        vad_backend: Any | None = None,
+        session: VoiceSession | None = None,
+    ):
+        self.assistant = assistant
+        self.config = config or VoiceConfig()
+        self.state_machine = session.state_machine if session is not None else VoiceStateMachine()
+        self.session = session or VoiceSession(
+            self.config,
+            state_machine=self.state_machine,
+            mic_factory=mic_factory,
+        )
+        self._stt = stt
+        self._custom_tts = tts
+        self.player = player or AudioOutputPlayer(self.config, tts=tts)
+        self._vad_backend = vad_backend
+        self.segmenter = UtteranceSegmenter(self.config, backend=vad_backend)
+
+        self._lock = threading.RLock()
+        self._mode: str = "text"  # "text" | "voice"
+        self._turn_id: int = 0
+        self._turn_cancel_event = threading.Event()
+        self._stop_threads = threading.Event()
+        self._utterance_queue: queue.Queue[tuple[np.ndarray, int]] = queue.Queue(maxsize=16)
+
+        self._audio_thread: threading.Thread | None = None
+        self._turn_thread: threading.Thread | None = None
+        self._last_error: str | None = None
+        self._observers: list[Callable[[], None]] = []
+
+    # ------------------------------------------------------------------
+    @property
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    @property
+    def state(self) -> VoiceState:
+        return self.state_machine.state
+
+    @property
+    def last_error(self) -> str | None:
+        with self._lock:
+            return self._last_error
+
+    @property
+    def stt(self) -> Any:
+        if self._stt is None:
+            self._stt = LocalSTT(
+                model_size=self.config.stt_model,
+                device="cpu",
+                compute_type=self.config.stt_compute_type,
+                cpu_threads=self.config.stt_cpu_threads,
+                beam_size=self.config.stt_beam_size,
+                download_root=self.config.stt_model_dir,
+                local_files_only=True,
+                max_transcript_chars=self.config.max_transcript_chars,
+            )
+        return self._stt
+
+    def add_observer(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            self._observers.append(callback)
+
+    def _notify_observers(self) -> None:
+        with self._lock:
+            callbacks = list(self._observers)
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    def update_config(self, new_config: VoiceConfig) -> None:
+        new_config.validate()
+        with self._lock:
+            old = self.config
+            self.config = new_config
+            self.session.config = new_config
+            self.player.update_config(new_config)
+            if (
+                old.stt_model != new_config.stt_model
+                or old.stt_compute_type != new_config.stt_compute_type
+                or old.stt_beam_size != new_config.stt_beam_size
+                or old.stt_cpu_threads != new_config.stt_cpu_threads
+                or old.stt_model_dir != new_config.stt_model_dir
+            ):
+                self._stt = None
+            self.segmenter = UtteranceSegmenter(new_config, backend=self._vad_backend)
+        self._notify_observers()
+
+    # ------------------------------------------------------------------
+    def start_voice_mode(self, *, background_workers: bool = True) -> None:
+        """Start explicit microphone capture and voice loop."""
+
+        with self._lock:
+            self._last_error = None
+            self._turn_cancel_event.clear()
+            self._stop_threads.clear()
+            self.segmenter.reset()
+
+        self.session.start()
+
+        with self._lock:
+            self._mode = "voice"
+            if background_workers:
+                self._audio_thread = threading.Thread(
+                    target=self._audio_capture_loop,
+                    name="riya-voice-audio",
+                    daemon=True,
+                )
+                self._turn_thread = threading.Thread(
+                    target=self._turn_worker_loop,
+                    name="riya-voice-turn",
+                    daemon=True,
+                )
+                self._audio_thread.start()
+                self._turn_thread.start()
+        self._notify_observers()
+
+    def stop_voice_mode(self) -> None:
+        """Stop voice capture/playback cleanly and switch back to text mode."""
+
+        with self._lock:
+            self._turn_id += 1
+            self._turn_cancel_event.set()
+            self._stop_threads.set()
+            self._mode = "text"
+            audio_t = self._audio_thread
+            turn_t = self._turn_thread
+            self._audio_thread = None
+            self._turn_thread = None
+
+        self.player.stop()
+        if hasattr(self.assistant, "cancel"):
+            try:
+                self.assistant.cancel()
+            except Exception:
+                pass
+
+        while True:
+            try:
+                self._utterance_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.session.stop(to_error=False)
+
+        for thread in (audio_t, turn_t):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=1.5)
+
+        if hasattr(self.assistant, "reset_cancel"):
+            try:
+                self.assistant.reset_cancel()
+            except Exception:
+                pass
+        self._notify_observers()
+
+    def switch_mode(self, mode: str, *, background_workers: bool = True) -> str:
+        """Seamlessly switch between 'text' and 'voice' without losing history."""
+
+        normalized = str(mode).strip().lower()
+        if normalized not in {"text", "voice"}:
+            raise ValueError("Mode must be 'text' or 'voice'.")
+        if normalized == "voice":
+            if self.state == VoiceState.IDLE:
+                self.start_voice_mode(background_workers=background_workers)
+            else:
+                with self._lock:
+                    self._mode = "voice"
+        else:
+            if self.state != VoiceState.IDLE:
+                self.stop_voice_mode()
+            else:
+                with self._lock:
+                    self._mode = "text"
+        self._notify_observers()
+        return self.mode
+
+    # ------------------------------------------------------------------
+    def _is_turn_active(self, turn_id: int) -> bool:
+        with self._lock:
+            return (
+                not self._turn_cancel_event.is_set()
+                and turn_id == self._turn_id
+                and self.state in ACTIVE_STATES
+            )
+
+    def interrupt(self, reason: str = "user_barge_in") -> None:
+        """Interrupt ongoing speech/thinking immediately and prepare for new input."""
+
+        with self._lock:
+            self._turn_id += 1
+            self._turn_cancel_event.set()
+            current = self.state_machine.state
+
+        self.player.stop()
+        if hasattr(self.assistant, "cancel"):
+            try:
+                self.assistant.cancel()
+            except Exception:
+                pass
+
+        if current in (VoiceState.SPEAKING, VoiceState.THINKING):
+            if self.state_machine.try_transition(VoiceState.INTERRUPTED, reason):
+                self.state_machine.try_transition(VoiceState.LISTENING, "ready_after_interrupt")
+        self._notify_observers()
+
+    # ------------------------------------------------------------------
+    def send_text(self, user_input: str, *, speak: bool | None = None) -> str:
+        """Handle typed user text using the shared RIYAAssistant & transcript."""
+
+        cleaned = strip_unsafe_control_chars(str(user_input), allow_newlines=True).strip()
+        if not cleaned:
+            return "Please tell me what you'd like me to do."
+
+        with self._lock:
+            if self.state in (VoiceState.SPEAKING, VoiceState.THINKING):
+                self.interrupt("text_input_override")
+            self._turn_id += 1
+            turn_id = self._turn_id
+            self._turn_cancel_event.clear()
+
+        self.session.append_transcript(role="user", text=cleaned, modality="text")
+
+        was_listening = self.state == VoiceState.LISTENING
+        if was_listening:
+            self.state_machine.try_transition(VoiceState.THINKING, "text_message_thinking")
+
+        with self._lock:
+            if turn_id != self._turn_id or self._turn_cancel_event.is_set():
+                return ""
+            if hasattr(self.assistant, "reset_cancel"):
+                self.assistant.reset_cancel()
+
+        pending_before = getattr(self.assistant, "pending_action", None)
+        had_pending_before = pending_before is not None
+        previous_token = (
+            pending_before.get("confirmation_token") or pending_before.get("token")
+            if isinstance(pending_before, dict)
+            else None
+        )
+
+        try:
+            response = self.assistant.process(cleaned)
+        except InferenceCancelledError:
+            self._rollback_interrupted_pending_action(had_pending_before, previous_token)
+            if was_listening and self.state == VoiceState.THINKING:
+                self.state_machine.try_transition(VoiceState.INTERRUPTED, "text_inference_cancelled")
+                self.state_machine.try_transition(VoiceState.LISTENING, "ready")
+            self._notify_observers()
+            return ""
+
+        with self._lock:
+            stale = turn_id != self._turn_id or self._turn_cancel_event.is_set()
+        if stale:
+            self._rollback_interrupted_pending_action(had_pending_before, previous_token)
+            return ""
+
+        entry = self.session.append_transcript(role="assistant", text=response, modality="text")
+
+        should_speak = (
+            self.mode == "voice" and self.config.voice_responses_enabled
+            if speak is None
+            else bool(speak)
+        )
+        if should_speak and self.state == VoiceState.THINKING:
+            self._speak_response(response, turn_id=turn_id, entry=entry)
+        elif was_listening and self.state == VoiceState.THINKING:
+            self.state_machine.try_transition(VoiceState.LISTENING, "text_turn_complete")
+
+        self._notify_observers()
+        return response
+
+    def correct_last_user_transcript(self, corrected_text: str) -> str | None:
+        """Update the latest user transcript entry and process the correction safely."""
+
+        cleaned = strip_unsafe_control_chars(str(corrected_text), allow_newlines=True).strip()
+        if not cleaned:
+            return None
+        entries = self.session.transcript_entries()
+        last_user = next((e for e in reversed(entries) if e.role == "user"), None)
+        if last_user is not None:
+            self.session.update_transcript(last_user.entry_id, text=cleaned, status="corrected")
+        if hasattr(self.assistant, "reset_cancel"):
+            self.assistant.reset_cancel()
+        response = self.assistant.process(cleaned)
+        self.session.append_transcript(role="assistant", text=response, modality=self.mode)
+        self._notify_observers()
+        return response
+
+    def handle_utterance_audio(
+        self,
+        audio: np.ndarray,
+        *,
+        turn_id: int | None = None,
+    ) -> str | None:
+        """Process one captured 16 kHz utterance synchronously (used by worker & tests)."""
+
+        with self._lock:
+            if turn_id is None:
+                self._turn_id += 1
+                turn_id = self._turn_id
+                self._turn_cancel_event.clear()
+            if turn_id != self._turn_id or self._turn_cancel_event.is_set():
+                return None
+
+        if self.state == VoiceState.IDLE:
+            raise RuntimeError("Voice session must be active before handling voice audio.")
+
+        # Ensure optional disk retention respects privacy settings strictly.
+        self.session.maybe_save_recording(audio)
+
+        if self.state != VoiceState.TRANSCRIBING:
+            if not self.state_machine.try_transition(VoiceState.TRANSCRIBING, "speech_captured"):
+                return None
+        self._notify_observers()
+
+        try:
+            stt_result = self.stt.transcribe_detailed(audio, language=self.config.stt_language)
+        except Exception as exc:
+            msg = exc.user_message if isinstance(exc, VoiceError) else "I couldn't understand that audio."
+            self._record_nonfatal_turn_error(msg)
+            return msg
+
+        if not self._is_turn_active(turn_id):
+            return None
+
+        transcript_text = (stt_result.text or "").strip() if isinstance(stt_result, TranscriptionResult) else str(stt_result).strip()
+        if not transcript_text:
+            self.state_machine.try_transition(VoiceState.LISTENING, "empty_transcription")
+            self._notify_observers()
+            return None
+
+        if not self.state_machine.try_transition(VoiceState.THINKING, "transcription_ready"):
+            return None
+
+        self.session.append_transcript(
+            role="user",
+            text=transcript_text,
+            modality="voice",
+            language=getattr(stt_result, "language", self.config.language),
+            confidence=getattr(stt_result, "confidence", None),
+        )
+        self._notify_observers()
+
+        # Secure voice confirmation gate when assistant holds pending_action.
+        if getattr(self.assistant, "pending_action", None) is not None:
+            gated = self._check_voice_confirmation_gate(stt_result)
+            if gated is not None:
+                entry = self.session.append_transcript(role="assistant", text=gated, modality="voice")
+                self._finish_voice_turn(gated, turn_id=turn_id, entry=entry)
+                return gated
+
+        with self._lock:
+            if not self._is_turn_active(turn_id):
+                return None
+            if hasattr(self.assistant, "reset_cancel"):
+                self.assistant.reset_cancel()
+
+        pending_before = getattr(self.assistant, "pending_action", None)
+        had_pending_before = pending_before is not None
+        previous_token = (
+            pending_before.get("confirmation_token") or pending_before.get("token")
+            if isinstance(pending_before, dict)
+            else None
+        )
+
+        try:
+            response = self.assistant.process(transcript_text)
+        except InferenceCancelledError:
+            self._rollback_interrupted_pending_action(had_pending_before, previous_token)
+            if self.state == VoiceState.THINKING:
+                self.state_machine.try_transition(VoiceState.INTERRUPTED, "inference_cancelled")
+                self.state_machine.try_transition(VoiceState.LISTENING, "ready")
+            self._notify_observers()
+            return None
+        except Exception:
+            self._rollback_interrupted_pending_action(had_pending_before, previous_token)
+            msg = "I encountered an internal error processing that request, so nothing was executed."
+            self._record_nonfatal_turn_error(msg)
+            return msg
+
+        # Discard stale AI response and roll back newly staged confirmations if interrupted.
+        if not self._is_turn_active(turn_id):
+            logger.debug("Discarding stale response from turn %s", turn_id)
+            self._rollback_interrupted_pending_action(had_pending_before, previous_token)
+            return None
+
+        entry = self.session.append_transcript(role="assistant", text=response, modality="voice")
+        self._finish_voice_turn(response, turn_id=turn_id, entry=entry)
+        return response
+
+    def _rollback_interrupted_pending_action(
+        self,
+        had_pending_before: bool,
+        previous_token: str | None,
+    ) -> None:
+        """Clear any unconfirmed pending_action staged by a cancelled turn."""
+
+        pending_after = getattr(self.assistant, "pending_action", None)
+        if pending_after is None:
+            return
+        after_token = (
+            pending_after.get("confirmation_token") or pending_after.get("token")
+            if isinstance(pending_after, dict)
+            else None
+        )
+        if had_pending_before and after_token == previous_token:
+            return
+
+        agent = getattr(self.assistant, "agent", None)
+        if isinstance(after_token, str) and after_token and agent is not None:
+            cancel_fn = getattr(agent, "cancel_confirmation", None)
+            if callable(cancel_fn):
+                try:
+                    cancel_fn(after_token)
+                except Exception:
+                    pass
+        try:
+            self.assistant.pending_action = None
+            if hasattr(self.assistant, "pending_plan"):
+                self.assistant.pending_plan = None
+        except Exception:
+            pass
+
+    def _check_voice_confirmation_gate(self, stt_result: Any) -> str | None:
+        if not self.config.voice_confirmation_enabled:
+            return (
+                "Voice confirmation is disabled for protected actions. "
+                "Please reply yes or no using text."
+            )
+        confidence = getattr(stt_result, "confidence", None)
+        if confidence is not None and confidence < self.config.min_confirmation_confidence:
+            return (
+                "I didn't catch that clearly enough to confirm a protected action. "
+                "Please clearly say yes to proceed or no to cancel."
+            )
+        normalized = str(getattr(stt_result, "text", "")).lower().strip().rstrip(".!?")
+        if normalized not in _YES_TOKENS and normalized not in _NO_TOKENS:
+            return "Please clearly say yes to proceed or no to cancel."
+        return None
+
+    def _finish_voice_turn(self, response: str, *, turn_id: int, entry: TranscriptEntry) -> None:
+        if self.config.voice_responses_enabled and self._is_turn_active(turn_id):
+            self._speak_response(response, turn_id=turn_id, entry=entry)
+        elif self.state == VoiceState.THINKING:
+            self.state_machine.try_transition(VoiceState.LISTENING, "voice_responses_disabled")
+        self._notify_observers()
+
+    def _speak_response(self, response: str, *, turn_id: int, entry: TranscriptEntry) -> None:
+        if not self.state_machine.try_transition(VoiceState.SPEAKING, "tts_started"):
+            return
+        self.segmenter.notify_playback_started()
+        self._notify_observers()
+
+        spoken_text = prepare_text_for_speech(
+            response,
+            style=self.config.response_style,
+            max_chars=self.config.max_spoken_chars,
+        )
+        chunks = split_into_speech_chunks(
+            spoken_text,
+            max_chunk_chars=self.config.speech_chunk_chars,
+        )
+        spoken_so_far: list[str] = []
+
+        def _on_chunk_done(_idx: int, chunk: str) -> None:
+            spoken_so_far.append(chunk)
+            self.session.update_transcript(
+                entry.entry_id,
+                spoken_text=" ".join(spoken_so_far),
+            )
+            self._notify_observers()
+
+        try:
+            completed = self.player.play_text_chunks(
+                chunks,
+                style=self.config.response_style,
+                temp_dir=self.session.temp_dir,
+                turn_check=lambda: self._is_turn_active(turn_id),
+                on_chunk_done=_on_chunk_done,
+            )
+            if not completed or not self._is_turn_active(turn_id):
+                self.session.update_transcript(entry.entry_id, status="interrupted")
+                if self.state == VoiceState.SPEAKING:
+                    self.state_machine.try_transition(VoiceState.INTERRUPTED, "playback_interrupted")
+                    self.state_machine.try_transition(VoiceState.LISTENING, "ready")
+                return
+
+            self.state_machine.try_transition(VoiceState.LISTENING, "playback_finished")
+        except Exception as exc:
+            msg = exc.user_message if isinstance(exc, VoiceError) else "Speech playback failed; see transcript."
+            with self._lock:
+                self._last_error = msg
+            self.session.update_transcript(entry.entry_id, status="error")
+            if self.state in ACTIVE_STATES:
+                self.state_machine.try_transition(VoiceState.LISTENING, "recovered_after_tts_error")
+        finally:
+            self._notify_observers()
+
+    def _record_nonfatal_turn_error(self, message: str) -> None:
+        with self._lock:
+            self._last_error = message
+        self.session.append_transcript(role="assistant", text=message, modality="voice", status="error")
+        if self.state in (VoiceState.TRANSCRIBING, VoiceState.THINKING, VoiceState.SPEAKING):
+            self.state_machine.try_transition(VoiceState.LISTENING, "recovered_from_turn_error")
+        self._notify_observers()
+
+    # ------------------------------------------------------------------
+    def _audio_capture_loop(self) -> None:
+        while not self._stop_threads.is_set() and self.state in ACTIVE_STATES:
+            mic = self.session.microphone
+            if mic is None or not mic.is_active:
+                break
+            try:
+                frame = mic.read_frame(timeout=0.05)
+            except VoiceError as exc:
+                self._handle_fatal_audio_error(exc.user_message)
+                return
+            except Exception:
+                self._handle_fatal_audio_error("Voice input encountered an unexpected error.")
+                return
+
+            if frame is None:
+                continue
+
+            current_state = self.state
+            event = self.segmenter.process_frame(
+                frame,
+                assistant_speaking=(current_state == VoiceState.SPEAKING),
+            )
+            if event.barge_in_triggered:
+                self.interrupt("user_barge_in")
+
+            if event.speech_ended and event.utterance is not None:
+                with self._lock:
+                    if not event.barge_in_triggered and self.state != VoiceState.INTERRUPTED:
+                        pass
+                    self._turn_cancel_event.clear()
+                    self._turn_id += 1
+                    tid = self._turn_id
+                try:
+                    self._utterance_queue.put((event.utterance, tid), timeout=0.1)
+                except queue.Full:
+                    pass
+
+    def _turn_worker_loop(self) -> None:
+        while not self._stop_threads.is_set():
+            try:
+                utterance, tid = self._utterance_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if self._stop_threads.is_set():
+                return
+            self.handle_utterance_audio(utterance, turn_id=tid)
+
+    def _handle_fatal_audio_error(self, message: str) -> None:
+        with self._lock:
+            self._last_error = message
+            self._mode = "text"
+            self._turn_id += 1
+            self._turn_cancel_event.set()
+            self._stop_threads.set()
+        self.player.stop()
+        self.session.stop(to_error=True)
+        self.session.recover_from_error()
+        self._notify_observers()
+
+    def close(self) -> None:
+        self.stop_voice_mode()
+        self.session.close()
+
+    def switch_identity(
+        self,
+        identity: Any | None,
+        *,
+        config: VoiceConfig | None = None,
+    ) -> None:
+        """Cancel active turns, drop to safe text mode, and rebind to the new user session."""
+        self.interrupt("user_switch")
+        with self._lock:
+            self._mode = "text"
+            self._turn_id += 1
+            self._turn_cancel_event.set()
+            if config is not None:
+                self.config = config
+        self.session.stop(to_error=False)
+        user_id = getattr(identity, "user_id", None) if identity is not None else None
+        auth_session_id = getattr(identity, "session_id", None) if identity is not None else None
+        self.session.bind_user(user_id, auth_session_id, config=config)
+        self._notify_observers()

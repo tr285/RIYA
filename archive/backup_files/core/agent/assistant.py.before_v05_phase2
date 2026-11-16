@@ -1,0 +1,1591 @@
+import copy
+import importlib
+from pathlib import Path
+import threading
+from typing import Any
+
+from core.agent.context import ConversationContext
+from core.agent.executor import CommandExecutor
+from core.agent.intent import IntentDetector, IntentType
+from core.agent.planner import AgentPlanner
+
+from core.identity.context import (
+    ExecutionContext,
+    ExecutionContextScope,
+    get_current_execution_context,
+)
+from core.identity.errors import IdentityError, InvalidIdentityError, MissingIdentityError
+from core.identity.manager import (
+    ConversationHistoryStore,
+    IdentityManager,
+    UserPermissionStore,
+    UserPreferencesService,
+)
+from core.identity.models import AuthenticatedIdentity, UserProfile
+
+from core.memory.intent import MemoryIntentType
+from core.memory.manager import MemoryManager
+from core.memory.service import MemoryService
+
+from core.agent.agent import RiyaAgent
+from core.ai.local_runtime import LocalLlamaRuntime
+from core.ai.safety import (
+    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    MAX_MODEL_RESPONSE_CHARS,
+    MAX_USER_INPUT_CHARS,
+    InferenceCancelledError,
+    InferenceTimeoutError,
+    bound_model_output,
+    run_with_timeout,
+    strip_unsafe_control_chars,
+    validate_user_input,
+)
+
+
+_UNSET = object()
+
+
+class RIYAAssistant:
+    """
+    Main RIYA application interface.
+
+    Public interface:
+
+        assistant = RIYAAssistant()
+        assistant.process("...")
+        assistant.close()
+
+    Architecture:
+
+        User
+          ↓
+        Memory
+          ↓
+        Deterministic Router
+          ↓
+        Semantic Tool Retrieval
+          ↓
+        AI Planner
+          ↓
+        Security
+          ↓
+        Tool Execution
+          ↓
+        Verification
+          ↓
+        RIYA Response
+    """
+
+    max_input_chars = MAX_USER_INPUT_CHARS
+    max_plan_steps = 8
+    max_response_chars = MAX_MODEL_RESPONSE_CHARS
+    inference_timeout_seconds = DEFAULT_INFERENCE_TIMEOUT_SECONDS
+
+    def __init__(
+        self,
+        *,
+        identity_manager: IdentityManager | None = None,
+        default_identity: AuthenticatedIdentity | None = None,
+        require_identity: bool = False,
+    ):
+
+        # =====================================================
+        # IDENTITY & PER-USER SERVICES
+        # =====================================================
+
+        self.identity_manager = identity_manager
+        self.require_identity = bool(
+            require_identity
+            or identity_manager is not None
+            or default_identity is not None
+        )
+        self.permission_store = (
+            UserPermissionStore(identity_manager)
+            if identity_manager is not None
+            else None
+        )
+        self.preferences_service = (
+            UserPreferencesService(identity_manager)
+            if identity_manager is not None
+            else None
+        )
+        self.history_store = (
+            ConversationHistoryStore(identity_manager)
+            if identity_manager is not None
+            else None
+        )
+        self._active_identity: AuthenticatedIdentity | None = None
+        self._user_contexts: dict[str, ConversationContext] = {}
+
+        # =====================================================
+        # RIYA AGENT
+        # =====================================================
+
+        self.agent = RiyaAgent(
+            identity_manager=identity_manager,
+            permission_store=self.permission_store,
+            require_identity=self.require_identity,
+            default_identity=default_identity,
+        )
+
+        # =====================================================
+        # LOCAL SEMANTIC ENGINE
+        # =====================================================
+
+        self.semantic = self._initialize_semantic_engine()
+
+        # =====================================================
+        # LOCAL AI
+        # =====================================================
+
+        self.ai = LocalLlamaRuntime(
+            context_size=4096,
+            max_tokens=256,
+        )
+
+        # =====================================================
+        # MODEL
+        # =====================================================
+
+        self.model_path = self._find_model()
+
+        self.ai.load_model(
+            str(self.model_path)
+        )
+
+        # =====================================================
+        # CORE COMPONENTS
+        # =====================================================
+
+        self.intent_detector = IntentDetector()
+
+        self.command_executor = CommandExecutor(
+            self.agent
+        )
+
+        memory_db = (
+            identity_manager.database
+            if identity_manager is not None
+            else None
+        )
+        self.memory = MemoryService(
+            manager=MemoryManager(
+                database=memory_db,
+                identity_manager=identity_manager,
+                require_user=self.require_identity,
+            )
+        )
+
+        # =====================================================
+        # AI PLANNER + SEMANTIC ENGINE
+        # =====================================================
+
+        self.planner = AgentPlanner(
+            self.ai,
+            self.agent.tools,
+            semantic_engine=self.semantic,
+        )
+
+        # =====================================================
+        # CONVERSATION CONTEXT
+        # =====================================================
+
+        self.context = ConversationContext(
+            max_messages=12
+        )
+
+        # =====================================================
+        # PENDING CONFIRMATION
+        # =====================================================
+
+        self.pending_action = None
+        self.pending_plan = None
+        self._cancel_event = threading.Event()
+
+        if default_identity is not None:
+            self.set_identity(default_identity)
+
+    def _initialize_semantic_engine(self):
+        """Load semantic tool retrieval without making it a startup requirement."""
+
+        self.semantic_unavailable_reason = None
+
+        try:
+            semantic_module = importlib.import_module(
+                "core.agent.semantic"
+            )
+
+            return semantic_module.SemanticToolEngine(
+                self.agent.tools,
+                top_k=8,
+            )
+
+        except Exception as exc:
+            # AgentPlanner accepts ``None`` and safely falls back to the full
+            # registry, so deterministic commands and planning remain usable.
+            # Semantic retrieval is an enhancement, not a startup dependency.
+            self.semantic_unavailable_reason = str(exc)
+            return None
+
+    # =========================================================
+    # MODEL LOCATION
+    # =========================================================
+
+    def _find_model(self):
+
+        from pathlib import Path
+
+        candidates = [
+
+            # -------------------------------------------------
+            # Project model
+            # -------------------------------------------------
+
+            Path.home()
+            / "Projects"
+            / "RIYA"
+            / "models"
+            / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+
+            # -------------------------------------------------
+            # Hugging Face cache
+            # -------------------------------------------------
+
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--lmstudio-community--Qwen3-4B-Instruct-2507-GGUF"
+            / "snapshots",
+        ]
+
+        # -----------------------------------------------------
+        # Direct model file
+        # -----------------------------------------------------
+
+        for candidate in candidates:
+
+            if candidate.is_file():
+
+                return candidate
+
+        # -----------------------------------------------------
+        # Search Hugging Face snapshots
+        # -----------------------------------------------------
+
+        hf_snapshots = candidates[-1]
+
+        if hf_snapshots.exists():
+
+            for snapshot in hf_snapshots.iterdir():
+
+                if not snapshot.is_dir():
+                    continue
+
+                model_file = (
+                    snapshot
+                    / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+                )
+
+                if model_file.exists():
+
+                    return model_file
+
+        raise FileNotFoundError(
+            "RIYA local Qwen3 model was not found.\n"
+            "Expected either:\n"
+            f"  {candidates[0]}\n"
+            "or the existing Hugging Face cache."
+        )
+
+    # =========================================================
+    # MAIN PROCESSING
+    # =========================================================
+
+    def _get_cancel_event(self) -> threading.Event:
+        """Return the cancellation event, initializing lazily for stubbed instances."""
+
+        event = getattr(self, "_cancel_event", None)
+        if event is None:
+            event = threading.Event()
+            self._cancel_event = event
+        return event
+
+    def cancel(self) -> None:
+        """Cancel active AI inference or pending confirmation safely."""
+
+        self._get_cancel_event().set()
+        if hasattr(self.ai, "cancel"):
+            self.ai.cancel()
+        if hasattr(self, "planner") and hasattr(self.planner, "cancel"):
+            self.planner.cancel()
+
+    def reset_cancel(self) -> None:
+        """Reset cancellation flags before processing new requests."""
+
+        self._get_cancel_event().clear()
+        if hasattr(self.ai, "reset_cancel"):
+            self.ai.reset_cancel()
+        if hasattr(self, "planner") and hasattr(self.planner, "reset_cancel"):
+            self.planner.reset_cancel()
+
+    @staticmethod
+    def _format_action_preview(
+        tool_name: str,
+        parameters: dict,
+    ) -> str:
+        """Render a concise, safe summary of a pending tool and its arguments."""
+
+        if not isinstance(parameters, dict) or not parameters:
+            return f"{tool_name}()"
+
+        parts = []
+        for key in sorted(parameters):
+            raw_val = parameters[key]
+            if isinstance(raw_val, str):
+                cleaned = strip_unsafe_control_chars(
+                    raw_val,
+                    allow_newlines=False,
+                ).strip()
+                if key == "path" and len(cleaned) > 80:
+                    cleaned = f"{cleaned[:28]}...{cleaned[-49:]}"
+                elif len(cleaned) > 64:
+                    cleaned = cleaned[:61] + "..."
+                parts.append(f"{key}={cleaned!r}")
+            else:
+                parts.append(f"{key}={raw_val!r}")
+
+        return f"{tool_name}({', '.join(parts)})"
+
+    def _clear_pending_confirmations(self) -> None:
+        pending = getattr(self, "pending_action", None)
+        agent = getattr(self, "agent", None)
+        if isinstance(pending, dict) and agent is not None and hasattr(agent, "cancel_confirmation"):
+            token = pending.get("confirmation_token")
+            if isinstance(token, str) and token:
+                agent.cancel_confirmation(token)
+        if agent is not None:
+            executor = getattr(agent, "executor", None)
+            confirmations = getattr(executor, "confirmations", None)
+            active = getattr(self, "_active_identity", None)
+            if confirmations is not None and isinstance(active, AuthenticatedIdentity):
+                confirmations.cancel_for_session(
+                    user_id=active.user_id,
+                    session_id=active.session_id,
+                )
+        self.pending_action = None
+        self.pending_plan = None
+
+    def _validate_identity_arg(self, identity: Any) -> AuthenticatedIdentity:
+        if identity is None:
+            raise MissingIdentityError("Authenticated user identity is required.")
+        if isinstance(identity, UserProfile):
+            raise InvalidIdentityError(
+                "A UserProfile cannot be used as an authenticated assistant identity."
+            )
+        if not isinstance(identity, AuthenticatedIdentity):
+            raise InvalidIdentityError(
+                "Invalid user identity; expected AuthenticatedIdentity."
+            )
+        mgr = getattr(self, "identity_manager", None)
+        if mgr is not None:
+            return mgr.validate_session(identity)
+        return identity
+
+    def _context_for_identity(
+        self,
+        identity: AuthenticatedIdentity | None,
+    ) -> ConversationContext:
+        contexts = getattr(self, "_user_contexts", None)
+        if contexts is None:
+            contexts = {}
+            self._user_contexts = contexts
+        if identity is None:
+            return ConversationContext(max_messages=12)
+        if identity.user_id not in contexts:
+            contexts[identity.user_id] = ConversationContext(max_messages=12)
+        return contexts[identity.user_id]
+
+    def set_identity(self, identity: AuthenticatedIdentity | None) -> None:
+        """Switch active authenticated user session, revoking pending confirmations."""
+        self._clear_pending_confirmations()
+
+        if identity is None:
+            self._active_identity = None
+            agent = getattr(self, "agent", None)
+            if agent is not None and hasattr(agent, "set_identity"):
+                agent.set_identity(None)
+            self.context = self._context_for_identity(None)
+            return
+
+        validated = self._validate_identity_arg(identity)
+        self._active_identity = validated
+        self.require_identity = True
+        agent = getattr(self, "agent", None)
+        if agent is not None and hasattr(agent, "set_identity"):
+            agent.set_identity(validated)
+        self.context = self._context_for_identity(validated)
+
+    @property
+    def current_identity(self) -> AuthenticatedIdentity | None:
+        return getattr(self, "_active_identity", None)
+
+    def switch_user(
+        self,
+        username: str,
+        *,
+        password: str | None = None,
+        auth_method: str | None = None,
+    ) -> AuthenticatedIdentity:
+        mgr = getattr(self, "identity_manager", None)
+        if mgr is None:
+            raise MissingIdentityError("IdentityManager is not configured.")
+        previous = getattr(self, "_active_identity", None)
+        if previous is not None:
+            mgr.logout(previous)
+        new_identity = mgr.authenticate(
+            username,
+            password=password,
+            auth_method=auth_method,
+        )
+        self.set_identity(new_identity)
+        return new_identity
+
+    def logout(self) -> None:
+        mgr = getattr(self, "identity_manager", None)
+        previous = getattr(self, "_active_identity", None)
+        if mgr is not None and isinstance(previous, AuthenticatedIdentity):
+            mgr.logout(previous)
+        self.set_identity(None)
+
+    def _resolve_turn_identity(
+        self,
+        user_context: Any,
+    ) -> AuthenticatedIdentity | None:
+        if user_context is not _UNSET:
+            return self._validate_identity_arg(user_context)
+
+        active = getattr(self, "_active_identity", None)
+        if active is not None:
+            return self._validate_identity_arg(active)
+
+        if getattr(self, "require_identity", False) or getattr(self, "identity_manager", None) is not None:
+            raise MissingIdentityError(
+                "Authenticated user session is required before accessing RIYA."
+            )
+
+        return None
+
+    def _build_turn_execution_context(
+        self,
+        identity: AuthenticatedIdentity,
+    ) -> ExecutionContext:
+        mgr = getattr(self, "identity_manager", None)
+        if mgr is not None:
+            scoped_memory = MemoryManager(
+                mgr.database,
+                identity=identity,
+                identity_manager=mgr,
+                require_user=True,
+            )
+            return mgr.build_execution_context(
+                identity,
+                memory_manager=scoped_memory,
+            )
+
+        workspace = Path(identity.workspace_dir).expanduser().resolve()
+        return ExecutionContext(
+            user_id=identity.user_id,
+            session_id=identity.session_id,
+            workspace_dir=workspace,
+            allowed_roots=(workspace,),
+            voice_dir=(workspace.parent / "voice").resolve(),
+            identity=identity,
+            memory_manager=None,
+        )
+
+    @staticmethod
+    def _stamp_pending_identity(
+        pending_action: dict[str, Any],
+        identity: AuthenticatedIdentity | None,
+    ) -> dict[str, Any]:
+        if identity is not None:
+            pending_action["user_id"] = identity.user_id
+            pending_action["session_id"] = identity.session_id
+        return pending_action
+
+    def process(
+        self,
+        user_input: str,
+        user_context: Any = _UNSET,
+    ) -> str:
+        try:
+            active_identity = self._resolve_turn_identity(user_context)
+        except IdentityError as exc:
+            return f"Authentication required: {exc}"
+
+        if self.pending_action is None:
+            self.pending_plan = None
+
+        if not isinstance(user_input, str):
+            return "Please tell me what you'd like me to do."
+
+        try:
+            user_input = validate_user_input(
+                user_input,
+                max_chars=getattr(self, "max_input_chars", MAX_USER_INPUT_CHARS),
+            )
+        except ValueError:
+            return (
+                "Your request exceeds RIYA's maximum input length. "
+                "Please shorten it and try again."
+            )
+
+        # -----------------------------------------------------
+        # Empty input
+        # -----------------------------------------------------
+
+        if not user_input:
+
+            return (
+                "Please tell me what you'd like me to do."
+            )
+
+        if active_identity is None:
+            return self._process_turn(user_input, active_identity=None)
+
+        previous_context = getattr(self, "context", None)
+        self.context = self._context_for_identity(active_identity)
+        exec_ctx = self._build_turn_execution_context(active_identity)
+        try:
+            with ExecutionContextScope(exec_ctx):
+                return self._process_turn(user_input, active_identity=active_identity)
+        finally:
+            if user_context is not _UNSET and getattr(self, "_active_identity", None) != active_identity:
+                if previous_context is not None:
+                    self.context = previous_context
+
+    def _process_turn(
+        self,
+        user_input: str,
+        active_identity: AuthenticatedIdentity | None = None,
+    ) -> str:
+        # -----------------------------------------------------
+        # Pending confirmation
+        # -----------------------------------------------------
+
+        if self.pending_action is not None:
+            if active_identity is not None and (
+                self.pending_action.get("user_id") != active_identity.user_id
+                or self.pending_action.get("session_id") != active_identity.session_id
+            ):
+                return (
+                    "That pending confirmation belongs to a different user session "
+                    "and cannot be authorized here."
+                )
+
+            return self._handle_confirmation(
+                user_input
+            )
+
+        # =====================================================
+        # MEMORY SYSTEM
+        # =====================================================
+
+        memory_intent = self.memory.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Recall
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.RECALL
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "I couldn't find that memory."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # List memories
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.LIST
+        ):
+
+            response = self.memory.execute_safe(
+                memory_intent
+            )
+
+            response = response or (
+                "RIYA has no stored memories."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Remember
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.REMEMBER
+        ):
+
+            action = (
+                self.memory.build_remember_action(
+                    memory_intent
+                )
+            )
+
+            try:
+                authorization = self.agent.execute(
+                    action["tool"],
+                    **copy.deepcopy(action["parameters"]),
+                )
+            except Exception as exc:
+                response = f"I couldn't remember that safely: {exc}"
+                self._update_context(user_input, response)
+                return response
+
+            if (
+                not isinstance(authorization, dict)
+                or authorization.get("status") != "confirmation_required"
+            ):
+                response = self._format_result(authorization)
+                self._update_context(user_input, response)
+                return response
+
+            token = authorization.get("confirmation_token")
+            if not isinstance(token, str) or not token:
+                response = "I couldn't obtain a valid confirmation token."
+                self._update_context(user_input, response)
+                return response
+
+            ctx = get_current_execution_context()
+            self.pending_action = self._stamp_pending_identity(
+                {
+                    "tool": action["tool"],
+                    "parameters": copy.deepcopy(action["parameters"]),
+                    "confirmation_token": token,
+                },
+                ctx.identity if ctx is not None else getattr(self, "_active_identity", None),
+            )
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            value = (
+                action["parameters"]["value"]
+            )
+
+            response = (
+                f"I'll remember '{value}' "
+                f"under '{category}' as '{key}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Forget
+        # -----------------------------------------------------
+
+        if (
+            memory_intent.type
+            == MemoryIntentType.FORGET
+        ):
+
+            action = (
+                self.memory.build_forget_action(
+                    memory_intent
+                )
+            )
+
+            try:
+                authorization = self.agent.execute(
+                    action["tool"],
+                    **copy.deepcopy(action["parameters"]),
+                )
+            except Exception as exc:
+                response = f"I couldn't process that forget request safely: {exc}"
+                self._update_context(user_input, response)
+                return response
+
+            if (
+                not isinstance(authorization, dict)
+                or authorization.get("status") != "confirmation_required"
+            ):
+                response = self._format_result(authorization)
+                self._update_context(user_input, response)
+                return response
+
+            token = authorization.get("confirmation_token")
+            if not isinstance(token, str) or not token:
+                response = "I couldn't obtain a valid confirmation token."
+                self._update_context(user_input, response)
+                return response
+
+            ctx = get_current_execution_context()
+            self.pending_action = self._stamp_pending_identity(
+                {
+                    "tool": action["tool"],
+                    "parameters": copy.deepcopy(action["parameters"]),
+                    "confirmation_token": token,
+                },
+                ctx.identity if ctx is not None else getattr(self, "_active_identity", None),
+            )
+
+            category = (
+                action["parameters"]["category"]
+            )
+
+            key = (
+                action["parameters"]["key"]
+            )
+
+            response = (
+                f"I'll forget the memory "
+                f"'{key}' under '{category}'. "
+                f"Proceed?"
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # DETERMINISTIC COMMAND ROUTER
+        # =====================================================
+
+        intent = self.intent_detector.detect(
+            user_input
+        )
+
+        # -----------------------------------------------------
+        # Exit
+        # -----------------------------------------------------
+
+        if intent.type == IntentType.EXIT:
+
+            return "Goodbye."
+
+        # -----------------------------------------------------
+        # Simple deterministic command
+        # -----------------------------------------------------
+
+        if intent.type != IntentType.CHAT:
+
+            try:
+
+                result = (
+                    self.command_executor.execute(
+                        intent
+                    )
+                )
+
+                response = self._format_result(
+                    result
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+            except Exception as exc:
+
+                response = (
+                    "I couldn't complete that action: "
+                    f"{exc}"
+                )
+
+                self._update_context(
+                    user_input,
+                    response,
+                )
+
+                return response
+
+        # =====================================================
+        # SEMANTIC + AI PLANNER
+        # =====================================================
+
+        try:
+            plan = self.planner.create_plan(
+                user_input
+            )
+        except (TimeoutError, InferenceTimeoutError):
+            response = (
+                "I timed out while planning that request, "
+                "so nothing was executed."
+            )
+            self._update_context(user_input, response)
+            return response
+        except InferenceCancelledError:
+            response = "That request was cancelled before execution."
+            self._update_context(user_input, response)
+            return response
+        except ValueError:
+            response = (
+                "I couldn't safely validate an action plan for that request, "
+                "so nothing was executed."
+            )
+            self._update_context(user_input, response)
+            return response
+        except Exception:
+            response = (
+                "I encountered an internal error while planning that request, "
+                "so nothing was executed."
+            )
+            self._update_context(user_input, response)
+            return response
+
+        # =====================================================
+        # NORMAL CONVERSATION
+        # =====================================================
+
+        if plan is None or not getattr(plan, "steps", None):
+            if self._get_cancel_event().is_set():
+                raise InferenceCancelledError("Assistant turn was cancelled.")
+            timeout = getattr(
+                self,
+                "inference_timeout_seconds",
+                DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+            )
+            max_chars = getattr(
+                self,
+                "max_response_chars",
+                MAX_MODEL_RESPONSE_CHARS,
+            )
+            try:
+                raw_response = run_with_timeout(
+                    self.ai.generate,
+                    user_input,
+                    conversation_context=(
+                        self.context.format_for_prompt()
+                    ),
+                    timeout_seconds=timeout,
+                    cancel_event=self._get_cancel_event(),
+                )
+                response = bound_model_output(
+                    raw_response,
+                    max_chars=max_chars,
+                )
+            except (TimeoutError, InferenceTimeoutError):
+                response = (
+                    "I timed out while generating a response. "
+                    "Please try again."
+                )
+            except InferenceCancelledError:
+                response = "That request was cancelled."
+            except Exception:
+                response = (
+                    "I encountered an internal error while generating a response."
+                )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # =====================================================
+        # MULTI-STEP EXECUTION
+        if self._get_cancel_event().is_set():
+            raise InferenceCancelledError("Assistant turn was cancelled.")
+        return self._execute_plan_steps(
+            plan.steps,
+            start_index=0,
+            results=[],
+            user_input=user_input,
+        )
+
+    def _execute_plan_steps(
+        self,
+        steps,
+        start_index,
+        results,
+        user_input,
+    ) -> str:
+        """Execute a plan and preserve progress across confirmations."""
+
+        max_steps = getattr(self, "max_plan_steps", 8)
+        if not isinstance(steps, (list, tuple)) or len(steps) > max_steps:
+            self.pending_plan = None
+            response = (
+                f"I couldn't run that plan because it exceeds the maximum "
+                f"allowed {max_steps} steps."
+            )
+            self._update_context(user_input, response)
+            return response
+
+        for index in range(start_index, len(steps)):
+            if self._get_cancel_event().is_set():
+                self.pending_plan = None
+                raise InferenceCancelledError(
+                    "Plan execution cancelled by interruption."
+                )
+
+            step = steps[index]
+            step_action = getattr(step, "action", None)
+            step_params = getattr(step, "parameters", None)
+            step_desc = getattr(step, "description", "")
+
+            if (
+                not isinstance(step_action, str)
+                or not step_action.strip()
+                or not isinstance(step_params, dict)
+                or not all(isinstance(key, str) for key in step_params)
+                or "confirmation_token" in step_params
+            ):
+                self.pending_plan = None
+                response = (
+                    f"I couldn't authorize '{step_desc or step_action}'. "
+                    "Plan steps cannot supply confirmation tokens directly."
+                )
+                self._update_context(user_input, response)
+                return response
+
+            try:
+                result = self.agent.execute(
+                    step_action,
+                    confirmation_token=None,
+                    **copy.deepcopy(step_params),
+                )
+            except Exception as exc:
+                self.pending_plan = None
+                response = (
+                    "I couldn't complete the full task. "
+                    f"The operation '{step_action}' failed: {exc}"
+                )
+                self._update_context(user_input, response)
+                return response
+
+            if (
+                isinstance(result, dict)
+                and result.get("status") == "confirmation_required"
+            ):
+                confirmation_token = result.get("confirmation_token")
+
+                if not isinstance(confirmation_token, str) or not confirmation_token:
+                    self.pending_plan = None
+                    self.pending_action = None
+                    response = (
+                        f"I couldn't verify confirmation metadata for '{step_action}', "
+                        "so execution was halted."
+                    )
+                    self._update_context(user_input, response)
+                    return response
+
+                if self._get_cancel_event().is_set():
+                    if hasattr(self.agent, "cancel_confirmation"):
+                        self.agent.cancel_confirmation(confirmation_token)
+                    self.pending_action = None
+                    self.pending_plan = None
+                    raise InferenceCancelledError(
+                        "Plan confirmation staging cancelled by interruption."
+                    )
+
+                ctx = get_current_execution_context()
+                self.pending_action = self._stamp_pending_identity(
+                    {
+                        "tool": step_action,
+                        "parameters": copy.deepcopy(step_params),
+                        "confirmation_token": confirmation_token,
+                    },
+                    ctx.identity if ctx is not None else getattr(self, "_active_identity", None),
+                )
+                self.pending_plan = {
+                    "steps": list(steps),
+                    "next_index": index + 1,
+                    "results": list(results),
+                    "pending_step": {
+                        "action": step_action,
+                        "description": step_desc,
+                    },
+                    "original_input": user_input,
+                }
+                action_preview = self._format_action_preview(
+                    step_action,
+                    step_params,
+                )
+                response = (
+                    f"{result.get('reason', 'This action requires confirmation.')} "
+                    f"Action: {action_preview}. "
+                    "Proceed?"
+                )
+                self._update_context(user_input, response)
+                return response
+
+            if (
+                isinstance(result, dict)
+                and result.get("status") in {
+                    "failed",
+                    "authorization_failed",
+                    "verification_failed",
+                    "blocked",
+                }
+            ):
+                self.pending_plan = None
+                reason = result.get(
+                    "reason",
+                    result.get("error", "Unknown failure."),
+                )
+                response = (
+                    f"I couldn't complete "
+                    f"'{step_desc or step_action}'. {reason}"
+                )
+                self._update_context(user_input, response)
+                return response
+
+            results.append({
+                "action": step_action,
+                "description": step_desc,
+                "result": result,
+            })
+
+        self.pending_plan = None
+        response = self._summarize_results(results)
+        self._update_context(user_input, response)
+        return response
+
+    # CONFIRMATION
+    # =========================================================
+
+    def _handle_confirmation(
+        self,
+        user_input: str,
+    ) -> str:
+
+        normalized = (
+            user_input.lower()
+            .strip()
+            .rstrip(".!?")
+        )
+
+        yes_words = {
+            "yes",
+            "y",
+            "yeah",
+            "yep",
+            "sure",
+            "ok",
+            "okay",
+            "confirm",
+            "do it",
+            "proceed",
+            "go ahead",
+            "please proceed",
+            "continue",
+        }
+
+        no_words = {
+            "no",
+            "n",
+            "nope",
+            "cancel",
+            "stop",
+            "don't",
+            "dont",
+        }
+
+        # -----------------------------------------------------
+        # Cancel
+        # -----------------------------------------------------
+
+        if normalized in no_words:
+
+            self.agent.cancel_confirmation(
+                self.pending_action.get("confirmation_token")
+            )
+
+            self.pending_action = None
+            self.pending_plan = None
+
+            response = (
+                "Okay, I cancelled that action."
+            )
+
+            self._update_context(
+                user_input,
+                response,
+            )
+
+            return response
+
+        # -----------------------------------------------------
+        # Invalid confirmation
+        # -----------------------------------------------------
+
+        if normalized not in yes_words:
+
+            return (
+                "Please say yes to proceed "
+                "or no to cancel."
+            )
+
+        # -----------------------------------------------------
+        # Execute confirmed action
+        action = self.pending_action
+        plan_state = self.pending_plan
+        self.pending_action = None
+
+        if (
+            not isinstance(action, dict)
+            or not isinstance(action.get("tool"), str)
+            or not action["tool"]
+            or not isinstance(action.get("parameters"), dict)
+            or not all(isinstance(key, str) for key in action["parameters"])
+            or "confirmation_token" in action["parameters"]
+            or not isinstance(action.get("confirmation_token"), str)
+            or not action["confirmation_token"]
+        ):
+            self.pending_plan = None
+            response = "I couldn't validate the pending confirmation state."
+            self._update_context(user_input, response)
+            return response
+
+        if plan_state is not None:
+            pending_step = (
+                plan_state.get("pending_step")
+                if isinstance(plan_state, dict)
+                else None
+            )
+            if (
+                not isinstance(pending_step, dict)
+                or pending_step.get("action") != action["tool"]
+            ):
+                self.pending_plan = None
+                response = "Pending plan state did not match the confirmed action."
+                self._update_context(user_input, response)
+                return response
+
+        try:
+            result = self.agent.execute(
+                action["tool"],
+                confirmation_token=action["confirmation_token"],
+                **copy.deepcopy(action["parameters"]),
+            )
+
+            if plan_state is None:
+                response = self._format_result(result)
+                self._update_context(user_input, response)
+                return response
+
+            # Resume only after explicit success.
+            if not (
+                isinstance(result, dict)
+                and result.get("status") == "success"
+            ):
+                self.pending_plan = None
+                response = self._format_result(result)
+                self._update_context(user_input, response)
+                return response
+
+            completed = list(plan_state["results"])
+            pending_step = plan_state["pending_step"]
+            completed.append({
+                "action": pending_step["action"],
+                "description": pending_step["description"],
+                "result": result,
+            })
+
+            self.pending_plan = None
+            return self._execute_plan_steps(
+                plan_state["steps"],
+                start_index=plan_state["next_index"],
+                results=completed,
+                user_input=plan_state["original_input"],
+            )
+
+        except InferenceCancelledError:
+            self.pending_plan = None
+            raise
+
+        except Exception as exc:
+            self.pending_plan = None
+            response = (
+                "I couldn't complete the "
+                f"confirmed action: {exc}"
+            )
+            self._update_context(user_input, response)
+            return response
+
+    # RESULT FORMATTING
+    # =========================================================
+
+    def _format_result(
+        self,
+        result,
+    ) -> str:
+
+        # -----------------------------------------------------
+        # Plain string
+        # -----------------------------------------------------
+
+        if isinstance(result, str):
+
+            return result.strip()
+
+        # -----------------------------------------------------
+        # Structured result
+        # -----------------------------------------------------
+
+        if isinstance(result, dict):
+
+            status = result.get(
+                "status"
+            )
+
+            # -------------------------------------------------
+            # Confirmation
+            # -------------------------------------------------
+
+            if status == "confirmation_required":
+                tool_name = result.get("tool")
+                parameters = result.get("parameters", {})
+                token = result.get("confirmation_token")
+
+                if (
+                    not isinstance(tool_name, str)
+                    or not tool_name
+                    or not isinstance(parameters, dict)
+                    or not isinstance(token, str)
+                    or not token
+                ):
+                    self.pending_action = None
+                    self.pending_plan = None
+                    return "I couldn't validate the confirmation request."
+
+                ctx = get_current_execution_context()
+                self.pending_action = self._stamp_pending_identity(
+                    {
+                        "tool": tool_name,
+                        "parameters": copy.deepcopy(parameters),
+                        "confirmation_token": token,
+                    },
+                    ctx.identity if ctx is not None else getattr(self, "_active_identity", None),
+                )
+
+                action_preview = self._format_action_preview(
+                    tool_name,
+                    parameters,
+                )
+                return (
+                    f"{result.get('reason', 'Confirmation required.')} "
+                    f"Action: {action_preview}. "
+                    "Proceed?"
+                )
+
+            # -------------------------------------------------
+            # Failed
+            # -------------------------------------------------
+
+            if status == "failed":
+
+                return (
+                    "I couldn't complete the action. "
+                    f"{result.get('error', 'Unknown error.')}"
+                )
+
+            if status == "authorization_failed":
+
+                return (
+                    "I couldn't authorize the action. "
+                    f"{result.get('reason', 'Confirmation failed.')}"
+                )
+
+            # -------------------------------------------------
+            # Verification failed
+            # -------------------------------------------------
+
+            if status == "verification_failed":
+
+                return (
+                    "The action was attempted, "
+                    "but I could not verify that it "
+                    "completed successfully. "
+                    f"{result.get('reason', '')}"
+                ).strip()
+
+            # -------------------------------------------------
+            # Successful
+            # -------------------------------------------------
+
+            if status == "success":
+
+                actual_result = result.get(
+                    "result"
+                )
+
+                if isinstance(
+                    actual_result,
+                    str,
+                ):
+
+                    return actual_result.strip()
+
+                if actual_result is not None:
+
+                    return str(
+                        actual_result
+                    )
+
+                verification = result.get(
+                    "verification"
+                )
+
+                if isinstance(
+                    verification,
+                    dict,
+                ):
+
+                    reason = verification.get(
+                        "reason"
+                    )
+
+                    if reason:
+
+                        return str(
+                            reason
+                        )
+
+                return (
+                    "The action completed successfully."
+                )
+
+            # -------------------------------------------------
+            # Unknown dictionary
+            # -------------------------------------------------
+
+            return str(result)
+
+        return str(result)
+
+    # =========================================================
+    # MULTI-STEP SUMMARY
+    # =========================================================
+
+    def _summarize_results(
+        self,
+        results,
+    ) -> str:
+
+        if not results:
+
+            return (
+                "The task completed."
+            )
+
+        successful = []
+
+        for item in results:
+
+            raw_result = item.get(
+                "result"
+            )
+
+            # -------------------------------------------------
+            # Structured ToolExecutor result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                dict,
+            ):
+
+                status = raw_result.get(
+                    "status"
+                )
+
+                if status == "success":
+
+                    actual_result = (
+                        raw_result.get(
+                            "result"
+                        )
+                    )
+
+                    if actual_result is not None:
+
+                        text = str(
+                            actual_result
+                        ).strip()
+
+                        if text:
+
+                            successful.append(
+                                text
+                            )
+
+                        continue
+
+                    verification = (
+                        raw_result.get(
+                            "verification"
+                        )
+                    )
+
+                    if isinstance(
+                        verification,
+                        dict,
+                    ):
+
+                        reason = (
+                            verification.get(
+                                "reason"
+                            )
+                        )
+
+                        if reason:
+
+                            successful.append(
+                                str(
+                                    reason
+                                ).strip()
+                            )
+
+                continue
+
+            # -------------------------------------------------
+            # Plain string result
+            # -------------------------------------------------
+
+            if isinstance(
+                raw_result,
+                str,
+            ):
+
+                cleaned = (
+                    raw_result.strip()
+                )
+
+                if cleaned:
+
+                    successful.append(
+                        cleaned
+                    )
+
+        # -----------------------------------------------------
+        # No readable result
+        # -----------------------------------------------------
+
+        if not successful:
+
+            return (
+                "Done. The requested actions "
+                "were completed and verified."
+            )
+
+        # -----------------------------------------------------
+        # One result
+        # -----------------------------------------------------
+
+        if len(successful) == 1:
+
+            return successful[0]
+
+        # -----------------------------------------------------
+        # Multiple results
+        # -----------------------------------------------------
+
+        lines = [
+            "Done. I completed the requested actions:"
+        ]
+
+        for result in successful:
+
+            lines.append(
+                f"• {result}"
+            )
+
+        return "\n".join(
+            lines
+        )
+
+    # =========================================================
+    # CONVERSATION CONTEXT
+    # =========================================================
+
+    def _update_context(
+        self,
+        user_input: str,
+        response: str,
+    ) -> None:
+
+        self.context.add_user(
+            user_input
+        )
+
+        if response:
+
+            self.context.add_assistant(
+                response
+            )
+
+        history_store = getattr(self, "history_store", None)
+        if history_store is not None:
+            ctx = get_current_execution_context()
+            identity = (
+                ctx.identity
+                if ctx is not None and ctx.identity is not None
+                else getattr(self, "_active_identity", None)
+            )
+            if isinstance(identity, AuthenticatedIdentity):
+                history_store.append_message(identity, "user", user_input)
+                if response:
+                    history_store.append_message(identity, "assistant", response)
+
+    # =========================================================
+    # SHUTDOWN
+    # =========================================================
+
+    def close(self):
+
+        if self.ai is not None:
+
+            try:
+
+                self.ai.unload_model()
+
+            except Exception:
+
+                pass

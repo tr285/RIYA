@@ -68,7 +68,7 @@ class CommandExecutor:
             )
 
         if intent_type == IntentType.CREATE_FOLDER:
-            path = parameters.get("path")
+            path = parameters.get("path") or parameters.get("folder_name")
 
             if not path:
                 raise ValueError(
@@ -100,6 +100,28 @@ class CommandExecutor:
             return self.agent.execute(
                 "current_time"
             )
+
+        if intent_type == IntentType.SYSTEM_INFORMATION:
+            return self.agent.execute("system_information")
+
+        if intent_type == IntentType.STORAGE_STATUS:
+            path = parameters.get("path", "/")
+            return self.agent.execute("storage_status", path=path)
+
+        if intent_type == IntentType.NETWORK_STATUS:
+            return self.agent.execute("network_status")
+
+        if intent_type == IntentType.BATTERY_STATUS:
+            return self.agent.execute("battery_status")
+
+        if intent_type == IntentType.CHECK_APPLICATION:
+            app_name = parameters.get("app_name")
+            if isinstance(app_name, str) and app_name.strip():
+                return self.agent.execute(
+                    "check_application",
+                    app_name=app_name.strip(),
+                )
+            return self.agent.execute("check_application")
 
         if intent_type == IntentType.EXIT:
             return "Goodbye."

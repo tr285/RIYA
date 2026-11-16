@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+# Debian rules file for RIYA
+
+%:
+	dh $@ --with python3
+
+override_dh_auto_build:
+	# Pre-compilation / verification if required
+
+override_dh_auto_install:
+	mkdir -p debian/riya/opt/riya
+	cp -r core debian/riya/opt/riya/
+	mkdir -p debian/riya/opt/riya/bin
+	cp packaging/linux/debian/riya-launcher debian/riya/opt/riya/bin/riya
+	chmod 0755 debian/riya/opt/riya/bin/riya
+

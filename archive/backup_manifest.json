@@ -1,0 +1,1616 @@
+{
+  "archive_directory": "/Users/tukaramgore/Projects/RIYA/archive/backup_files",
+  "total_files": 201,
+  "archived_moved": 190,
+  "archived_copied_retained": 11,
+  "files": [
+    {
+      "original_path": "core/agent/agent.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_phase4",
+      "sha256": "b26c0de3b94c3588c0f0c2f4d42a7fa227a78fcefc1eafa12323cabf41c9974e",
+      "size_bytes": 10291,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_security_audit",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_security_audit",
+      "sha256": "ec33d83bf73a578317848e224b1cdb6f3594ce3736dc2adb8ab3ef598577fcaa",
+      "size_bytes": 9995,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase1",
+      "sha256": "a5bfa4f7e57bb89b7ca15aa634a4ee0c9272617033621a78ee5983fb1d0ccf0e",
+      "size_bytes": 10528,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase2",
+      "sha256": "767d70a6c3cc33de25690238bdd4eb804119e121d139635ed9a5c08966f02fe7",
+      "size_bytes": 11373,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase4",
+      "sha256": "96c89be289f8582aed2fd43c14dfff8296774c9f4a69bff2631dd4ac94450e75",
+      "size_bytes": 12068,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase5",
+      "sha256": "96c89be289f8582aed2fd43c14dfff8296774c9f4a69bff2631dd4ac94450e75",
+      "size_bytes": 12068,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase6_m62",
+      "sha256": "e695260c59672bce63b22c34a853ab19a3953675ecb375824bc4999620a494ec",
+      "size_bytes": 20128,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase6_m63",
+      "sha256": "701f5b0573f7891c08e1dfdacd8acdd95dbc7b676cedc98d39f2af8dfb4aa10f",
+      "size_bytes": 24706,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/agent.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/agent/agent.py.before_v05_phase6_m64",
+      "sha256": "72b09f25d6cb8d617b17e229a5a32a8f609b94a0f882fdac7d6bf4ace0dd0c6c",
+      "size_bytes": 30769,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.bak",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.bak",
+      "sha256": "f977693fb383c6b1d9850df7f3db311c3971d5a23619b0d067f36b4b61c83099",
+      "size_bytes": 25033,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_final_audit",
+      "sha256": "efe7bad821f5d164c2ec3327cedd8eb4cb007992ac05a34b722576dfd0910fba",
+      "size_bytes": 37386,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_pending_plan_init_20261114_043119",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_pending_plan_init_20261114_043119",
+      "sha256": "c26052e14fadbec1441f7bdceff7b166784016db10894734ad085c78b649f08e",
+      "size_bytes": 27427,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_phase4",
+      "sha256": "5cd986b9861777da2016c805313b645f29bd02d9cb2c03a7d86e52e3164e0217",
+      "size_bytes": 28312,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_plan_continuation",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_plan_continuation",
+      "sha256": "c26052e14fadbec1441f7bdceff7b166784016db10894734ad085c78b649f08e",
+      "size_bytes": 27427,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_resumable_plan_20261114_043150",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_resumable_plan_20261114_043150",
+      "sha256": "ccf471c3b052547646ad79b9fb011c723a8eb54ad4c7d7d5caa41f13c59b99a7",
+      "size_bytes": 27460,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_security_audit",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_security_audit",
+      "sha256": "8d07ccb3767fe0deebd93cb0f31a2bac936688c5c166b47c65cefac4e9d1eccc",
+      "size_bytes": 27783,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase1",
+      "sha256": "1fa8feb85ec4b44de844fee63a5d231850f033689239043bb74d6e78edd845e6",
+      "size_bytes": 38916,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase2",
+      "sha256": "8ec48216569a57af2be45160aadf2fd6d4b2b40828eaecee093dccc1c637bc59",
+      "size_bytes": 50269,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase3",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase3",
+      "sha256": "f15c89109131aa752e1a5dca13bb399887df13de1ca130103465ce0a81cba4b4",
+      "size_bytes": 52219,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase4",
+      "sha256": "e5650bf2644f2ec03cac6a84f41625afbd9b5f24ead3ee685d367d7ec03b4b4b",
+      "size_bytes": 55936,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase5",
+      "sha256": "832c782b703cc1dc77ad18823413b96c9ff8d302d57f41e367efc67938a0d582",
+      "size_bytes": 64548,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase6_final",
+      "sha256": "93e524b43e6fb2f3aebe60f0b74047f46e398c6411498df4b8ef3753a27b85e0",
+      "size_bytes": 87565,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase6_m61",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase6_m61",
+      "sha256": "d5561b669342212df8c0d7c163af6ece50b865e799a257e381977386eb9f97d4",
+      "size_bytes": 78917,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase6_m62",
+      "sha256": "7f35e5853e60a5cb87f28591fc527578e8beb507895ea176e26292195999596d",
+      "size_bytes": 85393,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase6_m63",
+      "sha256": "93e524b43e6fb2f3aebe60f0b74047f46e398c6411498df4b8ef3753a27b85e0",
+      "size_bytes": 87565,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/assistant.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/agent/assistant.py.before_v05_phase6_m64",
+      "sha256": "93e524b43e6fb2f3aebe60f0b74047f46e398c6411498df4b8ef3753a27b85e0",
+      "size_bytes": 87565,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/context.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/context.py.before_phase4",
+      "sha256": "ac9345aa2655a79391ca75b92224e68c9ae55f6083728a4ba47bdb36b68468ae",
+      "size_bytes": 1984,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/context.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/agent/context.py.before_v05_phase4",
+      "sha256": "078a9cfb4dac83f1fb6800500140394b2b870858ba6a4dffc7e97a386ae44a46",
+      "size_bytes": 3149,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/executor.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/executor.py.before_phase4",
+      "sha256": "2b67bc4e0dc03b08257353772b13e27d2e644aebfcc0281ca42697632344289b",
+      "size_bytes": 3101,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/executor.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/executor.py.before_v05_phase6_m62",
+      "sha256": "a1f529c11128d332c6b20d73ac24331fb89b023852abda515cbcb427193524f6",
+      "size_bytes": 3134,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/executor.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/executor.py.before_v05_phase6_m63",
+      "sha256": "5de66a2336eb231d9636cb67658f0c177e470f6041e2864790ac7342bc167be1",
+      "size_bytes": 4018,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/intent.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/intent.py.before_v05_phase6_m62",
+      "sha256": "0dd1daf28f32ab119fb577fbf6e2d7e44ccfb84fccc76a1882bc3d4a29356140",
+      "size_bytes": 11771,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/intent.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/intent.py.before_v05_phase6_m63",
+      "sha256": "1916cd570c93aad6e818d45f5314c7dd9cb9a9e74b0068f297b8bfba24fec2eb",
+      "size_bytes": 15894,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_final_audit",
+      "sha256": "20ddf344c14739a213908e50acc18e5a19cb0ebf836c60a8f4477f618de26c90",
+      "size_bytes": 9130,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_phase4",
+      "sha256": "b66f0e0edcc9148b874c096172a9995769796a2668d36ec137b1207e8a775af8",
+      "size_bytes": 6856,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase1",
+      "sha256": "ef6a38971959f7b9409096b6f1d8865df73766ec3f4ef976c2e9956398cfda9e",
+      "size_bytes": 10883,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase2",
+      "sha256": "ef6a38971959f7b9409096b6f1d8865df73766ec3f4ef976c2e9956398cfda9e",
+      "size_bytes": 10883,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase4",
+      "sha256": "d05d650e2c90b34ed0893b1fdea98bb236710579f89e0f008798b7fb630f4c0f",
+      "size_bytes": 11055,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase5",
+      "sha256": "2d009485601a3c4e03f2c12fa90231602a7ee0f43606c7bccb458182d06c7697",
+      "size_bytes": 11781,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase6_m62",
+      "sha256": "08366b35e68147aa7188a87db0296fd40a077ebd1f17e31bc618575063635078",
+      "size_bytes": 23917,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase6_m63",
+      "sha256": "52c042f7bbbfa9b5163f9d635c427b947b13d0f075210ff62e895d89fdcb270e",
+      "size_bytes": 26297,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/planner.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/agent/planner.py.before_v05_phase6_m64",
+      "sha256": "6ba57de66ca67f16c5c581fa8f221d0620877b79193c61887ede7c91f367b254",
+      "size_bytes": 27135,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_decision.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/tool_decision.py.before_phase4",
+      "sha256": "74961b0764e03b0a23e19e0b480c43c875d4b14143f7aecdc29eda026b0e41e0",
+      "size_bytes": 3536,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_decision.py.before_security_audit",
+      "archived_path": "archive/backup_files/core/agent/tool_decision.py.before_security_audit",
+      "sha256": "1cb397bdac65d48b1335dceb062abd450d9aec8486fcefd2638669d3155fb185",
+      "size_bytes": 3435,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_decision.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/tool_decision.py.before_v05_phase1",
+      "sha256": "6a4f1b9811549ec26e9f6c74c2033497751e8d9ece2d7f896113f6ddbdc449cc",
+      "size_bytes": 6261,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_decision.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/tool_decision.py.before_v05_phase2",
+      "sha256": "6a4f1b9811549ec26e9f6c74c2033497751e8d9ece2d7f896113f6ddbdc449cc",
+      "size_bytes": 6261,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.bak",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.bak",
+      "sha256": "563f47f034780faa70cbefd0614f38ca25aad10d83676665d335d757086d714b",
+      "size_bytes": 19334,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_phase3",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_phase3",
+      "sha256": "c7960c989b046f3a534e6eb75416b96a6bd3c6cdf94459ac57a4d39eecbe7435",
+      "size_bytes": 20599,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_phase4",
+      "sha256": "7eacde42c9042a6366129dae582dc7aa3cbac4cda9bc449cacfd895879d6c0c9",
+      "size_bytes": 22101,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase1",
+      "sha256": "92bc759fff6a9873f8d103331d43541b8ff72657f6295c0500c49e5a52a8219e",
+      "size_bytes": 25439,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase2",
+      "sha256": "a964d0ba3d37a2e7bc9aeba4fe576a7b3448756e1de29b7e5dbb4ef4e3cd584e",
+      "size_bytes": 32710,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase4",
+      "sha256": "cb4d3efc32fba61572c01c370a1be12c0e3989e46e7e397b60891a9e8e1bb261",
+      "size_bytes": 35529,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase5",
+      "sha256": "bfed471ff6c3d9aadbff15e58f02ca360ffaee9d9b51b62420bc0b58e03f6ead",
+      "size_bytes": 37970,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase6_final",
+      "sha256": "ca3cb3dea2799f510fa91d8e90bfd2f1d97cbdcbc8edb34fb4e52313b4f07c01",
+      "size_bytes": 46815,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase6_m62",
+      "sha256": "53aa85ef791d24341c32c8b18d8776b224b6e9615fbd209131efd90721f5e093",
+      "size_bytes": 41593,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase6_m63",
+      "sha256": "831ecc6ca453a301afaf5325793f1387aa29123001f5b54bdbf8bffd1c34158a",
+      "size_bytes": 45188,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_executor.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/agent/tool_executor.py.before_v05_phase6_m64",
+      "sha256": "f668a675038da016a462fb454242ff48bc99b92351134ff053fd003f8f69c72c",
+      "size_bytes": 45191,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_phase4",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_phase4",
+      "sha256": "e38ec51fbd4f1a53f0ec5e6fd63ccd196d83300eda7e3fe7432a4c2e14563f8c",
+      "size_bytes": 2173,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_security_audit",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_security_audit",
+      "sha256": "14ba5103f1681f673f89853d926ac9630ab46c359bb8c8fabaed0842842dfbed",
+      "size_bytes": 1861,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase1",
+      "sha256": "143b0cc4f6424af94caa67429979e2bb6b9df29043474b187cf4bad18c144331",
+      "size_bytes": 12562,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase2",
+      "sha256": "148cc6e1257bdb47f75b45464f69e8295c67e21f1bfacf3947b4a2bb9352bbb4",
+      "size_bytes": 13097,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase5",
+      "sha256": "93eba6a9c748a2c1929e1b7ec5e3f655c6d03314f9b17e2a348eb20e4855f451",
+      "size_bytes": 13554,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase6_final",
+      "sha256": "a7f975f3b8ec505752680528dcbd52a4a0154ef5d1ca468d621f0e9eb8465e52",
+      "size_bytes": 26508,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase6_m62",
+      "sha256": "6d2741e81c0230dc9c975a1a630bed13ffc56f897fcbe280862b1a124c947543",
+      "size_bytes": 21532,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase6_m63",
+      "sha256": "6549bc95b59d1a5304ea4c9897c42a60feb4db5475608a687ec8bde68fc8fae0",
+      "size_bytes": 22531,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/agent/tool_registry.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/agent/tool_registry.py.before_v05_phase6_m64",
+      "sha256": "c8498ac5bd7eaf05d9d0b2cb26b276b5db67b8d249133d8dbd1e1f525c69ea79",
+      "size_bytes": 25706,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.bak",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.bak",
+      "sha256": "816825cf80c8446a6701b30887ab47b6196671f20b0caf74c6623ac2e896f290",
+      "size_bytes": 2364,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_backend_modes",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_backend_modes",
+      "sha256": "4c50b9f210ccb4b46aa2bf5f361f37bb369ee1232fb1df04986a366c16e3e22d",
+      "size_bytes": 2423,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_backend_validation",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_backend_validation",
+      "sha256": "c61f53fea07ccfd4007f5b1698fc67f8276435f759d83d61bb8925d9477d16d7",
+      "size_bytes": 2703,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_metal_fix",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_metal_fix",
+      "sha256": "816825cf80c8446a6701b30887ab47b6196671f20b0caf74c6623ac2e896f290",
+      "size_bytes": 2364,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_phase4",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_phase4",
+      "sha256": "2f8356ced8c50c52121e58311bf9c7b60581c0a8889ae6ed56ce09fb80a53db4",
+      "size_bytes": 2905,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_phase5",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_phase5",
+      "sha256": "9cb1e0ecc03695452cf2ec7140435ddbe79754527269f7bc81ece90a940bf76b",
+      "size_bytes": 9060,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/local_runtime.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/ai/local_runtime.py.before_v05_phase4",
+      "sha256": "9cb1e0ecc03695452cf2ec7140435ddbe79754527269f7bc81ece90a940bf76b",
+      "size_bytes": 9060,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/bridge/riya_llama.cpp.bak",
+      "archived_path": "archive/backup_files/core/ai/native/bridge/riya_llama.cpp.bak",
+      "sha256": "c07952382f8a1008e872432d203d2137bad23f1bd93eccf7830e953d01e1ad02",
+      "size_bytes": 8853,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/bridge/riya_llama.cpp.before_backend_modes",
+      "archived_path": "archive/backup_files/core/ai/native/bridge/riya_llama.cpp.before_backend_modes",
+      "sha256": "872b59bfe7f779cb25653bb6eee397fb7debd61688d23386ed91e3c2446ff634",
+      "size_bytes": 9100,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/bridge/riya_llama.cpp.before_metal_fix",
+      "archived_path": "archive/backup_files/core/ai/native/bridge/riya_llama.cpp.before_metal_fix",
+      "sha256": "aa36db57749d2f285efd5b99c6ee4f459e3080d3e22c3b0feaa6d2949c4f185a",
+      "size_bytes": 8851,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/llama_runtime.py.before_backend_modes",
+      "archived_path": "archive/backup_files/core/ai/native/llama_runtime.py.before_backend_modes",
+      "sha256": "869089bac9374a3b754fd62c872b7c3b47513cee54054012361e8cabd4711247",
+      "size_bytes": 2359,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/llama_runtime.py.before_metal_fix",
+      "archived_path": "archive/backup_files/core/ai/native/llama_runtime.py.before_metal_fix",
+      "sha256": "0b336ff83da6a554716ad7ad642fb629e0ff058a142d737d4b0a325de5911a63",
+      "size_bytes": 2360,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/llama_runtime.py.before_phase4",
+      "archived_path": "archive/backup_files/core/ai/native/llama_runtime.py.before_phase4",
+      "sha256": "9f6a8003464f5b4e4cd690e538ce57d75138327acbc7c5936765e8203faf3b0c",
+      "size_bytes": 3146,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/native/llama_runtime.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/ai/native/llama_runtime.py.before_v05_phase4",
+      "sha256": "38954f699bb86d5879ce26dd26d5fbe6835e946ad97c18c6ff966e673c6020dc",
+      "size_bytes": 6935,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/ai/safety.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/ai/safety.py.before_v05_phase4",
+      "sha256": "14fb8ef44b496d660e9e19496dec51acf3f985b168e5d22ae10db5da6b932865",
+      "size_bytes": 6637,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/automation/desktop.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/automation/desktop.py.before_v05_phase6_m62",
+      "sha256": "f5b212157ae20a2ee8ae374e0f1aa8e88f48365388f18952988c96aeaba12a99",
+      "size_bytes": 2383,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/automation/desktop.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/automation/desktop.py.before_v05_phase6_m64",
+      "sha256": "f5b212157ae20a2ee8ae374e0f1aa8e88f48365388f18952988c96aeaba12a99",
+      "size_bytes": 2383,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/config/settings.py.bak",
+      "archived_path": "archive/backup_files/core/config/settings.py.bak",
+      "sha256": "20bc3d362ec5a166ffc25abe7c072549e9c831bd8d8d52b6b7b3548999fad3ae",
+      "size_bytes": 179,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase2",
+      "sha256": "efd84979e12ff276420d4c708539b203845687c692a528172a81238a9f40e589",
+      "size_bytes": 13959,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase3",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase3",
+      "sha256": "bb0966f3b220c5b7a543899e04f6ab7f074e8dc91e6ae4efe3ff04a43a8131bb",
+      "size_bytes": 17610,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase4",
+      "sha256": "c73075a36254ebcc142b7fc0027dae6f9fd6ec08bc896518795d7ef3fae286e6",
+      "size_bytes": 19754,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase5",
+      "sha256": "5f8284a54621914d208725f70fe688e7439884b68f83646518286eed1eb7593e",
+      "size_bytes": 26170,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase6_final",
+      "sha256": "6ec29f8946b48c732ddba8081b23d6d446900f7edc1f53d2ba3f049d1abd42e0",
+      "size_bytes": 36702,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/database/migrations.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/database/migrations.py.before_v05_phase6_m63",
+      "sha256": "24ba5ee5daad9ff9af9f35a3447cc51bd1ba3ac588e5284e8d18afe14b49a358",
+      "size_bytes": 33226,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/linux.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/device/linux.py.before_v05_phase6_m63",
+      "sha256": "ae4900a5c5e0ae2cb838a8283c0efd8e5616661885b6327d3e38706351df9a9f",
+      "size_bytes": 12844,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/linux.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/device/linux.py.before_v05_phase6_m64",
+      "sha256": "ae4900a5c5e0ae2cb838a8283c0efd8e5616661885b6327d3e38706351df9a9f",
+      "size_bytes": 12844,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/macos.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/device/macos.py.before_v05_phase5",
+      "sha256": "8291cf03b7594268b56333272ee9ddab11a28d4a433a66007f9c6ed80d22b979",
+      "size_bytes": 1151,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/macos.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/device/macos.py.before_v05_phase6_m62",
+      "sha256": "eacbb85e5fa37d76ed893ccac0f07d54adbcd9a21000e372c399478e03aeed9b",
+      "size_bytes": 1671,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/macos.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/device/macos.py.before_v05_phase6_m63",
+      "sha256": "a0b5a8257d2602b7f602c13befd512227f4f5ab022581bc95ef90baebeeabb8d",
+      "size_bytes": 35371,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/macos.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/device/macos.py.before_v05_phase6_m64",
+      "sha256": "a0b5a8257d2602b7f602c13befd512227f4f5ab022581bc95ef90baebeeabb8d",
+      "size_bytes": 35371,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/platform.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/device/platform.py.before_v05_phase5",
+      "sha256": "1bc5d706b0e44571672d540646715a7efa1a584ba268abf86578e24892864794",
+      "size_bytes": 995,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/platform.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/device/platform.py.before_v05_phase6_m62",
+      "sha256": "6e3a3b424ecde8b7b933e059f1346ad08de52607cefdfac320fe7090b9bad018",
+      "size_bytes": 1374,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/platform.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/device/platform.py.before_v05_phase6_m63",
+      "sha256": "7c134103adb5f292381e4be8aa50c98b442b35fa1b185a9b6bfde48a2a401929",
+      "size_bytes": 16352,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/platform.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/device/platform.py.before_v05_phase6_m64",
+      "sha256": "7c134103adb5f292381e4be8aa50c98b442b35fa1b185a9b6bfde48a2a401929",
+      "size_bytes": 16352,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/windows.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/device/windows.py.before_v05_phase6_m63",
+      "sha256": "e6e78e1dcbb6695df1130ed934380a513334075cbf31360cb5d6e66ee5b1bd2a",
+      "size_bytes": 12968,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/device/windows.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/device/windows.py.before_v05_phase6_m64",
+      "sha256": "e6e78e1dcbb6695df1130ed934380a513334075cbf31360cb5d6e66ee5b1bd2a",
+      "size_bytes": 12968,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/identity/manager.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/identity/manager.py.before_v05_phase2",
+      "sha256": "e991240bd334d19e4a5b83411502d11697455663965d5bfac56d32490a3de4bd",
+      "size_bytes": 38808,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_phase5",
+      "archived_path": "archive/backup_files/core/main.py.before_phase5",
+      "sha256": "cf271ae6360feeb64d5fd676cf32e3b2fb29164ccbb1e03b1afa746fedc7db27",
+      "size_bytes": 724,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase1",
+      "sha256": "e449337645fa8f849b8ded0ad2f41773e90084541bd29ef8bfd1bcabf6f49d60",
+      "size_bytes": 3843,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase2",
+      "sha256": "80c641f4cc2dfcfef344398300e2f562e0da1255baaa19a67649c0038992759e",
+      "size_bytes": 11528,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase3",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase3",
+      "sha256": "46750af241f8eab1aaa17f506770bc711e4388fcb5e798e03f429587b3a40bcc",
+      "size_bytes": 18996,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase4",
+      "sha256": "6902e2ff4217e12bb8b63dee34613d6ef126f888c6906d2044e8cedbb22cd800",
+      "size_bytes": 29215,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase5",
+      "sha256": "4aaedf5c5c86345e9f5a173503778c5763a5e0f3fc827c8d47f0a30441844fa2",
+      "size_bytes": 30805,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/main.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/main.py.before_v05_phase6_final",
+      "sha256": "38e284e38a7d0db2990782b77d53ca81cfa36c883068672cb1f249588477327b",
+      "size_bytes": 34246,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/database.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/memory/database.py.before_v05_phase1",
+      "sha256": "54cbe6d552992395dcbdd3951f1541b86c96f1b27cc14cb251a599aa7fb4e984",
+      "size_bytes": 1414,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/intent.py.bak",
+      "archived_path": "archive/backup_files/core/memory/intent.py.bak",
+      "sha256": "dc2473146d589fdd3433ccd77f128d35699d651872fac1b06e3f33ab9b62a987",
+      "size_bytes": 8992,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/intent.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/memory/intent.py.before_v05_phase4",
+      "sha256": "18b3f824c8c39a6b9d46b3b3af334f47b1d8020dc4366d487c3afba54f3ac6ba",
+      "size_bytes": 9537,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/manager.py.before_phase4",
+      "archived_path": "archive/backup_files/core/memory/manager.py.before_phase4",
+      "sha256": "635b9667c736ce819525d076ebba7f674b03c2e8d0f7d42671dc1e4ddf4674ef",
+      "size_bytes": 6889,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/manager.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/memory/manager.py.before_v05_phase1",
+      "sha256": "161cf8c83fdbb1964bb9fcea1d9b137023e33bfce681534b10bf28292a974ccb",
+      "size_bytes": 9514,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/manager.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/memory/manager.py.before_v05_phase2",
+      "sha256": "6d4eff81e9fdcfa15ba78bb4ae66ab22772dd7ac359d4944e2023ae8062bafe7",
+      "size_bytes": 22897,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/manager.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/memory/manager.py.before_v05_phase4",
+      "sha256": "8d2d6661717605459af1176893dcab56bf972d7a0051b7cad8a17c13e68da6f9",
+      "size_bytes": 24350,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/service.py.before_phase4",
+      "archived_path": "archive/backup_files/core/memory/service.py.before_phase4",
+      "sha256": "f95d8961bba09fbbcc6cb1cc6e77ab71584d2b27d5df008b9151a27b00e7c19e",
+      "size_bytes": 3500,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/service.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/memory/service.py.before_v05_phase1",
+      "sha256": "085ca3e63a80a081740a044e17fbe4ac254b0faaead1d23b2ebc591d44e7fa4a",
+      "size_bytes": 3661,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/memory/service.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/memory/service.py.before_v05_phase4",
+      "sha256": "592578c1bb828facdfdb33cb83e0dce2bfd4bb062b96620deb1ce1fa6de0a445",
+      "size_bytes": 4008,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/onboarding/ui.py.before_v05_phase6_m61",
+      "archived_path": "archive/backup_files/core/onboarding/ui.py.before_v05_phase6_m61",
+      "sha256": "0d2fbc4624e7cccd51ceaab8b2283bdfb193aad28263313df84cb8f088986d71",
+      "size_bytes": 47241,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/__init__.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/security/__init__.py.before_v05_phase2",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/confirmation.py.bak",
+      "archived_path": "archive/backup_files/core/security/confirmation.py.bak",
+      "sha256": "fd214a316d72577a4fcc1be8b29b3cad65529bbacaa0398eb528a9022c4faaf0",
+      "size_bytes": 2636,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/confirmation.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/security/confirmation.py.before_v05_phase1",
+      "sha256": "62ace40b756b93a4c15905ddaab89b5d774e550744e9bbadcc59dd74b882eca6",
+      "size_bytes": 3941,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/confirmation.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/security/confirmation.py.before_v05_phase2",
+      "sha256": "b1634a446d2e4d4f34f24a5af63c02c08ac0ce15f9a6604fc4eb51be6715d29b",
+      "size_bytes": 5539,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/confirmation.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/security/confirmation.py.before_v05_phase5",
+      "sha256": "bfb2bce352efc0362fae4d57e41543d12596635a0bbc6e2fe0c898b2a48c093a",
+      "size_bytes": 7096,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_phase3",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_phase3",
+      "sha256": "781e28ec918a12b906642bbbaca8d022396d052adbec7790c172a692c6a70d97",
+      "size_bytes": 1654,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase1",
+      "sha256": "9dc313d15f5c6ad74d47ca21f70c605e061de316eb6b0a479225d011f5a2875b",
+      "size_bytes": 1904,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase2",
+      "sha256": "02365f2ad8d6cfe661fd794ee0e516a727d9f61c0a13d43d5d7a4ee38c03d695",
+      "size_bytes": 3714,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase4",
+      "sha256": "dbf853864cba730a0883fa6ace6f2f24ee28eafc5f2c839df1bc8745d574baea",
+      "size_bytes": 5538,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase5",
+      "sha256": "dbf853864cba730a0883fa6ace6f2f24ee28eafc5f2c839df1bc8745d574baea",
+      "size_bytes": 5538,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase6_m62",
+      "sha256": "770309a9e0b6c941e6d91a4e14d08f92e9cf6b3c275a6b6a20030960822b72eb",
+      "size_bytes": 7329,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase6_m63",
+      "sha256": "cb74bab4cb57a9e381ee2de870488b3f6c6a6233cecb41b13b8305146cf52f76",
+      "size_bytes": 7589,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/manager.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/security/manager.py.before_v05_phase6_m64",
+      "sha256": "f403b33749cda4d8a6c743534b211a21946cc1e357c7421d5acc8d97eb73ae60",
+      "size_bytes": 8271,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase4",
+      "sha256": "c90edfa7be369e9037de98a4a8fac9f33b1f5631d273ba771942bd754a5178b6",
+      "size_bytes": 66511,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase5",
+      "sha256": "909b0c8ddab18ffc30d79c0a1c7558dbd2ca242dfaedb1854c06d7516997cec9",
+      "size_bytes": 67529,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase6_final",
+      "sha256": "c936a547f547f5cd338949679eae67e1e702d9fc6cfec15678139447b7d3198b",
+      "size_bytes": 82934,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase6_m62",
+      "sha256": "a30335ea0846b81f1e0e4106c12cf09c00fb2fff8b5316548241321c0a9b96d1",
+      "size_bytes": 75637,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase6_m63",
+      "sha256": "3a5b6e42cef4bc86f192a730ba26255c43039bee4d7f5ddc66851a250734442d",
+      "size_bytes": 77150,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/security/permissions.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/security/permissions.py.before_v05_phase6_m64",
+      "sha256": "cf1faa1ad80008156661e2ef521a7b8bf75ed1efcf2758dea721288d98ed0ce1",
+      "size_bytes": 79107,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/filesystem/files.py.before_phase4",
+      "archived_path": "archive/backup_files/core/tools/filesystem/files.py.before_phase4",
+      "sha256": "32e00a2097d63e321948ab1d2f2dc482cae6e94cacd6adec55a89841833973c9",
+      "size_bytes": 13882,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/filesystem/files.py.before_phase5",
+      "archived_path": "archive/backup_files/core/tools/filesystem/files.py.before_phase5",
+      "sha256": "a760b8b1f0a2fd67defb00ebebea1b1fd78732cb769dbbfae7e278d4f8f71ffe",
+      "size_bytes": 16539,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/filesystem/files.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/tools/filesystem/files.py.before_v05_phase1",
+      "sha256": "1d708b217cda830af1d8f734023f57db9e6a1ea30de7497a786ac1a054c8c646",
+      "size_bytes": 16590,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/filesystem/files.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/tools/filesystem/files.py.before_v05_phase6_m62",
+      "sha256": "16c05e2db0b5e58e2190615e5c0293997919c8e47227743fe3c5811913820191",
+      "size_bytes": 17630,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/filesystem/files.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/tools/filesystem/files.py.before_v05_phase6_m63",
+      "sha256": "f8e46a04fbdc7090b6d61df5871d71154ad5372a0f9b958ca85dc0a0e721be2a",
+      "size_bytes": 21177,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/memory.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/tools/memory.py.before_v05_phase1",
+      "sha256": "2b5dc78d105f724811a18d53114d4fa48be11d42b45c1d8ab8fae1eab7188b99",
+      "size_bytes": 1333,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/memory.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/tools/memory.py.before_v05_phase4",
+      "sha256": "b366238e99cf549d77c2f0a8c9e0c2040ce2d8eb6255b15ee7bb1b12d9a7f06d",
+      "size_bytes": 1456,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/memory.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/tools/memory.py.before_v05_phase5",
+      "sha256": "b366238e99cf549d77c2f0a8c9e0c2040ce2d8eb6255b15ee7bb1b12d9a7f06d",
+      "size_bytes": 1456,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/system/macos.py.before_phase3",
+      "archived_path": "archive/backup_files/core/tools/system/macos.py.before_phase3",
+      "sha256": "47848e3f847a15665da1676385e479767307a72fdfdc09e5340676c812027883",
+      "size_bytes": 3255,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/system/macos.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/tools/system/macos.py.before_v05_phase5",
+      "sha256": "13f06925548f7e925f974676bee564a21822d24ed14f69b1eb62d9d66c0e87a5",
+      "size_bytes": 10259,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/system/macos.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/tools/system/macos.py.before_v05_phase6_m62",
+      "sha256": "724b97a1b7e04f479575b842cec34532dc70f04f5c97fc2e1ef78bc2bae97e34",
+      "size_bytes": 13787,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/tools/system/macos.py.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/core/tools/system/macos.py.before_v05_phase6_m64",
+      "sha256": "fd873a891d835225336ddda1ff20b6f93a2ffa754ed97d18cf6a8b7ad0fb02a7",
+      "size_bytes": 45635,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/__init__.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/__init__.py.before_v05_phase6_m65",
+      "sha256": "421bb8b131af91b63dfa5913c45608466809a1e280786049db3179e877697a1b",
+      "size_bytes": 1684,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/assistant.py.before_phase5",
+      "archived_path": "archive/backup_files/core/voice/assistant.py.before_phase5",
+      "sha256": "3fbfcf3b95a6864aa540d85ff4cb6b23d9deeaa079277c23fecae6ba8825a818",
+      "size_bytes": 1348,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/audio_input.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/audio_input.py.before_v05_phase6_m65",
+      "sha256": "e2f65907103d7a02c19115b0f721f8262ac4f79f9433cd8879602d6e9e27f5ab",
+      "size_bytes": 17057,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/audio_output.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/voice/audio_output.py.before_final_audit",
+      "sha256": "cae125e4459c87066ac7655ae6666c0befcfa218f31d50a45dafc88b2559d169",
+      "size_bytes": 12000,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/audio_output.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/audio_output.py.before_v05_phase6_m65",
+      "sha256": "8e964c3b71a2a5ee179ce0292469fddfaee94e2b64f95e7acc12649005384121",
+      "size_bytes": 11979,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/config.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/voice/config.py.before_v05_phase1",
+      "sha256": "07faa534a7f6c84e7215349846ccef2869e7a10699abadc215ba29a25e09d5a9",
+      "size_bytes": 10724,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/config.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/config.py.before_v05_phase6_m65",
+      "sha256": "6c0485d2588f57788e8b02b03b607ec3330d450aa5d1d94c234a8554624dd91f",
+      "size_bytes": 12408,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/microphone.py.before_phase5",
+      "archived_path": "archive/backup_files/core/voice/microphone.py.before_phase5",
+      "sha256": "c5de278564212ee18f2c2adee4d8aad462c7781461d98c51149a7cf6ccbf472a",
+      "size_bytes": 868,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_final_audit",
+      "sha256": "19e64ec9cfe0f66890997c982f1f87cdba16a8e6ce817387371e0458188c5fea",
+      "size_bytes": 23595,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase1",
+      "sha256": "df0981d3a6166a1caa17b6dee53f534a093f27bb1c0b1787cf10019e2890d236",
+      "size_bytes": 24948,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase2",
+      "sha256": "e60bdce629bc56c98593439856fce3824bb9e708c4f46e1147d6d4736f6a294f",
+      "size_bytes": 25754,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase5",
+      "sha256": "e156a126758db7c400f6462d2fd4dda557f630ada1eaf05f5e65d0e854927e6c",
+      "size_bytes": 31076,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase6_m61",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase6_m61",
+      "sha256": "724665549e8205bffee762c7181c4f8984e6b8051a085ee3553403ed49718c6a",
+      "size_bytes": 34340,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase6_m62",
+      "sha256": "e889709b941ea31b8f8fee1e1aad1b23d4adf2417cf9ac010af9be46a2e0f7a8",
+      "size_bytes": 42059,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/orchestrator.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/orchestrator.py.before_v05_phase6_m65",
+      "sha256": "1219b9d4883ca79a2567988e8c0587b064152f53ce5ac0d8a51e024f0a1a66fe",
+      "size_bytes": 42233,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/session.py.before_v05_phase1",
+      "archived_path": "archive/backup_files/core/voice/session.py.before_v05_phase1",
+      "sha256": "ca8565cadd068a25a13320474e67aa5a2afb628bc01bd6a6244a8673050794b3",
+      "size_bytes": 9648,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/session.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/session.py.before_v05_phase6_m65",
+      "sha256": "c2eef54103251f2d4a27373b6673b2ce2f6ff7631ec499de495584d6936ee345",
+      "size_bytes": 10565,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/state.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/state.py.before_v05_phase6_m65",
+      "sha256": "9855d195460386c0f55260b4404599cd19e103bd0a2ff9077bdc51d843672252",
+      "size_bytes": 4885,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/stt.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/voice/stt.py.before_final_audit",
+      "sha256": "9121d0583784f3edc80cae3cf8c5b37fbc090717123da61eff32616049971842",
+      "size_bytes": 9867,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/stt.py.before_phase5",
+      "archived_path": "archive/backup_files/core/voice/stt.py.before_phase5",
+      "sha256": "bc7b89f6c7e81cd5ec09dd5e0c92aab5a56642b2cf4348f760e9796c7a89f742",
+      "size_bytes": 905,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/stt.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/stt.py.before_v05_phase6_m65",
+      "sha256": "8e0166deaba48f1c3fd1eb942010e1c3c2fe25841af6a25b657f234c20b1d750",
+      "size_bytes": 10392,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/tts.py.before_phase3",
+      "archived_path": "archive/backup_files/core/voice/tts.py.before_phase3",
+      "sha256": "822293ee3f7c18339c47bfd7d329d587633ebbf5104f4a70b057789802ab3604",
+      "size_bytes": 498,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/tts.py.before_phase5",
+      "archived_path": "archive/backup_files/core/voice/tts.py.before_phase5",
+      "sha256": "748d9c48a681f8b4e6f16204d6831b50d787631f77e968b9e1a1f68d8e41c587",
+      "size_bytes": 903,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/tts.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/tts.py.before_v05_phase6_m65",
+      "sha256": "8e5d4a057288e7fb632d36ca20550120e8f85258ce769ae644d17ce2a3bb3158",
+      "size_bytes": 5990,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase2",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase2",
+      "sha256": "f60170c42b8665c0baf69ebb01df7c16baab05bc3b4869dcfdafa4ba0d38895b",
+      "size_bytes": 15603,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase3",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase3",
+      "sha256": "d0bcac4f8ca24bca1ff44ff72bdb5b79c68c907c51e0d68534773f41a4650f18",
+      "size_bytes": 26414,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase4",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase4",
+      "sha256": "b44d2a28fa161432bf70066b2d7433018b9a6a1eede57af4fd4b40b361b0a792",
+      "size_bytes": 35170,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase5",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase5",
+      "sha256": "4616707373c4d318d95eae40ad0945eff8fccae97dcb6e1239790f2c21788b63",
+      "size_bytes": 36127,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase6_final",
+      "sha256": "c5ae9fa1ba2fa8c5a8c4beacf3c77ab5ab20cd9b9c9b39b5d831a8cf0627f645",
+      "size_bytes": 78727,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase6_m61",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase6_m61",
+      "sha256": "9993cababa14b01012d060bac22910dcaae20c09a39b6defea1c7481ccf01d62",
+      "size_bytes": 37738,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase6_m62",
+      "sha256": "173b1b8d2596b6b75ce2e151fca81865cf720cec2c51a31783cd38d405662e99",
+      "size_bytes": 73518,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase6_m63",
+      "sha256": "0f162a6edf706b323b7e79db77f0f630d117223979f5edd363f9adab6622d281",
+      "size_bytes": 75907,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/ui.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/ui.py.before_v05_phase6_m65",
+      "sha256": "0f162a6edf706b323b7e79db77f0f630d117223979f5edd363f9adab6622d281",
+      "size_bytes": 75907,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/vad.py.before_final_audit",
+      "archived_path": "archive/backup_files/core/voice/vad.py.before_final_audit",
+      "sha256": "4c92876d5d4e313d5c6249045ac1374124a6a2e52e6860c29185283428588c7b",
+      "size_bytes": 12955,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "core/voice/vad.py.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/core/voice/vad.py.before_v05_phase6_m65",
+      "sha256": "32592114898f978ad0abf7beb99d8e954830c1e99f2c5f457e87396fcde8ba7a",
+      "size_bytes": 13175,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase1",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase1",
+      "sha256": "1675c727665a5b3d52e3f7b1aff9326e3a2f3fd8fc59cba1e3bdabac92398a08",
+      "size_bytes": 16384,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase2",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase2",
+      "sha256": "8b0ef9082b79b5d892d1506300f33f6a66156fac092356a8e60c5606e8f7fd61",
+      "size_bytes": 106496,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase3",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase3",
+      "sha256": "52d0483bcf908f196900e4b4f589ee855b1597ffeb56e48a88bec338cc328eb4",
+      "size_bytes": 135168,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase4",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase4",
+      "sha256": "f8c7d53d12a97340177f95f0b69ff3c610fac166ed7856a56e5c43c150a1f5de",
+      "size_bytes": 151552,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase5",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase5",
+      "sha256": "3a3eaaaebf892a601438c5a8b3724a55e70d515d1602a125053a64eb58a309f7",
+      "size_bytes": 217088,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6",
+      "sha256": "11a364d9ea4114d51b43ead1aa59a0bbe17832c8387851c402148a411dd90813",
+      "size_bytes": 303104,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6_final",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6_final",
+      "sha256": "7cfdb6db73a330b3e3e05c8957ad4e4e972b7a9642cc1efaafaaa5269db14efb",
+      "size_bytes": 344064,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6_m62",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6_m62",
+      "sha256": "11a364d9ea4114d51b43ead1aa59a0bbe17832c8387851c402148a411dd90813",
+      "size_bytes": 303104,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6_m63",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6_m63",
+      "sha256": "11a364d9ea4114d51b43ead1aa59a0bbe17832c8387851c402148a411dd90813",
+      "size_bytes": 303104,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6_m64",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6_m64",
+      "sha256": "7cfdb6db73a330b3e3e05c8957ad4e4e972b7a9642cc1efaafaaa5269db14efb",
+      "size_bytes": 344064,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "data/riya.db.before_v05_phase6_m65",
+      "archived_path": "archive/backup_files/data/riya.db.before_v05_phase6_m65",
+      "sha256": "7cfdb6db73a330b3e3e05c8957ad4e4e972b7a9642cc1efaafaaa5269db14efb",
+      "size_bytes": 344064,
+      "action": "copied_and_retained",
+      "verified": true
+    },
+    {
+      "original_path": "pyproject.toml.before_phase5",
+      "archived_path": "archive/backup_files/pyproject.toml.before_phase5",
+      "sha256": "f6a22dee74a980cd438deacf5813f036fb0ac7f06372d1607fa6462a88be623e",
+      "size_bytes": 568,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "pyproject.toml.before_v05_phase3",
+      "archived_path": "archive/backup_files/pyproject.toml.before_v05_phase3",
+      "sha256": "3cca2fe8e9fd5277bc6c39a9f834cc0fb9c007bcd4e21a0407285472aaf4bf59",
+      "size_bytes": 593,
+      "action": "moved_to_archive",
+      "verified": true
+    },
+    {
+      "original_path": "tests/test_confirmation_flow.py.before_plan_tests_20261114_043315",
+      "archived_path": "archive/backup_files/tests/test_confirmation_flow.py.before_plan_tests_20261114_043315",
+      "sha256": "25b5b26d64114e7ee8cc85133469ff81033e53cefce005674c22fbddec5d195f",
+      "size_bytes": 3278,
+      "action": "moved_to_archive",
+      "verified": true
+    }
+  ]
+}

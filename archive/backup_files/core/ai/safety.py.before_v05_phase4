@@ -1,0 +1,231 @@
+"""Runtime safety helpers, bounds, sanitization, and inference timeouts."""
+
+from __future__ import annotations
+
+import re
+import threading
+from typing import Any, Callable, TypeVar
+
+
+T = TypeVar("T")
+
+MAX_USER_INPUT_CHARS = 4000
+MAX_PROMPT_CHARS = 12000
+MAX_CONTEXT_CHARS = 4000
+MAX_MODEL_RESPONSE_CHARS = 32768
+DEFAULT_INFERENCE_TIMEOUT_SECONDS = 30.0
+
+MIN_CONTEXT_SIZE = 128
+MAX_CONTEXT_SIZE = 32768
+MAX_GENERATION_TOKENS = 2048
+
+_CHAT_CONTROL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"<\s*\|"), "< |"),
+    (re.compile(r"\|\s*>"), "| >"),
+    (re.compile(r"<\s*/?\s*s\s*>", re.IGNORECASE), "[tag]"),
+    (re.compile(r"\[\s*/?\s*INST\s*\]", re.IGNORECASE), "[inst]"),
+    (re.compile(r"<<\s*/?\s*SYS\s*>>", re.IGNORECASE), "[sys]"),
+)
+
+_SPECIAL_TOKEN_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    *_CHAT_CONTROL_PATTERNS,
+    (
+        re.compile(
+            r"<\s*/?\s*(?:tool_call|think|system|assistant|user_request|user_input|conversation_history|memory_data)\s*>",
+            re.IGNORECASE,
+        ),
+        "[tag]",
+    ),
+)
+
+_ROLE_LINE_PATTERN = re.compile(
+    r"^([ \t]*)(User|RIYA|System|Assistant)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def neutralize_chat_control_tokens(text: str) -> str:
+    """Neutralize model control tokens such as ChatML markers without breaking XML data tags."""
+
+    cleaned = strip_unsafe_control_chars(text, allow_newlines=True)
+    for pattern, replacement in _CHAT_CONTROL_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+    return cleaned
+
+
+class InferenceTimeoutError(TimeoutError):
+    """Raised when local AI inference exceeds its configured deadline."""
+
+
+class InferenceCancelledError(RuntimeError):
+    """Raised when local AI inference is cancelled before completion."""
+
+
+def strip_unsafe_control_chars(
+    text: str,
+    *,
+    allow_newlines: bool = True,
+) -> str:
+    """Remove null bytes and non-printable control characters."""
+
+    if not isinstance(text, str):
+        raise ValueError("Text input must be a string.")
+
+    cleaned_chars: list[str] = []
+    for char in text:
+        code = ord(char)
+        if code == 0 or code == 127:
+            continue
+        if code < 32:
+            if allow_newlines and char in ("\n", "\r", "\t"):
+                cleaned_chars.append(char)
+            elif char in ("\n", "\r", "\t"):
+                cleaned_chars.append(" ")
+            continue
+        cleaned_chars.append(char)
+
+    return "".join(cleaned_chars)
+
+
+def sanitize_untrusted_text(
+    text: str,
+    *,
+    max_chars: int | None = None,
+    allow_newlines: bool = True,
+    neutralize_roles: bool = False,
+) -> str:
+    """Neutralize LLM control tokens, XML delimiters, and optional role prefixes."""
+
+    cleaned = strip_unsafe_control_chars(
+        text,
+        allow_newlines=allow_newlines,
+    )
+
+    for pattern, replacement in _SPECIAL_TOKEN_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+
+    if neutralize_roles:
+        cleaned = _ROLE_LINE_PATTERN.sub(
+            r"\1[quoted-\2]:",
+            cleaned,
+        )
+
+    if max_chars is not None:
+        if max_chars <= 0:
+            raise ValueError("max_chars must be positive.")
+        if len(cleaned) > max_chars:
+            suffix = "... [truncated]"
+            keep = max(0, max_chars - len(suffix))
+            cleaned = cleaned[:keep] + suffix if keep > 0 else cleaned[:max_chars]
+
+    return cleaned
+
+
+def validate_user_input(
+    text: str,
+    *,
+    max_chars: int = MAX_USER_INPUT_CHARS,
+) -> str:
+    """Validate untrusted user input length and character safety."""
+
+    if not isinstance(text, str):
+        raise ValueError("User input must be a text string.")
+
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive.")
+
+    cleaned = strip_unsafe_control_chars(text, allow_newlines=True).strip()
+
+    if len(cleaned) > max_chars:
+        raise ValueError(
+            f"Input exceeds maximum allowed length of {max_chars} characters."
+        )
+
+    return cleaned
+
+
+def bound_model_output(
+    response: Any,
+    *,
+    max_chars: int = MAX_MODEL_RESPONSE_CHARS,
+) -> str:
+    """Validate and bound raw text returned from an AI runtime."""
+
+    if not isinstance(response, str):
+        raise ValueError("AI runtime must return a string response.")
+
+    cleaned = strip_unsafe_control_chars(response, allow_newlines=True).strip()
+
+    if len(cleaned) > max_chars:
+        raise ValueError(
+            f"AI model output exceeded maximum allowed size ({max_chars} chars)."
+        )
+
+    return cleaned
+
+
+def run_with_timeout(
+    func: Callable[..., T],
+    *args: Any,
+    timeout_seconds: float | None = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+    **kwargs: Any,
+) -> T:
+    """Execute an inference callable with deadline enforcement and cancellation."""
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise InferenceCancelledError("AI inference was cancelled.")
+
+    if timeout_seconds is None:
+        result = func(*args, **kwargs)
+        if cancel_event is not None and cancel_event.is_set():
+            raise InferenceCancelledError("AI inference was cancelled.")
+        return result
+
+    if isinstance(timeout_seconds, bool) or not isinstance(
+        timeout_seconds, (int, float)
+    ) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be a positive number.")
+
+    outcome: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _target() -> None:
+        try:
+            outcome["value"] = func(*args, **kwargs)
+        except BaseException as exc:  # pragma: no cover - propagated to caller
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    worker = threading.Thread(
+        target=_target,
+        daemon=True,
+        name="riya-inference-worker",
+    )
+    worker.start()
+
+    poll_interval = 0.05
+    import time
+
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    while not finished.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InferenceCancelledError("AI inference was cancelled.")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InferenceTimeoutError(
+                f"AI inference timed out after {timeout_seconds} seconds."
+            )
+
+        finished.wait(timeout=min(poll_interval, remaining))
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise InferenceCancelledError("AI inference was cancelled.")
+
+    if "error" in outcome:
+        raise outcome["error"]
+
+    return outcome["value"]

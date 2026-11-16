@@ -1,0 +1,304 @@
+"""RIYA interactive entry point supporting multi-user local authentication, text, voice CLI, and desktop UI."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import sys
+
+from core.agent.assistant import RIYAAssistant
+from core.config.settings import APP_NAME, APP_VERSION, DEVELOPER_NAME
+from core.identity import (
+    AuthenticatedIdentity,
+    IdentityError,
+    IdentityManager,
+    UserAlreadyExistsError,
+    UserNotFoundError,
+)
+from core.memory.database import MemoryDatabase
+
+
+def _prompt_create_user(identity_manager: IdentityManager) -> AuthenticatedIdentity:
+    while True:
+        username = input("Choose username (2-32 chars): ").strip()
+        display_name = input("Display name (optional): ").strip() or username
+        method = (
+            input("Auth method [local_password/local_pin/local_unlock] (default: local_password): ")
+            .strip()
+            .lower()
+            or "local_password"
+        )
+        password: str | None = None
+        if method in {"local_password", "local_pin"}:
+            secret = getpass.getpass(f"Enter {method.replace('local_', '')}: ")
+            confirm = getpass.getpass("Confirm credential: ")
+            if secret != confirm:
+                print("Credentials did not match. Please try again.")
+                continue
+            password = secret
+        try:
+            profile = identity_manager.create_user(
+                username,
+                password=password,
+                display_name=display_name,
+                auth_method=method,
+            )
+            return identity_manager.authenticate(
+                profile.username,
+                password=password,
+                auth_method=method,
+            )
+        except (ValueError, UserAlreadyExistsError, IdentityError) as exc:
+            print(f"Account creation error: {exc}")
+
+
+def _authenticate_cli_user(
+    identity_manager: IdentityManager,
+    preferred_username: str | None = None,
+) -> AuthenticatedIdentity:
+    users = identity_manager.list_users()
+    if not users:
+        print("No local users found. Create your first RIYA user profile:")
+        return _prompt_create_user(identity_manager)
+
+    if preferred_username:
+        profile = identity_manager.get_profile_by_username(preferred_username)
+        password = (
+            None
+            if profile.auth_method == "local_unlock"
+            else getpass.getpass(f"Password/PIN for {profile.username}: ")
+        )
+        return identity_manager.authenticate(
+            profile.username,
+            password=password,
+            auth_method=profile.auth_method,
+        )
+
+    print("Available RIYA accounts:")
+    for idx, profile in enumerate(users, start=1):
+        print(f"  {idx}. {profile.display_name} (@{profile.username}, method={profile.auth_method})")
+
+    while True:
+        choice = input("Enter username (or 'new' to create an account): ").strip()
+        if choice.lower() == "new":
+            return _prompt_create_user(identity_manager)
+        try:
+            profile = identity_manager.get_profile_by_username(choice)
+        except (ValueError, UserNotFoundError) as exc:
+            print(f"Account error: {exc}")
+            continue
+
+        password = (
+            None
+            if profile.auth_method == "local_unlock"
+            else getpass.getpass(f"Password/PIN for {profile.username}: ")
+        )
+        try:
+            return identity_manager.authenticate(
+                profile.username,
+                password=password,
+                auth_method=profile.auth_method,
+            )
+        except IdentityError as exc:
+            print(f"Authentication failed: {exc}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} Offline Assistant")
+    parser.add_argument("--voice", action="store_true", help="Start directly in voice conversation mode")
+    parser.add_argument("--ui", action="store_true", help="Launch desktop conversation UI")
+    parser.add_argument("--user", type=str, default=None, help="Authenticate as a specific local username")
+    args = parser.parse_args(argv)
+
+    database = MemoryDatabase()
+    identity_manager = IdentityManager(database=database)
+
+    try:
+        identity = _authenticate_cli_user(identity_manager, preferred_username=args.user)
+    except (EOFError, KeyboardInterrupt):
+        print("\nAuthentication cancelled.")
+        return
+
+    assistant = RIYAAssistant(
+        identity_manager=identity_manager,
+        default_identity=identity,
+        require_identity=True,
+    )
+
+    if args.ui:
+        from core.voice.config import VoiceConfig
+        from core.voice.orchestrator import VoiceOrchestrator
+        from core.voice.session import VoiceSession
+        from core.voice.ui import launch_voice_gui
+
+        cfg = VoiceConfig.load_for_user(identity_manager.users_root, identity.user_id)
+        session = VoiceSession(
+            cfg,
+            user_id=identity.user_id,
+            auth_session_id=identity.session_id,
+        )
+        orchestrator = VoiceOrchestrator(assistant, config=cfg, session=session)
+        try:
+            launch_voice_gui(orchestrator)
+        finally:
+            orchestrator.close()
+            assistant.logout()
+            assistant.close()
+        return
+
+    print("=" * 50)
+    print(f"{APP_NAME} {APP_VERSION}")
+    print(f"Developer: {DEVELOPER_NAME}")
+    print(f"Signed in as: {identity.display_name} (@{identity.username})")
+    print("=" * 50)
+    print(
+        "RIYA is ready. Commands: /voice, /text, /interrupt, /status, /settings, "
+        "/whoami, /create-user, /switch-user, /logout, or 'exit'.\n"
+    )
+
+    orchestrator = None
+
+    def _get_orchestrator():
+        nonlocal orchestrator
+        current = assistant.current_identity
+        if current is None:
+            raise IdentityError("Please sign in first with /switch-user.")
+        if orchestrator is None:
+            from core.voice.config import VoiceConfig
+            from core.voice.orchestrator import VoiceOrchestrator
+            from core.voice.session import VoiceSession
+
+            cfg = VoiceConfig.load_for_user(identity_manager.users_root, current.user_id)
+            session = VoiceSession(
+                cfg,
+                user_id=current.user_id,
+                auth_session_id=current.session_id,
+            )
+            orchestrator = VoiceOrchestrator(assistant, config=cfg, session=session)
+        return orchestrator
+
+    try:
+        if args.voice:
+            orch = _get_orchestrator()
+            orch.switch_mode("voice")
+            print("[Voice mode ON - Microphone active. Type /text or /interrupt anytime.]")
+
+        while True:
+            try:
+                user = input("You: ").strip()
+            except EOFError:
+                break
+
+            if not user:
+                continue
+
+            lower = user.lower()
+            if lower in {"exit", "quit", "stop"}:
+                response = assistant.process(user)
+                print(f"RIYA: {response}")
+                break
+
+            if lower == "/whoami":
+                current = assistant.current_identity
+                if current is None:
+                    print("[Signed out]")
+                else:
+                    print(
+                        f"[user=@{current.username} display={current.display_name!r} "
+                        f"user_id={current.user_id} workspace={current.workspace_dir}]"
+                    )
+                continue
+
+            if lower == "/create-user":
+                try:
+                    new_identity = _prompt_create_user(identity_manager)
+                    assistant.set_identity(new_identity)
+                    if orchestrator is not None:
+                        from core.voice.config import VoiceConfig
+                        cfg = VoiceConfig.load_for_user(
+                            identity_manager.users_root, new_identity.user_id
+                        )
+                        orchestrator.switch_identity(new_identity, config=cfg)
+                    print(f"[Created and switched to @{new_identity.username}]")
+                except (EOFError, KeyboardInterrupt, IdentityError, ValueError) as exc:
+                    print(f"[Account creation failed: {exc}]")
+                continue
+
+            if lower == "/switch-user":
+                try:
+                    new_identity = _authenticate_cli_user(identity_manager)
+                    previous = assistant.current_identity
+                    if previous is not None:
+                        identity_manager.logout(previous)
+                    assistant.set_identity(new_identity)
+                    if orchestrator is not None:
+                        from core.voice.config import VoiceConfig
+                        cfg = VoiceConfig.load_for_user(
+                            identity_manager.users_root, new_identity.user_id
+                        )
+                        orchestrator.switch_identity(new_identity, config=cfg)
+                    print(f"[Switched user to {new_identity.display_name} (@{new_identity.username})]")
+                except (EOFError, KeyboardInterrupt, IdentityError, ValueError) as exc:
+                    print(f"[Switch user failed: {exc}]")
+                continue
+
+            if lower == "/logout":
+                assistant.logout()
+                if orchestrator is not None:
+                    orchestrator.switch_identity(None)
+                print("[Signed out. Use /switch-user to sign in or 'exit' to quit.]")
+                continue
+
+            if lower == "/voice":
+                try:
+                    orch = _get_orchestrator()
+                    orch.switch_mode("voice")
+                    print("[Voice mode ON - Microphone active]")
+                except IdentityError as exc:
+                    print(f"[Voice error: {exc}]")
+                continue
+
+            if lower == "/text":
+                if orchestrator is not None:
+                    orchestrator.switch_mode("text")
+                print("[Text mode ON - Microphone off]")
+                continue
+
+            if lower == "/interrupt":
+                if orchestrator is not None:
+                    orchestrator.interrupt("cli_interrupt")
+                    print("[Playback interrupted]")
+                continue
+
+            if lower == "/status":
+                current = assistant.current_identity
+                user_label = f"@{current.username}" if current is not None else "signed_out"
+                if orchestrator is None:
+                    print(f"[user={user_label} mode=text voice_state=idle mic=OFF]")
+                else:
+                    print(
+                        f"[user={user_label} mode={orchestrator.mode} voice_state={orchestrator.state.value} "
+                        f"mic={'LIVE' if orchestrator.session.microphone_active else 'OFF'}]"
+                    )
+                continue
+
+            if lower == "/settings":
+                orch = _get_orchestrator()
+                print(orch.config.to_dict())
+                continue
+
+            if orchestrator is not None:
+                response = orchestrator.send_text(user)
+            else:
+                response = assistant.process(user)
+
+            print(f"RIYA: {response}")
+    finally:
+        if orchestrator is not None:
+            orchestrator.close()
+        assistant.logout()
+        assistant.close()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

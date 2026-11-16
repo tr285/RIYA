@@ -1,0 +1,607 @@
+"""Transactional, reversible SQLite migrations for RIYA."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import sqlite3
+from typing import Callable
+
+
+CURRENT_SCHEMA_VERSION = 4
+
+
+class MigrationError(RuntimeError):
+    """Raised when a schema migration or rollback cannot be applied safely."""
+
+
+@dataclass(frozen=True)
+class Migration:
+    version: int
+    name: str
+    up: Callable[[sqlite3.Connection], None]
+    down: Callable[[sqlite3.Connection], None]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    if not _table_exists(connection, table_name):
+        return set()
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _ensure_migrations_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def get_schema_version(connection: sqlite3.Connection) -> int:
+    if not _table_exists(connection, "schema_migrations"):
+        return 0
+    row = connection.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _up_0001_baseline_memories(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(category, key)
+        )
+        """
+    )
+
+
+def _down_0001_baseline_memories(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE IF EXISTS memories")
+
+
+def _up_0002_multi_user_identity_and_isolation(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            auth_method TEXT NOT NULL,
+            credential_hash TEXT NOT NULL,
+            credential_salt TEXT NOT NULL,
+            hash_algorithm TEXT NOT NULL DEFAULT 'pbkdf2_sha256',
+            hash_iterations INTEGER NOT NULL DEFAULT 310000,
+            workspace_dir TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            auth_method TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            namespace TEXT NOT NULL,
+            pref_key TEXT NOT NULL,
+            pref_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, namespace, pref_key)
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_permissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            tool_name TEXT NOT NULL,
+            policy TEXT NOT NULL CHECK (policy IN ('allow', 'confirm', 'deny')),
+            granted_by TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, tool_name)
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    existing_cols = _table_columns(connection, "memories")
+    if "user_id" not in existing_cols:
+        if _table_exists(connection, "memories"):
+            legacy_count = int(
+                connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            )
+            connection.execute("DROP TABLE IF EXISTS memories_v04_backup")
+            connection.execute("ALTER TABLE memories RENAME TO memories_v04_backup")
+        else:
+            legacy_count = 0
+
+        connection.execute(
+            """
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+                legacy_unclaimed INTEGER NOT NULL DEFAULT 0,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, category, key)
+            )
+            """
+        )
+
+        if legacy_count > 0:
+            created_expr = "created_at" if "created_at" in existing_cols else "CURRENT_TIMESTAMP"
+            updated_expr = "updated_at" if "updated_at" in existing_cols else "CURRENT_TIMESTAMP"
+            connection.execute(
+                f"""
+                INSERT INTO memories (
+                    id, user_id, legacy_unclaimed, category, key, value, created_at, updated_at
+                )
+                SELECT
+                    id, NULL, 1, category, key, value, {created_expr}, {updated_expr}
+                FROM memories_v04_backup
+                ORDER BY id ASC
+                """
+            )
+            migrated_count = int(
+                connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            )
+            if migrated_count != legacy_count:
+                raise MigrationError(
+                    "Legacy memory row count mismatch during v0.5 migration."
+                )
+
+        connection.execute("DROP TABLE IF EXISTS memories_v04_backup")
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_legacy_unique
+        ON memories(category, key)
+        WHERE user_id IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memories_user_category
+        ON memories(user_id, category)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memories_legacy_unclaimed
+        ON memories(legacy_unclaimed)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id
+        ON user_sessions(user_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash
+        ON user_sessions(token_hash)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_preferences_user_ns
+        ON user_preferences(user_id, namespace)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_permissions_user_tool
+        ON user_permissions(user_id, tool_name)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_conversation_history_user_session
+        ON conversation_history(user_id, session_id, id)
+        """
+    )
+
+
+def _down_0002_multi_user_identity_and_isolation(
+    connection: sqlite3.Connection,
+) -> None:
+    if _table_exists(connection, "memories"):
+        collision = connection.execute(
+            """
+            SELECT category, key, COUNT(*) AS cnt
+            FROM memories
+            GROUP BY category, key
+            HAVING cnt > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if collision is not None:
+            raise MigrationError(
+                "Cannot roll back multi-user schema: colliding (category, key) memories "
+                "exist across multiple users."
+            )
+
+        row_count = int(
+            connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        )
+        connection.execute("DROP TABLE IF EXISTS memories_v05_rollback")
+        connection.execute(
+            """
+            CREATE TABLE memories_v05_rollback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(category, key)
+            )
+            """
+        )
+        if row_count > 0:
+            connection.execute(
+                """
+                INSERT INTO memories_v05_rollback (
+                    id, category, key, value, created_at, updated_at
+                )
+                SELECT id, category, key, value, created_at, updated_at
+                FROM memories
+                ORDER BY id ASC
+                """
+            )
+        connection.execute("DROP INDEX IF EXISTS idx_memories_legacy_unique")
+        connection.execute("DROP INDEX IF EXISTS idx_memories_user_category")
+        connection.execute("DROP INDEX IF EXISTS idx_memories_legacy_unclaimed")
+        connection.execute("DROP TABLE memories")
+        connection.execute("ALTER TABLE memories_v05_rollback RENAME TO memories")
+
+    connection.execute("DROP TABLE IF EXISTS conversation_history")
+    connection.execute("DROP TABLE IF EXISTS user_permissions")
+    connection.execute("DROP TABLE IF EXISTS user_preferences")
+    connection.execute("DROP TABLE IF EXISTS user_sessions")
+    connection.execute("DROP TABLE IF EXISTS users")
+
+
+def _up_0003_permission_trust_and_audit(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS permission_grants (
+            grant_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            permission_key TEXT NOT NULL,
+            resource_scope TEXT NOT NULL DEFAULT '*',
+            decision TEXT NOT NULL CHECK (decision IN ('allow', 'confirm', 'deny')),
+            lifetime TEXT NOT NULL CHECK (
+                lifetime IN ('one_time', 'session', 'persistent', 'time_limited')
+            ),
+            session_id TEXT,
+            expires_at TEXT,
+            max_uses INTEGER,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            granted_by TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            revoked_at TEXT,
+            revoked_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS permission_audit_log (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            session_id TEXT,
+            permission_category TEXT NOT NULL,
+            permission_key TEXT NOT NULL,
+            resource_or_tool TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_permission_audit_no_update
+        BEFORE UPDATE ON permission_audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'permission_audit_log records are append-only');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_permission_audit_no_delete
+        BEFORE DELETE ON permission_audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'permission_audit_log records cannot be deleted');
+        END
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_permission_grants_user_key
+        ON permission_grants(user_id, permission_key, resource_scope)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_permission_grants_user_session
+        ON permission_grants(user_id, session_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_permission_grants_expires
+        ON permission_grants(expires_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_permission_audit_user_time
+        ON permission_audit_log(user_id, audit_id)
+        """
+    )
+
+
+def _down_0003_permission_trust_and_audit(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute("DROP TRIGGER IF EXISTS trg_permission_audit_no_update")
+    connection.execute("DROP TRIGGER IF EXISTS trg_permission_audit_no_delete")
+    connection.execute("DROP INDEX IF EXISTS idx_permission_audit_user_time")
+    connection.execute("DROP INDEX IF EXISTS idx_permission_grants_expires")
+    connection.execute("DROP INDEX IF EXISTS idx_permission_grants_user_session")
+    connection.execute("DROP INDEX IF EXISTS idx_permission_grants_user_key")
+    connection.execute("DROP TABLE IF EXISTS permission_audit_log")
+    connection.execute("DROP TABLE IF EXISTS permission_grants")
+
+
+def _up_0004_onboarding_and_setup_state(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS installation_setup_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            status TEXT NOT NULL CHECK (
+                status IN ('not_started', 'in_progress', 'completed', 'recovery_required')
+            ),
+            current_step TEXT NOT NULL,
+            completed_steps TEXT NOT NULL DEFAULT '[]',
+            selected_model_path TEXT,
+            selected_backend TEXT NOT NULL DEFAULT 'auto',
+            active_user_id TEXT,
+            last_error TEXT,
+            started_at TEXT,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_onboarding_state (
+            user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (
+                status IN ('not_started', 'in_progress', 'completed')
+            ),
+            current_step TEXT NOT NULL,
+            completed_steps TEXT NOT NULL DEFAULT '[]',
+            model_path TEXT,
+            ai_backend TEXT NOT NULL DEFAULT 'auto',
+            voice_configured INTEGER NOT NULL DEFAULT 0,
+            permissions_reviewed INTEGER NOT NULL DEFAULT 0,
+            health_checked INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
+
+
+def _down_0004_onboarding_and_setup_state(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute("DROP TABLE IF EXISTS user_onboarding_state")
+    connection.execute("DROP TABLE IF EXISTS installation_setup_state")
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        version=1,
+        name="0001_baseline_memories",
+        up=_up_0001_baseline_memories,
+        down=_down_0001_baseline_memories,
+    ),
+    Migration(
+        version=2,
+        name="0002_multi_user_identity_and_isolation",
+        up=_up_0002_multi_user_identity_and_isolation,
+        down=_down_0002_multi_user_identity_and_isolation,
+    ),
+    Migration(
+        version=3,
+        name="0003_permission_trust_and_audit",
+        up=_up_0003_permission_trust_and_audit,
+        down=_down_0003_permission_trust_and_audit,
+    ),
+    Migration(
+        version=4,
+        name="0004_onboarding_and_setup_state",
+        up=_up_0004_onboarding_and_setup_state,
+        down=_down_0004_onboarding_and_setup_state,
+    ),
+)
+
+
+def apply_migrations(
+    connection: sqlite3.Connection,
+    target_version: int = CURRENT_SCHEMA_VERSION,
+) -> list[int]:
+    """Apply pending migrations inside an atomic transaction."""
+    if target_version < 0 or target_version > CURRENT_SCHEMA_VERSION:
+        raise MigrationError(f"Unsupported target schema version: {target_version}")
+
+    applied: list[int] = []
+    connection.execute("PRAGMA foreign_keys = ON")
+
+    started_tx = False
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        started_tx = True
+
+    try:
+        _ensure_migrations_table(connection)
+        current_rows = connection.execute(
+            "SELECT version FROM schema_migrations"
+        ).fetchall()
+        applied_versions = {int(row[0]) for row in current_rows}
+
+        for migration in MIGRATIONS:
+            if migration.version > target_version:
+                break
+            if migration.version in applied_versions:
+                continue
+            migration.up(connection)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (?, ?, ?)
+                """,
+                (migration.version, migration.name, _utc_now()),
+            )
+            applied.append(migration.version)
+
+        if started_tx:
+            connection.commit()
+    except Exception:
+        if started_tx:
+            connection.rollback()
+        raise
+
+    return applied
+
+
+def rollback_migration(
+    connection: sqlite3.Connection,
+    target_version: int = 1,
+) -> list[int]:
+    """Roll back applied migrations down to target_version inside a transaction."""
+    if target_version < 0 or target_version > CURRENT_SCHEMA_VERSION:
+        raise MigrationError(f"Unsupported rollback target version: {target_version}")
+
+    rolled_back: list[int] = []
+    connection.execute("PRAGMA foreign_keys = ON")
+
+    started_tx = False
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        started_tx = True
+
+    try:
+        if not _table_exists(connection, "schema_migrations"):
+            if started_tx:
+                connection.commit()
+            return rolled_back
+
+        current_rows = connection.execute(
+            "SELECT version FROM schema_migrations"
+        ).fetchall()
+        applied_versions = {int(row[0]) for row in current_rows}
+
+        for migration in reversed(MIGRATIONS):
+            if migration.version <= target_version:
+                continue
+            if migration.version not in applied_versions:
+                continue
+            migration.down(connection)
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                (migration.version,),
+            )
+            rolled_back.append(migration.version)
+
+        if started_tx:
+            connection.commit()
+    except Exception:
+        if started_tx:
+            connection.rollback()
+        raise
+
+    return rolled_back

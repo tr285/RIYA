@@ -1,0 +1,526 @@
+import errno
+import os
+from dataclasses import dataclass
+from pathlib import Path
+import stat
+
+from core.config import settings
+
+
+class FilesystemAccessError(PermissionError):
+    """Raised when a filesystem tool is asked to leave an allowed root."""
+
+
+@dataclass(frozen=True)
+class _PathContext:
+    """A resolved policy path and its descriptor-safe root-relative form."""
+
+    resolved: Path
+    root: Path
+    parts: tuple[str, ...]
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _allowed_roots() -> tuple[Path, ...]:
+    """Return resolved allowed roots from the runtime configuration."""
+
+    return tuple(
+        Path(root).expanduser().resolve()
+        for root in settings.FILESYSTEM_ALLOWED_ROOTS
+    )
+
+
+def _is_within_allowed_root(path: Path) -> bool:
+    return any(
+        path == root or root in path.parents
+        for root in _allowed_roots()
+    )
+
+
+def _resolve_path(path: str) -> Path:
+    """Resolve aliases and enforce the allowed-root policy before access."""
+
+    path = path.strip()
+
+    aliases = {
+        "desktop": "~/Desktop",
+        "documents": "~/Documents",
+        "downloads": "~/Downloads",
+        "home": "~",
+    }
+
+    normalized = path.lower()
+
+    if normalized in aliases:
+        path = aliases[normalized]
+
+    resolved = Path(path).expanduser().resolve()
+
+    if not _is_within_allowed_root(resolved):
+        raise FilesystemAccessError(
+            "Access denied: RIYA can only access configured "
+            f"filesystem roots. Requested path: {resolved}"
+        )
+
+    return resolved
+
+
+def _path_context(path: str) -> _PathContext:
+    """Bind a policy-approved path to its most specific allowed root."""
+
+    resolved = _resolve_path(path)
+    roots = [
+        root
+        for root in _allowed_roots()
+        if resolved == root or root in resolved.parents
+    ]
+    root = max(roots, key=lambda item: len(item.parts))
+
+    return _PathContext(
+        resolved=resolved,
+        root=root,
+        parts=resolved.relative_to(root).parts,
+    )
+
+
+def _access_error(path: Path, exc: OSError) -> FilesystemAccessError:
+    """Do not expose a symlink/race as an ordinary filesystem failure."""
+
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return FilesystemAccessError(
+            f"Access denied: unsafe path component: {path}"
+        )
+
+    return FilesystemAccessError(
+        f"Access denied while opening path: {path}"
+    )
+
+
+def _open_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    try:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _access_error(path, exc) from exc
+
+
+def _open_directory(
+    context: _PathContext,
+    create_parents: bool = False,
+) -> int:
+    """Open a directory component-by-component without following links."""
+
+    try:
+        descriptor = os.open(context.root, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise _access_error(context.root, exc) from exc
+
+    current_path = context.root
+
+    try:
+        for part in context.parts:
+            current_path = current_path / part
+
+            try:
+                child = _open_directory_at(
+                    descriptor,
+                    part,
+                    current_path,
+                )
+            except FilesystemAccessError as exc:
+                if not create_parents or not isinstance(
+                    exc.__cause__, FileNotFoundError
+                ):
+                    raise
+
+                try:
+                    os.mkdir(part, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+
+                child = _open_directory_at(
+                    descriptor,
+                    part,
+                    current_path,
+                )
+
+            os.close(descriptor)
+            descriptor = child
+
+        return descriptor
+
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_parent_directory(
+    context: _PathContext,
+    create_parents: bool = False,
+) -> tuple[int, str | None]:
+    """Open a target's parent through no-follow directory descriptors."""
+
+    if not context.parts:
+        root_context = _PathContext(context.root, context.root, ())
+        return _open_directory(root_context), None
+
+    parent = _PathContext(
+        resolved=context.resolved.parent,
+        root=context.root,
+        parts=context.parts[:-1],
+    )
+
+    return _open_directory(parent, create_parents), context.parts[-1]
+
+
+def _entry_stat(parent_fd: int, name: str, path: Path):
+    try:
+        return os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _access_error(path, exc) from exc
+
+
+def _safe_scandir(directory_fd: int):
+    """Return a scan over a duplicated descriptor owned by scandir."""
+
+    return os.scandir(os.dup(directory_fd))
+
+
+def list_files(
+    path: str = ".",
+    directory: str | None = None,
+) -> str:
+
+    if directory is not None:
+        path = directory
+
+    context = _path_context(path)
+
+    try:
+        directory_fd = _open_directory(context)
+    except FilesystemAccessError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return f"Directory not found: {context.resolved}"
+        raise
+
+    try:
+        entries = []
+
+        with _safe_scandir(directory_fd) as scan:
+            for entry in scan:
+                entry_path = context.resolved / entry.name
+                entry_stat = _entry_stat(
+                    directory_fd,
+                    entry.name,
+                    entry_path,
+                )
+
+                # Never report a symlink that may change target after listing.
+                if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                    continue
+
+                entries.append((
+                    entry.name,
+                    stat.S_ISDIR(entry_stat.st_mode),
+                ))
+
+    finally:
+        os.close(directory_fd)
+
+    entries.sort(key=lambda item: (not item[1], item[0].lower()))
+
+    if not entries:
+        return f"{context.resolved} is empty."
+
+    return "\n".join(
+        f"{'[DIR]' if is_directory else '[FILE]'} {name}"
+        for name, is_directory in entries
+    )
+
+
+MAX_SEARCH_DEPTH = 20
+MAX_SEARCH_ENTRIES = 10_000
+MAX_SEARCH_MATCHES = 50
+
+
+def find_files(
+    name: str,
+    path: str | None = None,
+) -> str:
+
+    if path is None:
+        path = str(settings.PROJECT_ROOT)
+
+    context = _path_context(path)
+
+    try:
+        root_fd = _open_directory(context)
+    except FilesystemAccessError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return f"Directory not found: {context.resolved}"
+        raise
+
+    matches: list[str] = []
+    needle = name.lower()
+    visited_entries = 0
+    depth_limited = False
+    entry_limited = False
+
+    def walk(directory_fd: int, directory_path: Path, depth: int) -> None:
+        nonlocal visited_entries, depth_limited, entry_limited
+
+        if len(matches) >= MAX_SEARCH_MATCHES:
+            return
+
+        with _safe_scandir(directory_fd) as scan:
+            for entry in scan:
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    return
+
+                if visited_entries >= MAX_SEARCH_ENTRIES:
+                    entry_limited = True
+                    return
+
+                visited_entries += 1
+
+                entry_path = directory_path / entry.name
+                entry_stat = _entry_stat(
+                    directory_fd,
+                    entry.name,
+                    entry_path,
+                )
+
+                if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                    continue
+
+                if needle in entry.name.lower():
+                    matches.append(str(entry_path))
+
+                if not stat.S_ISDIR(entry_stat.st_mode):
+                    continue
+
+                if depth >= MAX_SEARCH_DEPTH:
+                    depth_limited = True
+                    continue
+
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    return
+
+                try:
+                    child_fd = _open_directory_at(
+                        directory_fd,
+                        entry.name,
+                        entry_path,
+                    )
+                except FilesystemAccessError:
+                    # The entry changed after stat. It is never followed.
+                    continue
+
+                try:
+                    walk(child_fd, entry_path, depth + 1)
+                finally:
+                    os.close(child_fd)
+
+                if (
+                    len(matches) >= MAX_SEARCH_MATCHES
+                    or entry_limited
+                ):
+                    return
+
+    try:
+        walk(root_fd, context.resolved, 0)
+    finally:
+        os.close(root_fd)
+
+    if not matches:
+        result = f"No files or folders found matching '{name}'."
+    else:
+        result = "\\n".join(matches)
+
+    if entry_limited or depth_limited:
+        result += (
+            "\\nSearch was limited to protect system resources. "
+            "Try searching a smaller directory."
+        )
+
+    return result
+
+def create_folder(path: str) -> str:
+
+    context = _path_context(path)
+
+    if not context.parts:
+        return f"Folder already exists: {context.resolved}"
+
+    parent_fd, name = _open_parent_directory(
+        context,
+        create_parents=True,
+    )
+    assert name is not None
+
+    try:
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError:
+            entry_stat = _entry_stat(parent_fd, name, context.resolved)
+
+            if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                raise FilesystemAccessError(
+                    f"Access denied: unsafe path component: {context.resolved}"
+                )
+
+            if stat.S_ISDIR(entry_stat.st_mode):
+                return f"Folder already exists: {context.resolved}"
+
+            return f"A file already exists at: {context.resolved}"
+
+    finally:
+        os.close(parent_fd)
+
+    return f"Folder created: {context.resolved}"
+
+
+def read_file(path: str) -> str:
+
+    context = _path_context(path)
+
+    if not context.parts:
+        return f"Not a file: {context.resolved}"
+
+    parent_fd, name = _open_parent_directory(context)
+    assert name is not None
+
+    try:
+        try:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return f"File not found: {context.resolved}"
+        except OSError as exc:
+            if exc.errno == errno.EISDIR:
+                return f"Not a file: {context.resolved}"
+            raise _access_error(context.resolved, exc) from exc
+
+    finally:
+        os.close(parent_fd)
+
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            return f"Not a file: {context.resolved}"
+
+        try:
+            with os.fdopen(file_fd, "r", encoding="utf-8") as file:
+                file_fd = None
+                return file.read()
+        except UnicodeDecodeError:
+            return "I can't read this as a UTF-8 text file: " f"{context.resolved}"
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+
+
+
+def verify_file_content(path: str, expected_content: str) -> bool:
+    """Verify exact UTF-8 content using safe descriptor-based access."""
+    if not isinstance(expected_content, str):
+        return False
+
+    try:
+        expected = expected_content.encode("utf-8")
+        context = _path_context(path)
+
+        if not context.parts:
+            return False
+
+        parent_fd, name = _open_parent_directory(context)
+        assert name is not None
+
+        try:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                return False
+
+            actual = bytearray()
+            limit = len(expected) + 1
+
+            while len(actual) < limit:
+                chunk = os.read(file_fd, limit - len(actual))
+                if not chunk:
+                    break
+                actual.extend(chunk)
+
+            return bytes(actual) == expected
+        finally:
+            os.close(file_fd)
+
+    except (OSError, UnicodeEncodeError, FilesystemAccessError):
+        return False
+
+def write_file(
+    path: str,
+    content: str,
+) -> str:
+
+    if not isinstance(content, str):
+        raise TypeError("File content must be text.")
+
+    context = _path_context(path)
+
+    if not context.parts:
+        return f"Not a file: {context.resolved}"
+
+    parent_fd, name = _open_parent_directory(
+        context,
+        create_parents=True,
+    )
+    assert name is not None
+
+    try:
+        try:
+            file_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EISDIR:
+                return f"Not a file: {context.resolved}"
+            raise _access_error(context.resolved, exc) from exc
+
+    finally:
+        os.close(parent_fd)
+
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            return f"Not a file: {context.resolved}"
+
+        os.ftruncate(file_fd, 0)
+
+        with os.fdopen(file_fd, "w", encoding="utf-8") as file:
+            file_fd = None
+            file.write(content)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+    return f"File written: {context.resolved}"

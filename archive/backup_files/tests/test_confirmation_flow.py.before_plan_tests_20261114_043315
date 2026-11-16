@@ -1,0 +1,96 @@
+import unittest
+from unittest.mock import Mock, patch
+
+class TestConfirmationFlow(unittest.TestCase):
+
+    def setUp(self):
+        # Avoid the assistant module's legacy module-level memory helper so
+        # this confirmation test never initializes the project database.
+        from core.memory.database import MemoryDatabase
+
+        with patch.object(MemoryDatabase, "_initialize"):
+            from core.agent.assistant import RIYAAssistant
+
+        # Bypass __init__: do not load AI models or databases.
+        self.assistant = RIYAAssistant.__new__(RIYAAssistant)
+        self.assistant.agent = Mock()
+        self.assistant.pending_plan = None
+        self.assistant.pending_action = {
+            "tool": "remember",
+            "parameters": {
+                "category": "personal",
+                "key": "my_name",
+                "value": "Tukaram",
+            },
+            "confirmation_token": "test-confirmation-token",
+        }
+        self.assistant.agent.execute.return_value = {
+            "status": "success"
+        }
+        self.assistant._format_result = Mock(
+            return_value="Memory saved."
+        )
+        self.assistant._update_context = Mock()
+
+    def test_yes_executes_action(self):
+        result = self.assistant._handle_confirmation("yes")
+
+        self.assertEqual(result, "Memory saved.")
+        self.assistant.agent.execute.assert_called_once_with(
+            "remember",
+            confirmation_token="test-confirmation-token",
+            category="personal",
+            key="my_name",
+            value="Tukaram",
+        )
+        self.assertIsNone(self.assistant.pending_action)
+
+    def test_no_cancels_action(self):
+        result = self.assistant._handle_confirmation("no")
+
+        self.assertIn("cancelled", result.lower())
+        self.assistant.agent.execute.assert_not_called()
+        self.assertIsNone(self.assistant.pending_action)
+
+    def test_unclear_response_keeps_pending_action(self):
+        result = self.assistant._handle_confirmation("maybe")
+
+        self.assertIn("yes", result.lower())
+        self.assertIsNotNone(self.assistant.pending_action)
+        self.assistant.agent.execute.assert_not_called()
+
+
+    def test_no_cancels_pending_plan(self):
+        self.assistant.pending_plan = {
+            "steps": [],
+            "next_index": 1,
+            "results": [],
+        }
+
+        result = self.assistant._handle_confirmation("no")
+
+        self.assertIn("cancelled", result.lower())
+        self.assertIsNone(self.assistant.pending_action)
+        self.assertIsNone(self.assistant.pending_plan)
+        self.assistant.agent.cancel_confirmation.assert_called_once_with(
+            "test-confirmation-token"
+        )
+
+    def test_unclear_response_preserves_pending_plan(self):
+        plan_state = {
+            "steps": [],
+            "next_index": 1,
+            "results": [],
+        }
+        self.assistant.pending_plan = plan_state
+
+        result = self.assistant._handle_confirmation("maybe")
+
+        self.assertIn("yes", result.lower())
+        self.assertIs(self.assistant.pending_plan, plan_state)
+        self.assertIsNotNone(self.assistant.pending_action)
+        self.assistant.agent.execute.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

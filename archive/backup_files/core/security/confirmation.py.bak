@@ -1,0 +1,86 @@
+"""One-time, action-bound confirmations for privileged RIYA tools."""
+
+from dataclasses import dataclass
+from hashlib import sha256
+import hmac
+import json
+import secrets
+import time
+from typing import Callable
+
+
+@dataclass(frozen=True)
+class ConfirmationGrant:
+    """An unforgeable, short-lived approval for one exact tool invocation."""
+
+    fingerprint: str
+    expires_at: float
+
+
+class ConfirmationManager:
+    """Issue and consume one-time confirmations without persisting them."""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 120,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._grants: dict[str, ConfirmationGrant] = {}
+
+    def issue(self, tool_name: str, parameters: dict) -> str:
+        """Create an approval bound to an exact tool name and parameters."""
+
+        token = secrets.token_urlsafe(32)
+        self._grants[token] = ConfirmationGrant(
+            fingerprint=self._fingerprint(tool_name, parameters),
+            expires_at=self._clock() + self.ttl_seconds,
+        )
+        return token
+
+    def consume(
+        self,
+        token: str | None,
+        tool_name: str,
+        parameters: dict,
+    ) -> tuple[bool, str]:
+        """Consume a token once, accepting it only for its original action."""
+
+        if not isinstance(token, str):
+            return False, "A valid confirmation token is required."
+
+        # Pop before validation so failed mismatch attempts cannot be replayed.
+        grant = self._grants.pop(token, None)
+
+        if grant is None:
+            return False, "Confirmation token is invalid, expired, or already used."
+
+        if self._clock() >= grant.expires_at:
+            return False, "Confirmation token has expired."
+
+        fingerprint = self._fingerprint(tool_name, parameters)
+
+        if not hmac.compare_digest(grant.fingerprint, fingerprint):
+            return False, "Confirmation token does not authorize this action."
+
+        return True, "Confirmation accepted."
+
+    def cancel(self, token: str | None) -> None:
+        """Invalidate a pending approval without executing its action."""
+
+        if isinstance(token, str):
+            self._grants.pop(token, None)
+
+    @staticmethod
+    def _fingerprint(tool_name: str, parameters: dict) -> str:
+        payload = json.dumps(
+            {
+                "tool": tool_name,
+                "parameters": parameters,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()

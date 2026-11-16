@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# RIYA AppImage Entry Point (AppRun)
+# Establishes runtime paths, ensures host XDG data isolation, and launches RIYA
+set -euo pipefail
+
+# 1. Resolve AppDir Base
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export APPDIR="${APPDIR:-$HERE}"
+
+# 2. Refuse Root Execution (unless overridden)
+if [[ "$(id -u)" -eq 0 ]] && [[ "${ALLOW_ROOT:-0}" != "1" ]]; then
+    echo "[SECURITY WARNING] RIYA AppImage should not be run as root." >&2
+    echo "Running as standard user ensures personal database and settings isolation." >&2
+    echo "Set ALLOW_ROOT=1 to override." >&2
+    exit 1
+fi
+
+# 3. Establish Host-Level XDG Storage Directories
+# Crucial: AppImage mount is read-only. Mutable user data must reside on the host.
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+USER_DATA_DIR="$XDG_DATA_HOME/riya/data"
+USER_MODELS_DIR="$XDG_DATA_HOME/riya/models"
+USER_LOGS_DIR="$XDG_DATA_HOME/riya/logs"
+USER_CACHE_DIR="$XDG_CACHE_HOME/riya"
+
+mkdir -p "$USER_DATA_DIR" "$USER_MODELS_DIR" "$USER_LOGS_DIR" "$USER_CACHE_DIR"
+
+# 4. Configure Library & Python Environment
+export PATH="$APPDIR/usr/bin:$APPDIR/opt/riya/bin:$PATH"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib64:$APPDIR/opt/riya/lib:${LD_LIBRARY_PATH:-}"
+
+# Search for application code in AppDir
+APP_CODE_DIR=""
+if [[ -d "$APPDIR/opt/riya/core" ]]; then
+    APP_CODE_DIR="$APPDIR/opt/riya"
+elif [[ -d "$APPDIR/usr/share/riya/core" ]]; then
+    APP_CODE_DIR="$APPDIR/usr/share/riya"
+elif [[ -d "$APPDIR/core" ]]; then
+    APP_CODE_DIR="$APPDIR"
+else
+    echo "Error: Application code not found inside AppImage AppDir." >&2
+    exit 1
+fi
+
+export PYTHONPATH="$APP_CODE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+export RIYA_ENV="${RIYA_ENV:-production}"
+export RIYA_APPIMAGE="1"
+export RIYA_DATA_DIR="$USER_DATA_DIR"
+export RIYA_MODELS_DIR="$USER_MODELS_DIR"
+export RIYA_LOGS_DIR="$USER_LOGS_DIR"
+export RIYA_CACHE_DIR="$USER_CACHE_DIR"
+export RIYA_APP_SUPPORT_DIR="$XDG_DATA_HOME/riya"
+
+# 5. Locate Python 3 Runtime (bundled inside AppImage or host system)
+PY_BIN=""
+if [[ -x "$APPDIR/usr/bin/python3" ]]; then
+    PY_BIN="$APPDIR/usr/bin/python3"
+elif [[ -x "$APPDIR/opt/riya/venv/bin/python3" ]]; then
+    PY_BIN="$APPDIR/opt/riya/venv/bin/python3"
+elif [[ -n "${RIYA_PYTHON:-}" ]] && [[ -x "$RIYA_PYTHON" ]]; then
+    PY_BIN="$RIYA_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+    PY_BIN="$(command -v python3)"
+elif [[ -x "/usr/bin/python3" ]]; then
+    PY_BIN="/usr/bin/python3"
+else
+    echo "Error: No Python 3 runtime found. Please install Python 3 (>= 3.10)." >&2
+    exit 1
+fi
+
+# 6. Execute RIYA Entry Point
+exec "$PY_BIN" -m core.main "$@"
+

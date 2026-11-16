@@ -74,6 +74,25 @@ class MemoryIntentDetector:
 
         normalized = text.lower()
 
+        # PERSONAL MEMORY RECALL
+        personal_question = normalized.rstrip(" ?.!")
+
+        personal_recall_questions = {
+            "what is my name",
+            "what's my name",
+            "what is my full name",
+            "who am i",
+            "tell me my name",
+            "do you know my name",
+        }
+
+        if personal_question in personal_recall_questions:
+            return MemoryIntent(
+                type=MemoryIntentType.RECALL,
+                category="personal",
+                key="my_name",
+            )
+
         # LIST
         if normalized in self.LIST_PHRASES:
 
@@ -206,6 +225,28 @@ class MemoryIntentDetector:
                         value=value,
                     )
 
+        if lowered.startswith(
+            ("my instruction is ", "personal instruction is ", "instruction is ", "rule is ")
+        ):
+            idx = lowered.find(" is ")
+            if idx > 0:
+                val = content[idx + 4 :].strip()
+                if val:
+                    return MemoryIntent(
+                        type=MemoryIntentType.REMEMBER,
+                        category="personal_instructions",
+                        key=self._make_key(val),
+                        value=val,
+                    )
+
+        if lowered.startswith("always "):
+            return MemoryIntent(
+                type=MemoryIntentType.REMEMBER,
+                category="personal_instructions",
+                key=self._make_key(content),
+                value=content,
+            )
+
         # ------------------------------------------
         # "I prefer X"
         # ------------------------------------------
@@ -222,7 +263,7 @@ class MemoryIntentDetector:
                 type=(
                     MemoryIntentType.REMEMBER
                 ),
-                category="preferences",
+                category="user_preferences",
                 key="preferred",
                 value=value,
             )
@@ -243,7 +284,7 @@ class MemoryIntentDetector:
                 type=(
                     MemoryIntentType.REMEMBER
                 ),
-                category="preferences",
+                category="user_preferences",
                 key="likes",
                 value=value,
             )
@@ -264,7 +305,7 @@ class MemoryIntentDetector:
                 type=(
                     MemoryIntentType.REMEMBER
                 ),
-                category="preferences",
+                category="user_preferences",
                 key="dislikes",
                 value=value,
             )
@@ -300,7 +341,7 @@ class MemoryIntentDetector:
                         type=(
                             MemoryIntentType.REMEMBER
                         ),
-                        category="preferences",
+                        category="user_preferences",
                         key=(
                             "favorite_"
                             + self._make_key(
@@ -335,7 +376,18 @@ class MemoryIntentDetector:
                 "dislike",
             )
         ):
-            return "preferences"
+            return "user_preferences"
+
+        if any(
+            word in lowered
+            for word in (
+                "instruction",
+                "rule",
+                "guideline",
+                "always",
+            )
+        ):
+            return "personal_instructions"
 
         if any(
             word in lowered

@@ -1,0 +1,168 @@
+from core.memory.intent import (
+    MemoryIntent,
+    MemoryIntentDetector,
+    MemoryIntentType,
+)
+
+from core.memory.manager import MemoryManager
+
+from core.tools.memory import (
+    remember,
+    recall_memory,
+    list_memories,
+    forget_memory,
+)
+
+
+class MemoryService:
+
+    def __init__(self):
+
+        self.detector = (
+            MemoryIntentDetector()
+        )
+
+        self.manager = MemoryManager()
+
+    def detect(
+        self,
+        text: str,
+    ) -> MemoryIntent:
+
+        return self.detector.detect(
+            text
+        )
+
+    def execute_safe(
+        self,
+        intent: MemoryIntent,
+    ) -> str | None:
+        """Execute strictly read-only memory queries; mutations remain denied here."""
+
+        if not isinstance(intent, MemoryIntent):
+            return None
+
+        if (
+            intent.type
+            == MemoryIntentType.RECALL
+        ):
+
+            category = (
+                intent.category
+                or "general"
+            )
+
+            key = (
+                intent.key
+                or "memory"
+            )
+
+            # First try exact lookup.
+            exact = recall_memory(
+                category=category,
+                key=key,
+            )
+
+            if not exact.startswith(
+                "I don't have a memory for"
+            ):
+                return exact
+
+            # If exact lookup fails, search the
+            # actual memory content/key/category.
+            matches = self.manager.search(
+                query=key,
+                category=None,
+            )
+
+            if not matches:
+                return (
+                    f"I don't have any memory "
+                    f"related to '{key}'."
+                )
+
+            if len(matches) == 1:
+                return matches[0]["value"]
+
+            lines = [
+                "I found these related memories:"
+            ]
+
+            for memory in matches[:5]:
+
+                lines.append(
+                    f"- {memory['category']}: "
+                    f"{memory['key']} = "
+                    f"{memory['value']}"
+                )
+
+            return "\n".join(lines)
+
+        if (
+            intent.type
+            == MemoryIntentType.LIST
+        ):
+
+            return list_memories()
+
+        return None
+
+    def build_remember_action(
+        self,
+        intent: MemoryIntent,
+    ) -> dict:
+
+        if (
+            intent.type
+            != MemoryIntentType.REMEMBER
+        ):
+            raise ValueError(
+                "Memory intent is not "
+                "a remember request."
+            )
+
+        return {
+            "tool": "remember",
+            "parameters": {
+                "category": (
+                    intent.category
+                    or "general"
+                ),
+                "key": (
+                    intent.key
+                    or "memory"
+                ),
+                "value": (
+                    intent.value
+                    or ""
+                ),
+            },
+        }
+
+    def build_forget_action(
+        self,
+        intent: MemoryIntent,
+    ) -> dict:
+
+        if (
+            intent.type
+            != MemoryIntentType.FORGET
+        ):
+            raise ValueError(
+                "Memory intent is not "
+                "a forget request."
+            )
+
+        return {
+            "tool": "forget_memory",
+            "parameters": {
+                "category": (
+                    intent.category
+                    or "general"
+                ),
+                "key": (
+                    intent.key
+                    or "memory"
+                ),
+            },
+        }

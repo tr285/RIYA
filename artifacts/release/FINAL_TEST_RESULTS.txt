@@ -1,0 +1,91 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.9, pytest-8.4.2, pluggy-1.5.0 -- /opt/anaconda3/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/tukaramgore/Projects/RIYA
+configfile: pyproject.toml
+plugins: cov-7.1.0, Faker-40.38.0, asyncio-1.4.0, anyio-4.10.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 15 items
+
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_theme_manager_palette_and_toggle PASSED [  6%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_markdown_renderer_headings_codeblocks_lists PASSED [ 13%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_desktop_app_startup_and_components_initialization PASSED [ 20%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_view_switching_and_sidebar_sync PASSED [ 26%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_chat_view_rendering_snapshots_and_streaming PASSED [ 33%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_confirmation_banner_in_chat_view PASSED [ 40%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_memories_view_operations_and_search PASSED [ 46%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_settings_view_all_10_tabs_present PASSED [ 53%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_packaging_bundle_and_dmg_validation PASSED [ 60%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_graceful_shutdown_and_resource_cleanup PASSED [ 66%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_chat_input_sending_and_voice_controls PASSED [ 73%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_tasks_view_submission_and_cancellation PASSED [ 80%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_permissions_view_grant_rule_execution PASSED [ 86%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_diagnostics_view_renders_readiness_checks PASSED [ 93%]
+tests/test_desktop_ui_modernization.py::TestDesktopUIModernization::test_launch_desktop_convenience_function PASSED [100%]
+
+============================== 15 passed in 1.20s ==============================
+============================= test session starts ==============================
+platform darwin -- Python 3.13.9, pytest-8.4.2, pluggy-1.5.0
+rootdir: /Users/tukaramgore/Projects/RIYA
+configfile: pyproject.toml
+testpaths: tests
+plugins: cov-7.1.0, Faker-40.38.0, asyncio-1.4.0, anyio-4.10.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 605 items
+
+tests/test_confirmation_flow.py ...........                              [  1%]
+tests/test_confirmation_manager.py ...............                       [  4%]
+tests/test_desktop_ui_modernization.py ...............                   [  6%]
+tests/test_filesystem_security.py ........                               [  8%]
+tests/test_final_system_audit.py .........                               [  9%]
+tests/test_linux_appimage.py .................                           [ 12%]
+tests/test_linux_data_preservation.py ........                           [ 13%]
+tests/test_linux_installation.py ....................................... [ 20%]
+..                                                                       [ 20%]
+tests/test_linux_packaging.py ...............................            [ 25%]
+tests/test_linux_platform.py .................                           [ 28%]
+tests/test_linux_security.py .....                                       [ 29%]
+tests/test_linux_voice_adapters.py ..........                            [ 30%]
+tests/test_macos_security.py ................                            [ 33%]
+tests/test_memory_authorization.py ..                                    [ 33%]
+tests/test_memory_database.py ....                                       [ 34%]
+tests/test_memory_intent.py .                                            [ 34%]
+tests/test_memory_isolation_and_fixtures.py ........                     [ 36%]
+tests/test_memory_service.py ...                                         [ 36%]
+tests/test_model_provisioning_and_packaging.py ..............            [ 38%]
+tests/test_multiuser_identity_and_isolation.py ...............           [ 41%]
+tests/test_native_ai_security.py ....................                    [ 44%]
+tests/test_native_backend_modes.py ......                                [ 45%]
+tests/test_onboarding_and_setup.py ..............                        [ 47%]
+tests/test_permission_and_trust.py ...................                   [ 51%]
+tests/test_phase4_memory_learning_self_improve.py .....                  [ 51%]
+tests/test_phase4_native_ai_and_conversation.py .......                  [ 53%]
+tests/test_phase4_real_offline_e2e.py ..                                 [ 53%]
+tests/test_phase5_real_offline_e2e.py .                                  [ 53%]
+tests/test_phase5_tasks_skills_voice_recovery.py .......                 [ 54%]
+tests/test_phase5_tools_browser_desktop_security.py ......               [ 55%]
+tests/test_phase6_milestone_6_1_unified_interface.py .....               [ 56%]
+tests/test_phase6_milestone_6_2_os_integration.py .......                [ 57%]
+tests/test_phase6_milestone_6_3_intelligent_file_management.py ......... [ 59%]
+........................................................................ [ 71%]
+...............                                                          [ 73%]
+tests/test_phase6_milestone_6_4_application_control.py ................. [ 76%]
+......................                                                   [ 80%]
+tests/test_phase6_milestone_6_5_voice_intelligence.py ............       [ 81%]
+tests/test_phase6_milestone_6_6_productivity.py .............            [ 84%]
+tests/test_phase6_milestone_6_7_cross_platform.py ............           [ 86%]
+tests/test_phase6_milestone_6_8_security.py ........                     [ 87%]
+tests/test_phase6_milestone_6_9_e2e_verification.py .......              [ 88%]
+tests/test_security_policy.py ......                                     [ 89%]
+tests/test_startup_resilience.py .....                                   [ 90%]
+tests/test_tool_executor_filesystem.py ...............                   [ 92%]
+tests/test_voice_command_activation.py ..................                [ 95%]
+tests/test_voice_conversation_integration.py ..                          [ 96%]
+tests/test_voice_interruption.py ..                                      [ 96%]
+tests/test_voice_security.py ...                                         [ 97%]
+tests/test_voice_session.py .......                                      [ 98%]
+tests/test_voice_state_machine.py .....                                  [ 99%]
+tests/test_voice_stt.py ...                                              [ 99%]
+tests/test_voice_tts.py ...                                              [100%]
+
+======================= 605 passed in 161.21s (0:02:41) ========================

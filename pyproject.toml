@@ -3,13 +3,48 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "riya-ai"
-version = "0.1.0"
-description = "RIYA - An offline-first, cross-platform personal AI assistant"
+name = "riya"
+version = "1.0.0"
+description = "RIYA - Universal Offline-First Personal AI Assistant"
+readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "Tularam" }
+    { name = "Tukaram", email = "developer@riya.ai" }
+]
+dependencies = [
+    "numpy>=1.24",
+    "sentence-transformers>=2.2",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+    "faster-whisper>=1.0",
+    "onnxruntime>=1.16",
+    "psutil>=5.9",
+    "pypdf>=3.0",
+    "openpyxl>=3.0",
+    "pillow>=9.0",
+    "chardet>=5.0",
+]
+
+[project.scripts]
+riya = "core.main:main"
+riya-ui = "core.main:main_ui"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.20",
+    "faker>=20.0",
+]
+voice = [
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+    "faster-whisper>=1.0",
+    "onnxruntime>=1.16",
 ]
 
 [tool.setuptools.packages.find]
 include = ["core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

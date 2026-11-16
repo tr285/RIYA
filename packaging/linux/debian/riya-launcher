@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# RIYA Native Linux Launcher Script
+# Resolves application root, establishes XDG storage directories, and executes core.main
+set -euo pipefail
+
+# 1. Root Execution Guard
+if [[ "$(id -u)" -eq 0 ]] && [[ "${ALLOW_ROOT:-0}" != "1" ]]; then
+    echo "[SECURITY WARNING] RIYA should not be executed as root." >&2
+    echo "Running as an ordinary user preserves filesystem security and user-data scoping." >&2
+    echo "To override this security check, set ALLOW_ROOT=1." >&2
+    exit 1
+fi
+
+# 2. Determine Application Installation Directory
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$BIN_DIR/../core" ]]; then
+    INSTALL_DIR="$(cd "$BIN_DIR/.." && pwd)"
+elif [[ -d "/opt/riya/core" ]]; then
+    INSTALL_DIR="/opt/riya"
+else
+    # Fallback to current directory or standard location
+    INSTALL_DIR="$(pwd)"
+fi
+
+# 3. Establish XDG Base Directory Storage Paths
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+USER_DATA_DIR="$XDG_DATA_HOME/riya/data"
+USER_MODELS_DIR="$XDG_DATA_HOME/riya/models"
+USER_LOGS_DIR="$XDG_DATA_HOME/riya/logs"
+USER_CACHE_DIR="$XDG_CACHE_HOME/riya"
+
+mkdir -p "$USER_DATA_DIR" "$USER_MODELS_DIR" "$USER_LOGS_DIR" "$USER_CACHE_DIR"
+
+# 4. Locate Valid Python 3 Runtime
+PY_BIN=""
+if [[ -n "${RIYA_PYTHON:-}" ]] && [[ -x "$RIYA_PYTHON" ]]; then
+    PY_BIN="$RIYA_PYTHON"
+elif [[ -x "$INSTALL_DIR/venv/bin/python3" ]]; then
+    PY_BIN="$INSTALL_DIR/venv/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+    PY_BIN="$(command -v python3)"
+elif [[ -x "/usr/bin/python3" ]]; then
+    PY_BIN="/usr/bin/python3"
+else
+    echo "Error: Python 3 runtime not found. Please install python3 (>= 3.10)." >&2
+    exit 1
+fi
+
+# 5. Export Standard Application Environment Variables
+export PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+export RIYA_ENV="${RIYA_ENV:-production}"
+export RIYA_DATA_DIR="$USER_DATA_DIR"
+export RIYA_MODELS_DIR="$USER_MODELS_DIR"
+export RIYA_LOGS_DIR="$USER_LOGS_DIR"
+export RIYA_CACHE_DIR="$USER_CACHE_DIR"
+export RIYA_APP_SUPPORT_DIR="$XDG_DATA_HOME/riya"
+
+# 6. Execute Application
+exec "$PY_BIN" -m core.main "$@"
+

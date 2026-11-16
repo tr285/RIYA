@@ -1,0 +1,21 @@
+#!/bin/sh
+# prerm script for riya
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Remove symlink from /usr/bin
+        rm -f /usr/bin/riya || true
+        ;;
+
+    upgrade|failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
+

@@ -1,0 +1,420 @@
+"""Conversational Text + Voice User Interface (framework-independent VM + Tkinter view)."""
+
+from __future__ import annotations
+
+import math
+import queue
+from dataclasses import dataclass
+from typing import Any
+
+from core.voice.audio_input import list_input_devices, list_output_devices
+from core.voice.config import (
+    RESPONSE_STYLES,
+    SUPPORTED_LANGUAGES,
+    VERIFIED_LANGUAGES,
+    VoiceConfig,
+)
+from core.voice.orchestrator import VoiceOrchestrator
+from core.voice.session import TranscriptEntry
+from core.voice.state import ACTIVE_STATES, VoiceState
+from core.voice.tts import LocalTTS
+
+
+@dataclass(frozen=True)
+class VoiceVisualSnapshot:
+    """Thread-safe snapshot consumed by GUI/CLI views."""
+
+    mode: str
+    voice_state: VoiceState
+    status_label: str
+    microphone_active: bool
+    assistant_speaking: bool
+    audio_level: float
+    waveform_bars: tuple[float, ...]
+    transcript: tuple[TranscriptEntry, ...]
+    error_message: str | None
+    can_interrupt: bool
+    config: VoiceConfig
+
+
+class VoiceUIController:
+    """Connects UI actions cleanly to ``VoiceOrchestrator`` without state leakage."""
+
+    BAR_COUNT = 24
+
+    def __init__(self, orchestrator: VoiceOrchestrator):
+        self.orchestrator = orchestrator
+        self._phase = 0.0
+
+    @staticmethod
+    def status_label_for(state: VoiceState, *, mode: str) -> str:
+        mapping = {
+            VoiceState.IDLE: "Ready (Text mode)" if mode == "text" else "Voice Ready",
+            VoiceState.LISTENING: "Listening...",
+            VoiceState.TRANSCRIBING: "Transcribing speech...",
+            VoiceState.THINKING: "Thinking...",
+            VoiceState.SPEAKING: "Speaking...",
+            VoiceState.INTERRUPTED: "Interrupted",
+            VoiceState.ERROR: "Voice Error",
+            VoiceState.STOPPING: "Stopping voice...",
+        }
+        return mapping.get(state, state.value)
+
+    @staticmethod
+    def language_options() -> list[tuple[str, str]]:
+        """Return (code, honest_display_label) pairs for settings UI."""
+
+        options: list[tuple[str, str]] = []
+        for code, name in SUPPORTED_LANGUAGES.items():
+            if code in VERIFIED_LANGUAGES:
+                options.append((code, f"{name} ({code})"))
+            else:
+                options.append((code, f"{name} ({code} - untested)"))
+        return options
+
+    def advance_waveform(self, state: VoiceState, level: float) -> tuple[float, ...]:
+        """Compute lightweight 24-bar animation envelope without busy polling."""
+
+        self._phase = (self._phase + 0.35) % (2.0 * math.pi)
+        bars: list[float] = []
+        center = (self.BAR_COUNT - 1) / 2.0
+
+        for idx in range(self.BAR_COUNT):
+            dist_scale = 1.0 - 0.55 * (abs(idx - center) / max(1.0, center))
+            if state == VoiceState.LISTENING:
+                amp = 0.14 + 0.86 * min(1.0, max(0.0, level))
+                wave = 0.5 + 0.5 * math.sin(self._phase + idx * 0.45)
+                val = amp * dist_scale * (0.45 + 0.55 * wave)
+            elif state == VoiceState.SPEAKING:
+                amp = 0.22 + 0.78 * min(1.0, max(0.15, level))
+                wave = 0.5 + 0.5 * math.sin(self._phase * 1.4 + idx * 0.55)
+                val = amp * dist_scale * (0.40 + 0.60 * wave)
+            elif state in (VoiceState.TRANSCRIBING, VoiceState.THINKING):
+                pulse = 0.5 + 0.5 * math.sin(self._phase * 0.9 - idx * 0.35)
+                val = 0.15 + 0.35 * pulse * dist_scale
+            elif state == VoiceState.IDLE:
+                val = 0.08 * dist_scale
+            else:
+                val = 0.05
+            bars.append(round(max(0.04, min(1.0, val)), 3))
+        return tuple(bars)
+
+    def snapshot(self) -> VoiceVisualSnapshot:
+        state = self.orchestrator.state
+        mode = self.orchestrator.mode
+        mic_active = self.orchestrator.session.microphone_active
+        speaking = state == VoiceState.SPEAKING or self.orchestrator.player.is_playing
+        if speaking:
+            level = self.orchestrator.player.current_level
+        elif mic_active:
+            level = self.orchestrator.session.microphone_level
+        else:
+            level = 0.0
+
+        return VoiceVisualSnapshot(
+            mode=mode,
+            voice_state=state,
+            status_label=self.status_label_for(state, mode=mode),
+            microphone_active=mic_active,
+            assistant_speaking=speaking,
+            audio_level=level,
+            waveform_bars=self.advance_waveform(state, level),
+            transcript=tuple(self.orchestrator.session.transcript_entries()),
+            error_message=self.orchestrator.last_error,
+            can_interrupt=state in (VoiceState.SPEAKING, VoiceState.THINKING),
+            config=self.orchestrator.config,
+        )
+
+    def submit_text(self, text: str) -> str:
+        return self.orchestrator.send_text(text)
+
+    def toggle_voice_mode(self) -> str:
+        target = "text" if self.orchestrator.mode == "voice" else "voice"
+        return self.orchestrator.switch_mode(target)
+
+    def stop_voice(self) -> None:
+        self.orchestrator.stop_voice_mode()
+
+    def interrupt(self) -> None:
+        self.orchestrator.interrupt("user_ui_interrupt")
+
+    def apply_settings(self, **changes: Any) -> VoiceConfig:
+        new_cfg = self.orchestrator.config.updated(**changes)
+        self.orchestrator.update_config(new_cfg)
+        new_cfg.save()
+        return new_cfg
+
+
+def launch_voice_gui(orchestrator: VoiceOrchestrator) -> None:
+    """Launch RIYA's offline macOS desktop conversation window (Tkinter)."""
+
+    import tkinter as tk
+    from tkinter import ttk
+
+    controller = VoiceUIController(orchestrator)
+    root = tk.Tk()
+    root.title("RIYA — Offline Voice & Text Assistant")
+    root.geometry("820x640")
+    root.configure(bg="#11141a")
+
+    ui_events: queue.Queue[str] = queue.Queue()
+    orchestrator.add_observer(lambda: ui_events.put("refresh"))
+
+    # ---- Header / Mode bar ----------------------------------------------
+    top = tk.Frame(root, bg="#181d26", pady=10, padx=14)
+    top.pack(fill=tk.X)
+
+    title_lbl = tk.Label(
+        top,
+        text="RIYA",
+        fg="#f3f6fb",
+        bg="#181d26",
+        font=("Helvetica", 16, "bold"),
+    )
+    title_lbl.pack(side=tk.LEFT)
+
+    status_var = tk.StringVar(value="Ready (Text mode)")
+    mic_var = tk.StringVar(value="MIC OFF")
+    mic_lbl = tk.Label(
+        top,
+        textvariable=mic_var,
+        fg="#98a2b3",
+        bg="#232a36",
+        padx=10,
+        pady=4,
+        font=("Helvetica", 10, "bold"),
+    )
+    mic_lbl.pack(side=tk.LEFT, padx=(14, 8))
+
+    status_lbl = tk.Label(
+        top,
+        textvariable=status_var,
+        fg="#cbd5e1",
+        bg="#181d26",
+        font=("Helvetica", 11),
+    )
+    status_lbl.pack(side=tk.LEFT, padx=4)
+
+    settings_btn = ttk.Button(top, text="Settings")
+    settings_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    mode_btn_var = tk.StringVar(value="Start Voice")
+    mode_btn = ttk.Button(top, textvariable=mode_btn_var)
+    mode_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    interrupt_btn = ttk.Button(top, text="Interrupt")
+    interrupt_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    # ---- Active voice waveform card -------------------------------------
+    wave_frame = tk.Frame(root, bg="#151a22", pady=8, padx=14)
+    wave_frame.pack(fill=tk.X)
+    canvas = tk.Canvas(
+        wave_frame,
+        height=72,
+        bg="#151a22",
+        highlightthickness=0,
+    )
+    canvas.pack(fill=tk.X)
+
+    err_var = tk.StringVar(value="")
+    err_lbl = tk.Label(
+        root,
+        textvariable=err_var,
+        fg="#fca5a5",
+        bg="#11141a",
+        font=("Helvetica", 10),
+    )
+    err_lbl.pack(fill=tk.X, padx=14)
+
+    # ---- Conversation transcript ----------------------------------------
+    transcript_box = tk.Text(
+        root,
+        wrap=tk.WORD,
+        bg="#0d1015",
+        fg="#e2e8f0",
+        insertbackground="#e2e8f0",
+        relief=tk.FLAT,
+        padx=14,
+        pady=12,
+        font=("Helvetica", 12),
+        state=tk.DISABLED,
+    )
+    transcript_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=(4, 10))
+    transcript_box.tag_configure("user", foreground="#7dd3fc")
+    transcript_box.tag_configure("assistant", foreground="#e2e8f0")
+    transcript_box.tag_configure("meta", foreground="#64748b", font=("Helvetica", 9))
+
+    # ---- Text input bar -------------------------------------------------
+    bottom = tk.Frame(root, bg="#11141a", padx=14, pady=12)
+    bottom.pack(fill=tk.X)
+
+    entry = tk.Entry(
+        bottom,
+        bg="#1b212c",
+        fg="#f8fafc",
+        insertbackground="#f8fafc",
+        relief=tk.FLAT,
+        font=("Helvetica", 12),
+    )
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 8))
+
+    def _on_send(_event=None):
+        text = entry.get().strip()
+        if not text:
+            return
+        entry.delete(0, tk.END)
+        controller.submit_text(text)
+        _render()
+
+    send_btn = ttk.Button(bottom, text="Send", command=_on_send)
+    send_btn.pack(side=tk.RIGHT)
+    entry.bind("<Return>", _on_send)
+
+    def _on_toggle_voice():
+        try:
+            controller.toggle_voice_mode()
+        except Exception as exc:
+            err_var.set(str(exc))
+        _render()
+
+    mode_btn.configure(command=_on_toggle_voice)
+    interrupt_btn.configure(command=lambda: (controller.interrupt(), _render()))
+
+    def _open_settings():
+        win = tk.Toplevel(root)
+        win.title("Voice Settings")
+        win.geometry("460x430")
+        win.configure(bg="#181d26")
+
+        cfg = orchestrator.config
+        in_devs = ["Default"] + [d.name for d in list_input_devices()]
+        out_devs = ["Default"] + [d.name for d in list_output_devices()]
+        lang_opts = controller.language_options()
+        lang_labels = [lbl for _, lbl in lang_opts]
+        lang_codes = [code for code, _ in lang_opts]
+        voice_names = sorted({cfg.voice} | {v["name"] for v in LocalTTS.list_voices()})
+
+        fields_data: list[tuple[str, Any]] = []
+
+        def _row(label_text: str, widget_fn):
+            row = tk.Frame(win, bg="#181d26", pady=4, padx=14)
+            row.pack(fill=tk.X)
+            tk.Label(row, text=label_text, fg="#cbd5e1", bg="#181d26", width=18, anchor="w").pack(side=tk.LEFT)
+            w = widget_fn(row)
+            w.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            fields_data.append((label_text, w))
+
+        in_var = tk.StringVar(value=str(cfg.input_device or "Default"))
+        out_var = tk.StringVar(value=str(cfg.output_device or "Default"))
+        lang_idx = lang_codes.index(cfg.language) if cfg.language in lang_codes else 0
+        lang_var = tk.StringVar(value=lang_labels[lang_idx])
+        voice_var = tk.StringVar(value=cfg.voice)
+        rate_var = tk.IntVar(value=cfg.speech_rate_wpm)
+        vol_var = tk.DoubleVar(value=cfg.volume)
+        style_var = tk.StringVar(value=cfg.response_style)
+        resp_var = tk.BooleanVar(value=cfg.voice_responses_enabled)
+
+        _row("Input Device", lambda p: ttk.Combobox(p, textvariable=in_var, values=in_devs, state="readonly"))
+        _row("Output Device", lambda p: ttk.Combobox(p, textvariable=out_var, values=out_devs, state="readonly"))
+        _row("Language", lambda p: ttk.Combobox(p, textvariable=lang_var, values=lang_labels, state="readonly"))
+        _row("Voice", lambda p: ttk.Combobox(p, textvariable=voice_var, values=voice_names, state="readonly"))
+        _row("Response Style", lambda p: ttk.Combobox(p, textvariable=style_var, values=list(RESPONSE_STYLES), state="readonly"))
+        _row("Speed (WPM)", lambda p: tk.Scale(p, from_=110, to=300, orient=tk.HORIZONTAL, variable=rate_var, bg="#181d26", fg="#f8fafc"))
+        _row("Volume", lambda p: tk.Scale(p, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, variable=vol_var, bg="#181d26", fg="#f8fafc"))
+
+        chk_row = tk.Frame(win, bg="#181d26", pady=6, padx=14)
+        chk_row.pack(fill=tk.X)
+        tk.Checkbutton(
+            chk_row,
+            text="Enable spoken voice responses",
+            variable=resp_var,
+            bg="#181d26",
+            fg="#f8fafc",
+            selectcolor="#11141a",
+        ).pack(anchor="w")
+
+        def _save():
+            sel_lang = lang_codes[lang_labels.index(lang_var.get())]
+            controller.apply_settings(
+                input_device=None if in_var.get() == "Default" else in_var.get(),
+                output_device=None if out_var.get() == "Default" else out_var.get(),
+                language=sel_lang,
+                voice=voice_var.get(),
+                response_style=style_var.get(),
+                speech_rate_wpm=int(rate_var.get()),
+                volume=float(vol_var.get()),
+                voice_responses_enabled=bool(resp_var.get()),
+            )
+            win.destroy()
+            _render()
+
+        ttk.Button(win, text="Save Settings", command=_save).pack(pady=14)
+
+    settings_btn.configure(command=_open_settings)
+
+    last_rendered_count = -1
+
+    def _render() -> None:
+        nonlocal last_rendered_count
+        snap = controller.snapshot()
+        status_var.set(snap.status_label)
+        err_var.set(snap.error_message or "")
+
+        if snap.microphone_active:
+            mic_var.set("MIC LIVE")
+            mic_lbl.configure(fg="#10b981", bg="#14332a")
+        else:
+            mic_var.set("MIC OFF")
+            mic_lbl.configure(fg="#98a2b3", bg="#232a36")
+
+        mode_btn_var.set("Stop Voice" if snap.mode == "voice" else "Start Voice")
+        interrupt_btn.configure(state=tk.NORMAL if snap.can_interrupt else tk.DISABLED)
+
+        # Draw 24-bar audio waveform without excessive redraw cost.
+        canvas.delete("all")
+        w = max(240, canvas.winfo_width() or 780)
+        h = 72
+        bar_w = max(4, (w - 40) // (len(snap.waveform_bars) * 2))
+        gap = bar_w
+        color = "#38bdf8" if snap.assistant_speaking else ("#34d399" if snap.microphone_active else "#475569")
+        start_x = (w - len(snap.waveform_bars) * (bar_w + gap)) // 2
+        for idx, amp in enumerate(snap.waveform_bars):
+            bh = max(4, int(amp * (h - 14)))
+            x0 = start_x + idx * (bar_w + gap)
+            y0 = (h - bh) // 2
+            canvas.create_rectangle(x0, y0, x0 + bar_w, y0 + bh, fill=color, outline="")
+
+        if len(snap.transcript) != last_rendered_count:
+            last_rendered_count = len(snap.transcript)
+            transcript_box.configure(state=tk.NORMAL)
+            transcript_box.delete("1.0", tk.END)
+            for item in snap.transcript:
+                tag = "user" if item.role == "user" else "assistant"
+                speaker = "You" if item.role == "user" else "RIYA"
+                transcript_box.insert(tk.END, f"{speaker} [{item.modality}]: ", (tag,))
+                transcript_box.insert(tk.END, f"{item.text}\n", (tag,))
+            transcript_box.see(tk.END)
+            transcript_box.configure(state=tk.DISABLED)
+
+    def _tick() -> None:
+        drained = False
+        while True:
+            try:
+                ui_events.get_nowait()
+                drained = True
+            except queue.Empty:
+                break
+        if drained or orchestrator.state in ACTIVE_STATES:
+            _render()
+        # Low-power interval when idle; smooth 15 fps only while active.
+        interval_ms = 66 if orchestrator.state in ACTIVE_STATES else 350
+        root.after(interval_ms, _tick)
+
+    def _on_close() -> None:
+        orchestrator.close()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+    _render()
+    root.after(100, _tick)
+    root.mainloop()

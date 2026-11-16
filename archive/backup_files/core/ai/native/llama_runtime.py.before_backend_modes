@@ -1,0 +1,93 @@
+import ctypes
+from pathlib import Path
+
+
+class NativeLlamaRuntime:
+    def __init__(self, model_path: str, context_size: int = 4096):
+        project_root = Path(__file__).resolve().parents[3]
+
+        bridge_path = (
+            project_root
+            / "core"
+            / "ai"
+            / "native"
+            / "bridge"
+            / "libriya_llama.dylib"
+        )
+
+        if not bridge_path.exists():
+            raise FileNotFoundError(
+                f"RIYA native bridge not found: {bridge_path}"
+            )
+
+        self.lib = ctypes.CDLL(str(bridge_path))
+
+        self.lib.riya_load_model.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int32,
+        ]
+        self.lib.riya_load_model.restype = ctypes.c_void_p
+
+        self.lib.riya_free_model.argtypes = [
+            ctypes.c_void_p,
+        ]
+        self.lib.riya_free_model.restype = None
+
+        self.lib.riya_generate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+        ]
+        self.lib.riya_generate.restype = ctypes.c_int
+
+        model_path = Path(model_path).expanduser().resolve()
+
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Model not found: {model_path}"
+            )
+
+        self.handle = self.lib.riya_load_model(
+            str(model_path).encode(),
+            context_size,
+        )
+
+        if not self.handle:
+            raise RuntimeError("RIYA failed to load the local model.")
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+    ) -> str:
+
+        output_size = 16384
+        output = ctypes.create_string_buffer(output_size)
+
+        result = self.lib.riya_generate(
+            self.handle,
+            prompt.encode("utf-8"),
+            output,
+            output_size,
+            max_tokens,
+        )
+
+        if result < 0:
+            raise RuntimeError(
+                f"RIYA generation failed with code {result}"
+            )
+
+        return output.value.decode("utf-8", errors="replace").strip()
+
+    def close(self):
+        if self.handle:
+            self.lib.riya_free_model(self.handle)
+            self.handle = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

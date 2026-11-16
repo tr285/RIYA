@@ -1,0 +1,118 @@
+"""RIYA interactive entry point supporting seamless text, voice CLI, and desktop UI."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from core.agent.assistant import RIYAAssistant
+from core.config.settings import APP_NAME, APP_VERSION, DEVELOPER_NAME
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} Offline Assistant")
+    parser.add_argument("--voice", action="store_true", help="Start directly in voice conversation mode")
+    parser.add_argument("--ui", action="store_true", help="Launch desktop conversation UI")
+    args = parser.parse_args(argv)
+
+    assistant = RIYAAssistant()
+
+    if args.ui:
+        from core.voice.config import VoiceConfig
+        from core.voice.orchestrator import VoiceOrchestrator
+        from core.voice.ui import launch_voice_gui
+
+        cfg = VoiceConfig.load()
+        orchestrator = VoiceOrchestrator(assistant, config=cfg)
+        try:
+            launch_voice_gui(orchestrator)
+        finally:
+            orchestrator.close()
+            assistant.close()
+        return
+
+    print("=" * 50)
+    print(f"{APP_NAME} {APP_VERSION}")
+    print(f"Developer: {DEVELOPER_NAME}")
+    print("=" * 50)
+    print("RIYA is ready. Commands: /voice, /text, /interrupt, /status, /settings, or 'exit'.\n")
+
+    orchestrator = None
+
+    def _get_orchestrator():
+        nonlocal orchestrator
+        if orchestrator is None:
+            from core.voice.config import VoiceConfig
+            from core.voice.orchestrator import VoiceOrchestrator
+
+            orchestrator = VoiceOrchestrator(assistant, config=VoiceConfig.load())
+        return orchestrator
+
+    try:
+        if args.voice:
+            orch = _get_orchestrator()
+            orch.switch_mode("voice")
+            print("[Voice mode ON - Microphone active. Type /text or /interrupt anytime.]")
+
+        while True:
+            try:
+                user = input("You: ").strip()
+            except EOFError:
+                break
+
+            if not user:
+                continue
+
+            lower = user.lower()
+            if lower in {"exit", "quit", "stop"}:
+                response = assistant.process(user)
+                print(f"RIYA: {response}")
+                break
+
+            if lower == "/voice":
+                orch = _get_orchestrator()
+                orch.switch_mode("voice")
+                print("[Voice mode ON - Microphone active]")
+                continue
+
+            if lower == "/text":
+                if orchestrator is not None:
+                    orchestrator.switch_mode("text")
+                print("[Text mode ON - Microphone off]")
+                continue
+
+            if lower == "/interrupt":
+                if orchestrator is not None:
+                    orchestrator.interrupt("cli_interrupt")
+                    print("[Playback interrupted]")
+                continue
+
+            if lower == "/status":
+                if orchestrator is None:
+                    print("[mode=text voice_state=idle mic=OFF]")
+                else:
+                    print(
+                        f"[mode={orchestrator.mode} voice_state={orchestrator.state.value} "
+                        f"mic={'LIVE' if orchestrator.session.microphone_active else 'OFF'}]"
+                    )
+                continue
+
+            if lower == "/settings":
+                orch = _get_orchestrator()
+                print(orch.config.to_dict())
+                continue
+
+            if orchestrator is not None:
+                response = orchestrator.send_text(user)
+            else:
+                response = assistant.process(user)
+
+            print(f"RIYA: {response}")
+    finally:
+        if orchestrator is not None:
+            orchestrator.close()
+        assistant.close()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

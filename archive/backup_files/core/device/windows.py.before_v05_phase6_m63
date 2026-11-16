@@ -1,0 +1,362 @@
+"""Windows platform adapter contract for RIYA (explicitly unsupported until Windows native verification)."""
+
+from __future__ import annotations
+
+import json
+import os
+import platform as _py_platform
+import sys
+
+from core.device.platform import (
+    ApplicationAdapter,
+    CapabilityDescriptor,
+    ClipboardAdapter,
+    FilesystemAdapter,
+    NotificationAdapter,
+    PlatformAdapter,
+    PlatformCapabilities,
+    PlatformInfo,
+    PlatformOperationResult,
+    SystemInformationAdapter,
+    UnsupportedPlatformCapabilityError,
+    WindowManagerAdapter,
+    make_unsupported_result,
+)
+
+
+_WINDOWS_UNSUPPORTED_REASON = (
+    "Windows native OS integration is not yet implemented or verified in RIYA v0.5 Milestone 6.2."
+)
+
+_WINDOWS_CAPABILITIES: tuple[CapabilityDescriptor, ...] = tuple(
+    CapabilityDescriptor(
+        capability=cap,
+        supported=False,
+        required_permission=perm,
+        description=f"Windows adapter contract for '{cap}'.",
+        reason_if_unsupported=_WINDOWS_UNSUPPORTED_REASON,
+    )
+    for cap, perm in (
+        ("system_info", "system.info"),
+        ("storage_info", "system.info"),
+        ("battery_status", "system.info"),
+        ("network_status", "system.info"),
+        ("app_discovery", "system.info"),
+        ("app_launch", "system.open_app"),
+        ("app_close", "system.close_app"),
+        ("app_focus", "desktop.automate"),
+        ("file_discovery", "filesystem.read"),
+        ("file_metadata", "filesystem.read"),
+        ("clipboard_read", "system.clipboard"),
+        ("clipboard_write", "system.clipboard"),
+        ("local_notification", "system.notification"),
+        ("window_inspection", "desktop.automate"),
+        ("screenshot", "system.screenshot"),
+        ("volume_control", "system.volume"),
+        ("screen_lock", "system.lock_screen"),
+    )
+)
+
+
+class WindowsSystemInformationAdapter(SystemInformationAdapter):
+    def get_system_info(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="system_info",
+            operation="get_system_info",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def get_storage_info(self, path: str = "/") -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="storage_info",
+            operation="get_storage_info",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def get_battery_status(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="battery_status",
+            operation="get_battery_status",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def get_network_status(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="network_status",
+            operation="get_network_status",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsApplicationAdapter(ApplicationAdapter):
+    def discover_applications(self, filter_text: str = "") -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_discovery",
+            operation="discover_applications",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def resolve_application(self, app_name: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_discovery",
+            operation="resolve_application",
+            required_permission="system.info",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def launch_application(self, app_name: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_launch",
+            operation="launch_application",
+            required_permission="system.open_app",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def close_application(self, app_name: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_close",
+            operation="close_application",
+            required_permission="system.close_app",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def list_running_applications(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_discovery",
+            operation="list_running_applications",
+            required_permission="desktop.automate",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsFilesystemAdapter(FilesystemAdapter):
+    def discover_files(self, path: str = ".") -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="file_discovery",
+            operation="discover_files",
+            required_permission="filesystem.read",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def search_files(self, name: str, path: str | None = None) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="file_discovery",
+            operation="search_files",
+            required_permission="filesystem.read",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def inspect_metadata(self, path: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="file_metadata",
+            operation="inspect_metadata",
+            required_permission="filesystem.read",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsClipboardAdapter(ClipboardAdapter):
+    def read_clipboard(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="clipboard_read",
+            operation="read_clipboard",
+            required_permission="system.clipboard",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def write_clipboard(self, text: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="clipboard_write",
+            operation="write_clipboard",
+            required_permission="system.clipboard",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsNotificationAdapter(NotificationAdapter):
+    def send_notification(
+        self,
+        title: str,
+        message: str,
+        subtitle: str = "",
+    ) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="local_notification",
+            operation="send_notification",
+            required_permission="system.notification",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsWindowManagerAdapter(WindowManagerAdapter):
+    def get_active_window_info(self) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="window_inspection",
+            operation="get_active_window_info",
+            required_permission="desktop.automate",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def focus_application(self, app_name: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="app_focus",
+            operation="focus_application",
+            required_permission="desktop.automate",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+    def get_application_state(self, app_name: str) -> PlatformOperationResult:
+        return make_unsupported_result(
+            platform_name="windows",
+            capability="window_inspection",
+            operation="get_application_state",
+            required_permission="desktop.automate",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+        )
+
+
+class WindowsPlatform(PlatformAdapter):
+    """Architecture-level Windows adapter contract with no silent fallback."""
+
+    platform_name = "windows"
+
+    def __init__(self) -> None:
+        self._sys_info = WindowsSystemInformationAdapter()
+        self._apps = WindowsApplicationAdapter()
+        self._fs = WindowsFilesystemAdapter()
+        self._clipboard = WindowsClipboardAdapter()
+        self._notifications = WindowsNotificationAdapter()
+        self._windows = WindowsWindowManagerAdapter()
+
+    @property
+    def system_info_adapter(self) -> SystemInformationAdapter:
+        return self._sys_info
+
+    @property
+    def application_adapter(self) -> ApplicationAdapter:
+        return self._apps
+
+    @property
+    def filesystem_adapter(self) -> FilesystemAdapter:
+        return self._fs
+
+    @property
+    def clipboard_adapter(self) -> ClipboardAdapter:
+        return self._clipboard
+
+    @property
+    def notification_adapter(self) -> NotificationAdapter:
+        return self._notifications
+
+    @property
+    def window_adapter(self) -> WindowManagerAdapter:
+        return self._windows
+
+    def platform_info(self) -> PlatformInfo:
+        cores = int(os.cpu_count() or 1)
+        return PlatformInfo(
+            os_name="windows",
+            system="Windows",
+            os_version=_py_platform.release() if sys.platform.startswith("win") else "unverified",
+            build_version=_py_platform.version() if sys.platform.startswith("win") else "",
+            architecture=_py_platform.machine() or "x86_64",
+            machine_model="Windows PC",
+            cpu_brand=_py_platform.processor() or "x86_64",
+            cpu_cores_logical=cores,
+            cpu_cores_physical=cores,
+            is_supported=False,
+        )
+
+    def capabilities(self) -> PlatformCapabilities:
+        return PlatformCapabilities(
+            platform_name="windows",
+            platform_available=False,
+            descriptors=_WINDOWS_CAPABILITIES,
+        )
+
+    def platform_capabilities_summary(self) -> str:
+        return json.dumps(self.status_summary(), ensure_ascii=False)
+
+    def _raise_unsupported(self, capability: str, permission: str) -> str:
+        raise UnsupportedPlatformCapabilityError(
+            capability=capability,
+            platform_name="windows",
+            reason=_WINDOWS_UNSUPPORTED_REASON,
+            required_permission=permission,
+        )
+
+    def open_application(self, app_name: str) -> str:
+        return self._raise_unsupported("app_launch", "system.open_app")
+
+    def close_application(self, app_name: str) -> str:
+        return self._raise_unsupported("app_close", "system.close_app")
+
+    def take_screenshot(self) -> str:
+        return self._raise_unsupported("screenshot", "system.screenshot")
+
+    def current_time(self) -> str:
+        return self._raise_unsupported("system_info", "system.info")
+
+    def set_volume(self, level: int) -> str:
+        return self._raise_unsupported("volume_control", "system.volume")
+
+    def mute_volume(self) -> str:
+        return self._raise_unsupported("volume_control", "system.volume")
+
+    def unmute_volume(self) -> str:
+        return self._raise_unsupported("volume_control", "system.volume")
+
+    def battery_status(self) -> str:
+        return self._raise_unsupported("battery_status", "system.info")
+
+    def system_information(self) -> str:
+        return self._raise_unsupported("system_info", "system.info")
+
+    def lock_screen(self) -> str:
+        return self._raise_unsupported("screen_lock", "system.lock_screen")
+
+    def storage_status(self, path: str = "/") -> str:
+        return self._raise_unsupported("storage_info", "system.info")
+
+    def network_status(self) -> str:
+        return self._raise_unsupported("network_status", "system.info")
+
+    def check_application(self, app_name: str = "") -> str:
+        return self._raise_unsupported("app_discovery", "system.info")
+
+    def inspect_file_metadata(self, path: str) -> str:
+        return self._raise_unsupported("file_metadata", "filesystem.read")
+
+    def clipboard_read(self) -> str:
+        return self._raise_unsupported("clipboard_read", "system.clipboard")
+
+    def clipboard_write(self, text: str) -> str:
+        return self._raise_unsupported("clipboard_write", "system.clipboard")
+
+    def send_notification(self, title: str, message: str, subtitle: str = "") -> str:
+        return self._raise_unsupported("local_notification", "system.notification")
+
+    def active_window_info(self) -> str:
+        return self._raise_unsupported("window_inspection", "desktop.automate")

@@ -1,0 +1,648 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from core.ai.safety import strip_unsafe_control_chars
+from core.identity.context import get_current_execution_context
+from core.identity.errors import InvalidIdentityError, MissingIdentityError
+from core.identity.models import AuthenticatedIdentity, UserProfile
+from core.memory.database import MemoryDatabase
+
+
+MAX_MEMORY_CATEGORY_CHARS = 64
+MAX_MEMORY_KEY_CHARS = 128
+MAX_MEMORY_VALUE_CHARS = 2000
+MAX_MEMORY_SEARCH_RESULTS = 50
+MAX_MEMORY_LIST_RESULTS = 100
+
+_UNSET = object()
+
+
+class MemoryManager:
+    """SQLite-backed long-term memory manager with fail-closed multi-user isolation."""
+
+    def __init__(
+        self,
+        database=None,
+        *,
+        user_id: str | None | object = _UNSET,
+        identity: Any = _UNSET,
+        identity_manager: Any = None,
+        require_user: bool = False,
+    ):
+        self.database = database or MemoryDatabase()
+        self.identity_manager = identity_manager
+        self.require_user = bool(require_user)
+        self._explicit_user_id_provided = user_id is not _UNSET
+        self._explicit_identity_provided = identity is not _UNSET
+        self._user_id: str | None = None if user_id is _UNSET else user_id  # type: ignore[assignment]
+        self._identity: Any = None if identity is _UNSET else identity
+
+        if self._explicit_identity_provided:
+            self._validate_explicit_identity_object(self._identity)
+        if self._explicit_user_id_provided:
+            self._validate_raw_user_id(self._user_id)
+
+    @staticmethod
+    def _validate_explicit_identity_object(identity: Any) -> AuthenticatedIdentity:
+        if identity is None:
+            raise MissingIdentityError("Authenticated user identity is required.")
+        if isinstance(identity, UserProfile):
+            raise InvalidIdentityError(
+                "A UserProfile cannot be used as an authenticated memory identity."
+            )
+        if not isinstance(identity, AuthenticatedIdentity):
+            raise InvalidIdentityError(
+                "Invalid identity object; expected AuthenticatedIdentity."
+            )
+        return identity
+
+    @staticmethod
+    def _validate_raw_user_id(user_id: Any) -> str:
+        if user_id is None or (isinstance(user_id, str) and not user_id.strip()):
+            raise MissingIdentityError("Non-empty user_id is required.")
+        if not isinstance(user_id, str):
+            raise InvalidIdentityError("user_id must be a valid string.")
+        return user_id.strip()
+
+    def for_identity(
+        self,
+        identity: AuthenticatedIdentity,
+        *,
+        identity_manager: Any | None = None,
+    ) -> "MemoryManager":
+        """Create a MemoryManager strictly bound to a validated user session."""
+        mgr = identity_manager if identity_manager is not None else self.identity_manager
+        validated = self._validate_explicit_identity_object(identity)
+        if mgr is not None:
+            validated = mgr.validate_session(validated)
+        return MemoryManager(
+            self.database,
+            identity=validated,
+            identity_manager=mgr,
+            require_user=True,
+        )
+
+    def _assert_active_user_exists(self, user_id: str) -> None:
+        conn = self.database.connect()
+        try:
+            row = conn.execute(
+                "SELECT is_active FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None or not bool(row["is_active"]):
+                raise InvalidIdentityError(
+                    f"User '{user_id}' does not exist or is inactive."
+                )
+        finally:
+            conn.close()
+
+    def _resolve_user_id(self) -> str | None:
+        """Resolve the authoritative user_id or fail closed in multi-user mode."""
+        ctx = get_current_execution_context()
+
+        if self._explicit_identity_provided:
+            validated = self._validate_explicit_identity_object(self._identity)
+            if self.identity_manager is not None:
+                validated = self.identity_manager.validate_session(validated)
+            else:
+                if datetime.fromisoformat(validated.expires_at) <= datetime.now(timezone.utc):
+                    raise InvalidIdentityError("Authenticated identity has expired.")
+                self._assert_active_user_exists(validated.user_id)
+            if ctx is not None and ctx.user_id != validated.user_id:
+                raise InvalidIdentityError(
+                    "Cross-user memory access blocked by execution context."
+                )
+            return validated.user_id
+
+        if self._explicit_user_id_provided:
+            if self.identity_manager is not None:
+                raise MissingIdentityError(
+                    "AuthenticatedIdentity is required when identity_manager is configured."
+                )
+            scoped = self._validate_raw_user_id(self._user_id)
+            if ctx is not None and ctx.user_id != scoped:
+                raise InvalidIdentityError(
+                    "Cross-user memory access blocked by execution context."
+                )
+            self._assert_active_user_exists(scoped)
+            return scoped
+
+        if ctx is not None:
+            if self.identity_manager is not None and ctx.identity is not None:
+                validated = self.identity_manager.validate_session(ctx.identity)
+                return validated.user_id
+            if not isinstance(ctx.user_id, str) or not ctx.user_id.strip():
+                raise MissingIdentityError("Invalid execution context user_id.")
+            return ctx.user_id
+
+        if (
+            self.require_user
+            or self.identity_manager is not None
+            or self.database.has_registered_users()
+        ):
+            raise MissingIdentityError(
+                "Authenticated user context is required for memory access."
+            )
+
+        # Single-userless v0.4 compatibility mode only when 0 users are registered.
+        return None
+
+    @staticmethod
+    def _validate_identifier(
+        value: str,
+        field_name: str,
+        max_chars: int,
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"Memory {field_name} must be a string.")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(
+                f"Memory {field_name} contains unsafe control characters."
+            )
+        cleaned = strip_unsafe_control_chars(value, allow_newlines=False).strip()
+        if not cleaned:
+            raise ValueError(f"Memory {field_name} cannot be empty.")
+        if len(cleaned) > max_chars:
+            raise ValueError(
+                f"Memory {field_name} exceeds maximum length ({max_chars})."
+            )
+        return cleaned
+
+    def remember(
+        self,
+        category: str,
+        key: str,
+        value: str,
+    ) -> str:
+        user_id = self._resolve_user_id()
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        if not isinstance(value, str):
+            raise ValueError("Memory value must be a string.")
+        value = strip_unsafe_control_chars(value, allow_newlines=True).strip()
+        if not value:
+            raise ValueError("Memory value cannot be empty.")
+        if len(value) > MAX_MEMORY_VALUE_CHARS:
+            raise ValueError(
+                f"Memory value exceeds maximum length ({MAX_MEMORY_VALUE_CHARS})."
+            )
+
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                connection.execute(
+                    """
+                    INSERT INTO memories (
+                        user_id,
+                        legacy_unclaimed,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (NULL, 0, ?, ?, ?, ?, ?)
+                    ON CONFLICT(category, key) WHERE user_id IS NULL
+                    DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (category, key, value, now_ts, now_ts),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO memories (
+                        user_id,
+                        legacy_unclaimed,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, 0, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, category, key)
+                    DO UPDATE SET
+                        value = excluded.value,
+                        legacy_unclaimed = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (user_id, category, key, value, now_ts, now_ts),
+                )
+            connection.commit()
+
+        return f"Remembered '{key}' under '{category}'."
+
+    def update_memory(
+        self,
+        category: str,
+        key: str,
+        value: str,
+    ) -> bool:
+        user_id = self._resolve_user_id()
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+        if not isinstance(value, str):
+            raise ValueError("Memory value must be a string.")
+        value = strip_unsafe_control_chars(value, allow_newlines=True).strip()
+        if not value:
+            raise ValueError("Memory value cannot be empty.")
+        if len(value) > MAX_MEMORY_VALUE_CHARS:
+            raise ValueError(
+                f"Memory value exceeds maximum length ({MAX_MEMORY_VALUE_CHARS})."
+            )
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE memories
+                    SET value = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id IS NULL
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (value, category, key),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE memories
+                    SET value = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (value, user_id, category, key),
+                )
+            connection.commit()
+
+        return cursor.rowcount > 0
+
+    def recall(
+        self,
+        category: str,
+        key: str,
+    ) -> str | None:
+        user_id = self._resolve_user_id()
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                row = connection.execute(
+                    """
+                    SELECT value
+                    FROM memories
+                    WHERE user_id IS NULL
+                      AND legacy_unclaimed = 0
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (category, key),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT value
+                    FROM memories
+                    WHERE user_id = ?
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (user_id, category, key),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        return row["value"]
+
+    def search(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = MAX_MEMORY_SEARCH_RESULTS,
+    ) -> list[dict]:
+        user_id = self._resolve_user_id()
+        if not isinstance(query, str):
+            raise ValueError("Memory search query must be a string.")
+
+        query = strip_unsafe_control_chars(query, allow_newlines=False).strip()
+
+        if not query:
+            return []
+
+        if len(query) > MAX_MEMORY_KEY_CHARS * 2:
+            query = query[: MAX_MEMORY_KEY_CHARS * 2]
+
+        limit = max(1, min(int(limit), MAX_MEMORY_SEARCH_RESULTS))
+
+        category_value = (
+            self._validate_identifier(
+                category,
+                "category",
+                MAX_MEMORY_CATEGORY_CHARS,
+            )
+            if category is not None
+            else None
+        )
+
+        words = [word.lower() for word in query.split() if len(word) >= 2]
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                if category_value is None:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id IS NULL AND legacy_unclaimed = 0
+                        ORDER BY updated_at DESC, id DESC
+                        """
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id IS NULL
+                          AND legacy_unclaimed = 0
+                          AND category = ?
+                        ORDER BY updated_at DESC, id DESC
+                        """,
+                        (category_value,),
+                    ).fetchall()
+            else:
+                if category_value is None:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id = ?
+                        ORDER BY updated_at DESC, id DESC
+                        """,
+                        (user_id,),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id = ? AND category = ?
+                        ORDER BY updated_at DESC, id DESC
+                        """,
+                        (user_id, category_value),
+                    ).fetchall()
+
+        memories = [dict(row) for row in rows]
+
+        if not words:
+            return memories[:limit]
+
+        matches = []
+        for memory in memories:
+            searchable = " ".join(
+                [memory["category"], memory["key"], memory["value"]]
+            ).lower()
+            score = sum(1 for word in words if word in searchable)
+            if score > 0:
+                memory["_score"] = score
+                matches.append(memory)
+
+        matches.sort(
+            key=lambda item: (item["_score"], item["updated_at"], item["id"]),
+            reverse=True,
+        )
+
+        for memory in matches:
+            memory.pop("_score", None)
+
+        return matches[:limit]
+
+    def list_memories(
+        self,
+        category: str | None = None,
+        limit: int = MAX_MEMORY_LIST_RESULTS,
+    ) -> list[dict]:
+        user_id = self._resolve_user_id()
+        if category is not None:
+            category = self._validate_identifier(
+                category,
+                "category",
+                MAX_MEMORY_CATEGORY_CHARS,
+            )
+
+        limit = max(1, min(int(limit), MAX_MEMORY_LIST_RESULTS))
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                if category is None:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id IS NULL AND legacy_unclaimed = 0
+                        ORDER BY category, key
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id IS NULL
+                          AND legacy_unclaimed = 0
+                          AND category = ?
+                        ORDER BY key
+                        LIMIT ?
+                        """,
+                        (category, limit),
+                    ).fetchall()
+            else:
+                if category is None:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id = ?
+                        ORDER BY category, key
+                        LIMIT ?
+                        """,
+                        (user_id, limit),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT id, category, key, value, created_at, updated_at
+                        FROM memories
+                        WHERE user_id = ? AND category = ?
+                        ORDER BY key
+                        LIMIT ?
+                        """,
+                        (user_id, category, limit),
+                    ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def forget(
+        self,
+        category: str,
+        key: str,
+    ) -> bool:
+        user_id = self._resolve_user_id()
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE user_id IS NULL
+                      AND legacy_unclaimed = 0
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (category, key),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE user_id = ?
+                      AND category = ?
+                      AND key = ?
+                    """,
+                    (user_id, category, key),
+                )
+            connection.commit()
+
+        return cursor.rowcount > 0
+
+    def clear_category(
+        self,
+        category: str,
+    ) -> int:
+        user_id = self._resolve_user_id()
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+            if user_id is None:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE user_id IS NULL
+                      AND legacy_unclaimed = 0
+                      AND category = ?
+                    """,
+                    (category,),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE user_id = ? AND category = ?
+                    """,
+                    (user_id, category),
+                )
+            connection.commit()
+
+        return cursor.rowcount
+
+    def claim_legacy_memories(
+        self,
+        identity: AuthenticatedIdentity,
+        *,
+        identity_manager: Any | None = None,
+        overwrite: bool = False,
+    ) -> int:
+        """Explicitly claim legacy v0.4 unclaimed memories into an authenticated user's scope."""
+        validated = self._validate_explicit_identity_object(identity)
+        mgr = identity_manager if identity_manager is not None else self.identity_manager
+        if mgr is not None:
+            validated = mgr.validate_session(validated)
+        else:
+            self._assert_active_user_exists(validated.user_id)
+
+        claimed = 0
+        with self.database.connect() as connection:
+            legacy_rows = connection.execute(
+                """
+                SELECT id, category, key
+                FROM memories
+                WHERE user_id IS NULL AND legacy_unclaimed = 1
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            for row in legacy_rows:
+                existing = connection.execute(
+                    """
+                    SELECT id
+                    FROM memories
+                    WHERE user_id = ? AND category = ? AND key = ?
+                    """,
+                    (validated.user_id, row["category"], row["key"]),
+                ).fetchone()
+                if existing is not None:
+                    if overwrite:
+                        connection.execute(
+                            "DELETE FROM memories WHERE id = ?",
+                            (existing["id"],),
+                        )
+                    else:
+                        continue
+                connection.execute(
+                    """
+                    UPDATE memories
+                    SET user_id = ?, legacy_unclaimed = 0, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id IS NULL AND legacy_unclaimed = 1
+                    """,
+                    (validated.user_id, row["id"]),
+                )
+                claimed += 1
+            connection.commit()
+        return claimed

@@ -1,0 +1,454 @@
+#include "llama.h"
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+extern "C" {
+
+struct RiyaContext {
+    llama_model * model;
+    llama_context * context;
+    const llama_vocab * vocab;
+};
+
+RiyaContext * riya_load_model(
+    const char * model_path,
+    int32_t context_size
+) {
+    if (model_path == nullptr || context_size <= 0) {
+        return nullptr;
+    }
+
+    llama_model_params model_params =
+        llama_model_default_params();
+
+    llama_model * model =
+        llama_model_load_from_file(
+            model_path,
+            model_params
+        );
+
+    if (model == nullptr) {
+        return nullptr;
+    }
+
+    llama_context_params context_params =
+        llama_context_default_params();
+
+    context_params.n_ctx = context_size;
+    context_params.n_batch = context_size;
+
+    llama_context * context =
+        llama_init_from_model(
+            model,
+            context_params
+        );
+
+    if (context == nullptr) {
+        llama_model_free(model);
+        return nullptr;
+    }
+
+    return new RiyaContext{
+        model,
+        context,
+        llama_model_get_vocab(model)
+    };
+}
+
+void riya_free_model(RiyaContext * handle) {
+    if (handle == nullptr) {
+        return;
+    }
+
+    if (handle->context != nullptr) {
+        llama_free(handle->context);
+    }
+
+    if (handle->model != nullptr) {
+        llama_model_free(handle->model);
+    }
+
+    delete handle;
+}
+
+int32_t riya_tokenize(
+    RiyaContext * handle,
+    const char * text,
+    int32_t * tokens,
+    int32_t max_tokens
+) {
+    if (
+        handle == nullptr ||
+        handle->vocab == nullptr ||
+        text == nullptr ||
+        tokens == nullptr ||
+        max_tokens <= 0
+    ) {
+        return -1;
+    }
+
+    return llama_tokenize(
+        handle->vocab,
+        text,
+        static_cast<int32_t>(std::strlen(text)),
+        reinterpret_cast<llama_token *>(tokens),
+        max_tokens,
+        true,
+        false
+    );
+}
+
+static std::string build_chat_prompt(
+    RiyaContext * handle,
+    const char * user_prompt
+) {
+    const char * tmpl =
+        llama_model_chat_template(
+            handle->model,
+            nullptr
+        );
+
+    if (tmpl == nullptr || user_prompt == nullptr) {
+        return std::string(
+            "You are RIYA, an offline-first personal "
+            "AI assistant created by Tularam. "
+            "Your name is RIYA.\n\n"
+            "User: "
+        ) + (user_prompt ? user_prompt : "") +
+            "\nRIYA:";
+    }
+
+    llama_chat_message message;
+
+    message.role = "user";
+    message.content = user_prompt;
+
+    int32_t required =
+        llama_chat_apply_template(
+            tmpl,
+            &message,
+            1,
+            true,
+            nullptr,
+            0
+        );
+
+    if (required <= 0) {
+        return std::string(
+            "User: "
+        ) + user_prompt +
+            "\nRIYA:";
+    }
+
+    std::vector<char> buffer(
+        static_cast<size_t>(required) + 1
+    );
+
+    int32_t written =
+        llama_chat_apply_template(
+            tmpl,
+            &message,
+            1,
+            true,
+            buffer.data(),
+            static_cast<int32_t>(buffer.size())
+        );
+
+    if (written <= 0) {
+        return std::string(
+            "User: "
+        ) + user_prompt +
+            "\nRIYA:";
+    }
+
+    return std::string(
+        buffer.data(),
+        static_cast<size_t>(written)
+    );
+}
+
+int32_t riya_generate(
+    RiyaContext * handle,
+    const char * prompt,
+    char * output,
+    int32_t output_size,
+    int32_t max_tokens
+) {
+    if (
+        handle == nullptr ||
+        handle->context == nullptr ||
+        handle->vocab == nullptr ||
+        prompt == nullptr ||
+        output == nullptr ||
+        output_size <= 0 ||
+        max_tokens <= 0
+    ) {
+        return -1;
+    }
+
+    output[0] = '\0';
+
+    /*
+     * Clear native llama.cpp conversation state.
+     * RIYA's Python layer manages conversation history.
+     */
+    llama_memory_t memory =
+        llama_get_memory(handle->context);
+
+    if (memory == nullptr) {
+        return -2;
+    }
+
+    llama_memory_clear(
+        memory,
+        true
+    );
+
+    /*
+     * Build the model-specific chat prompt.
+     */
+    std::string formatted_prompt =
+        build_chat_prompt(
+            handle,
+            prompt
+        );
+
+    const int32_t prompt_length =
+        static_cast<int32_t>(
+            formatted_prompt.size()
+        );
+
+    std::vector<llama_token> tokens(4096);
+
+    int32_t n_prompt_tokens =
+        llama_tokenize(
+            handle->vocab,
+            formatted_prompt.c_str(),
+            prompt_length,
+            tokens.data(),
+            static_cast<int32_t>(tokens.size()),
+            true,
+            true
+        );
+
+    if (n_prompt_tokens < 0) {
+        tokens.resize(
+            static_cast<size_t>(-n_prompt_tokens)
+        );
+
+        n_prompt_tokens =
+            llama_tokenize(
+                handle->vocab,
+                formatted_prompt.c_str(),
+                prompt_length,
+                tokens.data(),
+                static_cast<int32_t>(tokens.size()),
+                true,
+                true
+            );
+    }
+
+    if (n_prompt_tokens <= 0) {
+        return -3;
+    }
+
+    if (
+        n_prompt_tokens >=
+        static_cast<int32_t>(
+            llama_n_ctx(handle->context)
+        )
+    ) {
+        return -4;
+    }
+
+    /*
+     * Evaluate prompt.
+     */
+    llama_batch batch =
+        llama_batch_get_one(
+            tokens.data(),
+            n_prompt_tokens
+        );
+
+    if (
+        llama_decode(
+            handle->context,
+            batch
+        ) != 0
+    ) {
+        return -5;
+    }
+
+    /*
+     * Sampler.
+     */
+    llama_sampler_chain_params sampler_params =
+        llama_sampler_chain_default_params();
+
+    llama_sampler * sampler =
+        llama_sampler_chain_init(
+            sampler_params
+        );
+
+    if (sampler == nullptr) {
+        return -6;
+    }
+
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_top_k(40)
+    );
+
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_top_p(0.9f, 1)
+    );
+
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_temp(0.7f)
+    );
+
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_dist(1234)
+    );
+
+    std::string result;
+
+    result.reserve(
+        static_cast<size_t>(output_size - 1)
+    );
+
+    int32_t current_pos =
+        n_prompt_tokens;
+
+    const llama_token eos =
+        llama_vocab_eos(handle->vocab);
+
+    /*
+     * Generate response.
+     */
+    for (
+        int32_t i = 0;
+        i < max_tokens;
+        ++i
+    ) {
+        llama_token token =
+            llama_sampler_sample(
+                sampler,
+                handle->context,
+                -1
+            );
+
+        if (
+            token == eos ||
+            llama_vocab_is_eog(
+                handle->vocab,
+                token
+            )
+        ) {
+            break;
+        }
+
+        llama_sampler_accept(
+            sampler,
+            token
+        );
+
+        char piece[256];
+
+        int32_t piece_size =
+            llama_token_to_piece(
+                handle->vocab,
+                token,
+                piece,
+                sizeof(piece),
+                0,
+                false
+            );
+
+        if (piece_size > 0) {
+            if (
+                static_cast<int32_t>(
+                    result.size()
+                ) + piece_size >= output_size
+            ) {
+                break;
+            }
+
+            result.append(
+                piece,
+                static_cast<size_t>(piece_size)
+            );
+        }
+
+        llama_batch next =
+            llama_batch_get_one(
+                &token,
+                1
+            );
+
+        if (
+            llama_decode(
+                handle->context,
+                next
+            ) != 0
+        ) {
+            break;
+        }
+
+        ++current_pos;
+
+        if (
+            current_pos >=
+            static_cast<int32_t>(
+                llama_n_ctx(handle->context)
+            )
+        ) {
+            break;
+        }
+    }
+
+    llama_sampler_free(sampler);
+
+    /*
+     * Remove Qwen end-of-message token.
+     */
+    const std::string end_token =
+        "<|im_end|>";
+
+    if (
+        result.size() >= end_token.size() &&
+        result.compare(
+            result.size() - end_token.size(),
+            end_token.size(),
+            end_token
+        ) == 0
+    ) {
+        result.erase(
+            result.size() - end_token.size()
+        );
+    }
+
+    /*
+     * Copy result to Python buffer.
+     */
+    if (!result.empty()) {
+        std::memcpy(
+            output,
+            result.data(),
+            result.size()
+        );
+    }
+
+    output[result.size()] = '\0';
+
+    return static_cast<int32_t>(
+        result.size()
+    );
+}
+
+}

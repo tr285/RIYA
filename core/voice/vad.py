@@ -1,0 +1,361 @@
+"""Streaming Voice Activity Detection (VAD) and utterance segmentation.
+
+Supports two local, zero-network engines:
+1. ``SileroStreamingVAD`` — stateful ONNX runtime wrapper around the bundled
+   ``silero_vad_v6.onnx`` model shipped inside ``faster-whisper`` (512-sample
+   frames at 16 kHz, 64-sample context, LSTM state ``h``/``c``).
+2. ``EnergyVAD`` — deterministic RMS adaptive noise-floor detector used when
+   ``vad_engine="energy"`` or when ONNX runtime / model asset is unavailable.
+
+``UtteranceSegmenter`` turns 512-sample audio frames into speech start/end
+events and complete utterance buffers with pre-roll padding, natural pause
+tolerance, maximum utterance bounds, and barge-in detection during playback.
+"""
+
+from __future__ import annotations
+
+import os
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+
+from core.voice.config import VAD_FRAME_SAMPLES, VoiceConfig
+
+
+def _default_silero_onnx_path() -> Path | None:
+    try:
+        from faster_whisper.vad import get_assets_path
+
+        candidate = Path(get_assets_path()) / "silero_vad_v6.onnx"
+        if candidate.is_file():
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
+class SileroStreamingVAD:
+    """Stateful 16 kHz, 512-sample frame Silero v6 ONNX speech probability model."""
+
+    def __init__(self, model_path: str | Path | None = None):
+        import onnxruntime as ort
+
+        disable_telemetry = getattr(ort, "disable_telemetry_events", None)
+        if callable(disable_telemetry):
+            try:
+                disable_telemetry()
+            except Exception:
+                pass
+
+        resolved = Path(model_path) if model_path is not None else _default_silero_onnx_path()
+        if resolved is None or not resolved.is_file():
+            raise FileNotFoundError("Local silero_vad_v6.onnx asset was not found.")
+
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False
+        opts.log_severity_level = 4
+
+        self.model_path = resolved
+        self._session = ort.InferenceSession(
+            os.fspath(resolved),
+            providers=["CPUExecutionProvider"],
+            sess_options=opts,
+        )
+        self.reset()
+
+    def reset(self) -> None:
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._context = np.zeros(64, dtype=np.float32)
+
+    def speech_probability(self, frame: np.ndarray) -> float:
+        arr = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if arr.size != VAD_FRAME_SAMPLES:
+            if arr.size < VAD_FRAME_SAMPLES:
+                padded = np.zeros(VAD_FRAME_SAMPLES, dtype=np.float32)
+                padded[: arr.size] = arr
+                arr = padded
+            else:
+                arr = arr[:VAD_FRAME_SAMPLES]
+
+        model_input = np.concatenate([self._context, arr])[None, :]
+        prob, self._h, self._c = self._session.run(
+            None,
+            {"input": model_input, "h": self._h, "c": self._c},
+        )
+        self._context = arr[-64:].copy()
+        value = float(np.asarray(prob).reshape(-1)[0])
+        return max(0.0, min(1.0, value))
+
+
+class EnergyVAD:
+    """Lightweight local RMS + adaptive noise floor speech probability estimator."""
+
+    def __init__(self, noise_floor: float = 0.008, speech_rms: float = 0.035):
+        self._initial_floor = float(noise_floor)
+        self._speech_rms = max(float(speech_rms), self._initial_floor * 1.5)
+        self.reset()
+
+    def reset(self) -> None:
+        self._noise_floor = self._initial_floor
+
+    def speech_probability(self, frame: np.ndarray) -> float:
+        arr = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return 0.0
+        rms = float(np.sqrt(np.mean(np.square(arr, dtype=np.float64))))
+        if rms < self._noise_floor * 1.4:
+            self._noise_floor = 0.95 * self._noise_floor + 0.05 * max(rms, 1e-4)
+
+        denom = max(self._speech_rms - self._noise_floor, 1e-3)
+        score = (rms - self._noise_floor * 1.25) / denom
+        return float(max(0.0, min(1.0, score)))
+
+
+def create_vad_backend(
+    config: VoiceConfig,
+    *,
+    silero_model_path: str | Path | None = None,
+) -> SileroStreamingVAD | EnergyVAD:
+    """Create the configured local VAD backend, falling back to EnergyVAD if needed."""
+
+    if config.vad_engine == "silero":
+        try:
+            return SileroStreamingVAD(model_path=silero_model_path)
+        except Exception:
+            return EnergyVAD()
+    return EnergyVAD()
+
+
+@dataclass(frozen=True)
+class VADFrameEvent:
+    """Result of processing a single 512-sample (32 ms) audio frame."""
+
+    probability: float
+    rms_level: float
+    is_speech: bool
+    speech_started: bool = False
+    speech_ended: bool = False
+    barge_in_triggered: bool = False
+    utterance: np.ndarray | None = None
+    forced_cut: bool = False
+
+
+class UtteranceSegmenter:
+    """Stateful turn-taking and barge-in segmenter over 512-sample 16 kHz frames.
+
+    Features:
+    - Hysteresis speech detection (``vad_threshold`` to start, ``vad_neg_threshold``
+      to count silence) so natural word/clause pauses are not clipped.
+    - Pre-roll ring buffer (``speech_pad_ms``) so leading consonants are preserved.
+    - Minimum speech duration (``min_speech_ms``) before accepting speech start.
+    - Configurable trailing silence threshold (``min_silence_ms``).
+    - Hard cap on utterance duration (``max_utterance_seconds``).
+    - Separate higher-threshold barge-in detector (``barge_in_threshold``,
+      ``barge_in_min_speech_ms``) with an optional echo-guard cooldown after TTS
+      playback begins.
+    """
+
+    def __init__(
+        self,
+        config: VoiceConfig | None = None,
+        backend: Callable[[np.ndarray], float] | SileroStreamingVAD | EnergyVAD | None = None,
+    ):
+        self.config = config or VoiceConfig()
+        if backend is None:
+            self._backend = create_vad_backend(self.config)
+        else:
+            self._backend = backend
+
+        self._frame_ms = self.config.frame_ms
+        self._pad_frames = max(1, int(round(self.config.speech_pad_ms / self._frame_ms)))
+        self._min_speech_frames = max(
+            1, int(round(self.config.min_speech_ms / self._frame_ms))
+        )
+        self._min_silence_frames = max(
+            1, int(round(self.config.min_silence_ms / self._frame_ms))
+        )
+        self._max_utterance_frames = max(
+            self._min_speech_frames + 1,
+            int(round((self.config.max_utterance_seconds * 1000.0) / self._frame_ms)),
+        )
+        self._barge_in_frames = max(
+            1, int(round(self.config.barge_in_min_speech_ms / self._frame_ms))
+        )
+        self._echo_guard_frames = max(
+            0, int(round(self.config.echo_guard_ms / self._frame_ms))
+        )
+        self.reset()
+
+    def reset(self) -> None:
+        if hasattr(self._backend, "reset"):
+            self._backend.reset()
+        self._preroll: deque[np.ndarray] = deque(maxlen=self._pad_frames)
+        self._speech_buffer: list[np.ndarray] = []
+        self._in_speech = False
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._candidate_frames = 0
+        self._barge_in_streak = 0
+        self._echo_guard_remaining = 0
+
+    @property
+    def in_speech(self) -> bool:
+        return self._in_speech
+
+    def notify_playback_started(self) -> None:
+        """Start a short echo-guard window when assistant playback begins."""
+
+        self._echo_guard_remaining = self._echo_guard_frames
+        self._barge_in_streak = 0
+
+    def _score_frame(self, frame: np.ndarray) -> float:
+        if hasattr(self._backend, "speech_probability"):
+            return float(self._backend.speech_probability(frame))
+        return float(self._backend(frame))
+
+    @staticmethod
+    def compute_rms(frame: np.ndarray) -> float:
+        if frame.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
+
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        *,
+        assistant_speaking: bool = False,
+    ) -> VADFrameEvent:
+        """Process one 512-sample mono float32 frame at 16 kHz."""
+
+        clean = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if clean.size != VAD_FRAME_SAMPLES:
+            if clean.size < VAD_FRAME_SAMPLES:
+                padded = np.zeros(VAD_FRAME_SAMPLES, dtype=np.float32)
+                padded[: clean.size] = clean
+                clean = padded
+            else:
+                clean = clean[:VAD_FRAME_SAMPLES]
+
+        rms = self.compute_rms(clean)
+        prob = self._score_frame(clean)
+
+        # ---- Barge-in monitoring while assistant is speaking -------------
+        if assistant_speaking:
+            if self._echo_guard_remaining > 0:
+                self._echo_guard_remaining -= 1
+                self._preroll.append(clean.copy())
+                return VADFrameEvent(
+                    probability=prob,
+                    rms_level=rms,
+                    is_speech=False,
+                )
+
+            if self.config.barge_in_enabled and prob >= self.config.barge_in_threshold:
+                self._barge_in_streak += 1
+                self._preroll.append(clean.copy())
+                if self._barge_in_streak >= self._barge_in_frames:
+                    # Seed speech capture immediately with pre-roll frames so
+                    # the interrupting words are preserved.
+                    self._in_speech = True
+                    self._speech_buffer = list(self._preroll)
+                    self._speech_frames = len(self._speech_buffer)
+                    self._silence_frames = 0
+                    self._candidate_frames = 0
+                    self._barge_in_streak = 0
+                    return VADFrameEvent(
+                        probability=prob,
+                        rms_level=rms,
+                        is_speech=True,
+                        speech_started=True,
+                        barge_in_triggered=True,
+                    )
+            else:
+                self._barge_in_streak = 0
+                self._preroll.append(clean.copy())
+
+            return VADFrameEvent(
+                probability=prob,
+                rms_level=rms,
+                is_speech=prob >= self.config.barge_in_threshold,
+            )
+
+        # ---- Normal listening turn segmentation --------------------------
+        if not self._in_speech:
+            self._preroll.append(clean.copy())
+            if prob >= self.config.vad_threshold:
+                self._candidate_frames += 1
+                if self._candidate_frames >= self._min_speech_frames:
+                    self._in_speech = True
+                    self._speech_buffer = list(self._preroll)
+                    self._speech_frames = len(self._speech_buffer)
+                    self._silence_frames = 0
+                    self._candidate_frames = 0
+                    return VADFrameEvent(
+                        probability=prob,
+                        rms_level=rms,
+                        is_speech=True,
+                        speech_started=True,
+                    )
+            else:
+                self._candidate_frames = 0
+
+            return VADFrameEvent(
+                probability=prob,
+                rms_level=rms,
+                is_speech=False,
+            )
+
+        # Currently inside an active user utterance.
+        self._speech_buffer.append(clean.copy())
+        self._speech_frames += 1
+
+        if prob < self.config.vad_neg_threshold:
+            self._silence_frames += 1
+        else:
+            self._silence_frames = 0
+
+        if self._silence_frames >= self._min_silence_frames:
+            utterance = np.concatenate(self._speech_buffer).astype(np.float32, copy=False)
+            self.reset()
+            return VADFrameEvent(
+                probability=prob,
+                rms_level=rms,
+                is_speech=False,
+                speech_ended=True,
+                utterance=utterance,
+                forced_cut=False,
+            )
+
+        if len(self._speech_buffer) >= self._max_utterance_frames:
+            utterance = np.concatenate(self._speech_buffer).astype(np.float32, copy=False)
+            self.reset()
+            return VADFrameEvent(
+                probability=prob,
+                rms_level=rms,
+                is_speech=False,
+                speech_ended=True,
+                utterance=utterance,
+                forced_cut=True,
+            )
+
+        return VADFrameEvent(
+            probability=prob,
+            rms_level=rms,
+            is_speech=True,
+        )
+
+    def flush(self) -> np.ndarray | None:
+        """Flush buffered speech if an utterance is currently active."""
+
+        if not self._in_speech or self._speech_frames < self._min_speech_frames:
+            self.reset()
+            return None
+        utterance = np.concatenate(self._speech_buffer).astype(np.float32, copy=False)
+        self.reset()
+        return utterance

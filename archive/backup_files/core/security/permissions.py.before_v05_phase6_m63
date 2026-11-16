@@ -1,0 +1,2046 @@
+"""Centralized per-user Permission & Trust Management for RIYA."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+import sqlite3
+import threading
+from typing import Any, Callable, Iterable
+from uuid import uuid4
+
+from core.identity.manager import (
+    AuthenticatedIdentity,
+    IdentityManager,
+    InvalidIdentityError,
+    MissingIdentityError,
+)
+from core.security.audit import PermissionAuditLogger, sanitize_reason, sanitize_resource_label
+
+
+class PermissionErrorBase(PermissionError):
+    """Base error for RIYA permission and trust enforcement."""
+
+
+class PermissionDeniedError(PermissionErrorBase):
+    """Raised when an action is explicitly denied or default-denied."""
+
+
+class PermissionAuthorityError(PermissionErrorBase):
+    """Raised when an untrusted actor attempts a privileged permission mutation."""
+
+
+class PermissionConflictError(PermissionErrorBase):
+    """Raised when attempting to grant over an active DENY rule without revoking it."""
+
+
+class PermissionDecision(str, Enum):
+    ALLOW = "allow"
+    CONFIRM = "confirm"
+    DENY = "deny"
+    NOT_CONFIGURED = "not_configured"
+
+
+class PermissionLifetime(str, Enum):
+    ONE_TIME = "one_time"
+    SESSION = "session"
+    PERSISTENT = "persistent"
+    TIME_LIMITED = "time_limited"
+
+
+_UNTRUSTED_ACTORS = frozenset(
+    {
+        "llm",
+        "model",
+        "planner",
+        "tool",
+        "assistant_model",
+        "prompt",
+        "untrusted",
+    }
+)
+
+_MAX_TIME_LIMITED_SECONDS = 365 * 24 * 3600  # 1 year upper bound
+
+
+@dataclass(frozen=True)
+class PermissionSpec:
+    permission_key: str
+    category: str
+    description: str
+    tools: tuple[str, ...]
+    sensitive: bool
+    protected_by_default: bool
+
+
+# Mapped strictly to real RIYA capabilities in core/tools/, core/voice/,
+# core/memory/, and core/identity/. No unimplemented features are invented here.
+PERMISSION_SPECS: dict[str, PermissionSpec] = {
+    # Filesystem
+    "filesystem.read": PermissionSpec(
+        permission_key="filesystem.read",
+        category="filesystem",
+        description="Read files, inspect file metadata, list directories, and search filenames inside allowed paths.",
+        tools=("list_files", "find_files", "read_file", "inspect_file_metadata"),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "filesystem.create": PermissionSpec(
+        permission_key="filesystem.create",
+        category="filesystem",
+        description="Create new files and folders inside allowed paths.",
+        tools=("create_folder", "write_file"),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+    "filesystem.modify": PermissionSpec(
+        permission_key="filesystem.modify",
+        category="filesystem",
+        description="Modify or overwrite existing files inside allowed paths.",
+        tools=("write_file",),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+    "filesystem.directory": PermissionSpec(
+        permission_key="filesystem.directory",
+        category="filesystem",
+        description="Scoped access rule for a specific directory path.",
+        tools=(
+            "list_files",
+            "find_files",
+            "create_folder",
+            "read_file",
+            "write_file",
+            "inspect_file_metadata",
+        ),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    # Memory
+    "memory.read": PermissionSpec(
+        permission_key="memory.read",
+        category="memory",
+        description="Read and search stored personal memory facts for the current user.",
+        tools=("recall_memory", "list_memories", "search_memory"),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "memory.write": PermissionSpec(
+        permission_key="memory.write",
+        category="memory",
+        description="Save new personal memory facts for the current user.",
+        tools=("remember",),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+    "memory.delete": PermissionSpec(
+        permission_key="memory.delete",
+        category="memory",
+        description="Delete stored personal memory facts for the current user.",
+        tools=("forget_memory",),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+    # System automation (macOS / device wrappers)
+    "system.open_app": PermissionSpec(
+        permission_key="system.open_app",
+        category="system",
+        description="Launch local macOS applications.",
+        tools=("open_application",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.close_app": PermissionSpec(
+        permission_key="system.close_app",
+        category="system",
+        description="Quit running local macOS applications.",
+        tools=("close_application",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.screenshot": PermissionSpec(
+        permission_key="system.screenshot",
+        category="system",
+        description="Capture screen screenshots using macOS screencapture.",
+        tools=("take_screenshot",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.volume": PermissionSpec(
+        permission_key="system.volume",
+        category="system",
+        description="Read/change macOS output volume and mute/unmute audio.",
+        tools=("set_volume", "mute_volume", "unmute_volume"),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.lock_screen": PermissionSpec(
+        permission_key="system.lock_screen",
+        category="system",
+        description="Lock the macOS screen immediately.",
+        tools=("lock_screen",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.info": PermissionSpec(
+        permission_key="system.info",
+        category="system",
+        description="Read local time, battery status, storage, network, installed app metadata, and system information.",
+        tools=(
+            "current_time",
+            "battery_status",
+            "system_information",
+            "storage_status",
+            "network_status",
+            "check_application",
+            "platform_capabilities",
+        ),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "system.clipboard": PermissionSpec(
+        permission_key="system.clipboard",
+        category="system",
+        description="Read or write the local operating-system clipboard on explicit request.",
+        tools=("clipboard_read", "clipboard_write"),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "system.notification": PermissionSpec(
+        permission_key="system.notification",
+        category="system",
+        description="Send local operating-system notifications.",
+        tools=("send_notification",),
+        sensitive=False,
+        protected_by_default=True,
+    ),
+    # Voice & devices
+    "voice.microphone": PermissionSpec(
+        permission_key="voice.microphone",
+        category="voice",
+        description="Capture audio from the microphone and process voice mode speech.",
+        tools=("voice_microphone",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "voice.speaker": PermissionSpec(
+        permission_key="voice.speaker",
+        category="voice",
+        description="Speak responses aloud using local text-to-speech audio output.",
+        tools=("voice_speaker",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "voice.config": PermissionSpec(
+        permission_key="voice.config",
+        category="voice",
+        description="Read or update per-user voice mode configuration settings.",
+        tools=("voice_config",),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "voice.device": PermissionSpec(
+        permission_key="voice.device",
+        category="voice",
+        description="Select or switch audio input/output hardware devices.",
+        tools=("voice_device",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    # Personal user stores
+    "personal.preferences": PermissionSpec(
+        permission_key="personal.preferences",
+        category="personal",
+        description="Read, update, or delete user-scoped assistant preferences.",
+        tools=("preferences",),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "personal.history": PermissionSpec(
+        permission_key="personal.history",
+        category="personal",
+        description="Read, append, or clear user-scoped conversation history.",
+        tools=("history",),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "personal.profile": PermissionSpec(
+        permission_key="personal.profile",
+        category="personal",
+        description="Access or manage user account profile details.",
+        tools=("profile",),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+    "learning.manage": PermissionSpec(
+        permission_key="learning.manage",
+        category="personal",
+        description="Record response feedback, manage adaptive style profiles, and run offline evaluations.",
+        tools=("learning",),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    # Controlled self-improvement
+    "self_improve.propose": PermissionSpec(
+        permission_key="self_improve.propose",
+        category="system",
+        description="Analyze modules, stage code improvement diffs, and run isolated sandbox verification.",
+        tools=("self_improve_propose",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "self_improve.apply": PermissionSpec(
+        permission_key="self_improve.apply",
+        category="system",
+        description="Apply or roll back user-authorized code modification patches to the local RIYA repository.",
+        tools=("self_improve_apply",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    # Phase 5 autonomous agent, sandboxed compute, database, browser, desktop & skills
+    "compute.calculate": PermissionSpec(
+        permission_key="compute.calculate",
+        category="compute",
+        description="Evaluate safe arithmetic and pure mathematical expressions.",
+        tools=("calculate",),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "python.sandbox": PermissionSpec(
+        permission_key="python.sandbox",
+        category="compute",
+        description="Execute short Python snippets inside a strictly sandboxed subprocess with no network or host filesystem access.",
+        tools=("python_sandbox",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "terminal.execute": PermissionSpec(
+        permission_key="terminal.execute",
+        category="system",
+        description="Run strictly allowlisted non-destructive local terminal inspection or test commands inside allowed workspace directories.",
+        tools=("terminal_command",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "database.local": PermissionSpec(
+        permission_key="database.local",
+        category="data",
+        description="Query or update user-isolated sandbox SQLite workspace databases.",
+        tools=("local_db_query",),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "browser.interact": PermissionSpec(
+        permission_key="browser.interact",
+        category="browser",
+        description="Inspect local HTML pages and (when explicitly permitted and online) fetch web pages or submit confirmed forms.",
+        tools=(
+            "browser_open_local",
+            "browser_inspect_page",
+            "browser_extract_links",
+            "browser_fetch_url",
+            "browser_submit_form",
+        ),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "desktop.automate": PermissionSpec(
+        permission_key="desktop.automate",
+        category="desktop",
+        description="Discover installed/running desktop apps, inspect app/window state, and focus windows.",
+        tools=(
+            "desktop_list_apps",
+            "desktop_running_apps",
+            "desktop_app_state",
+            "desktop_focus_app",
+            "active_window_info",
+        ),
+        sensitive=True,
+        protected_by_default=True,
+    ),
+    "tasks.manage": PermissionSpec(
+        permission_key="tasks.manage",
+        category="tasks",
+        description="Inspect, resume, cancel, and clear user-scoped autonomous task history.",
+        tools=(
+            "task_status",
+            "task_resume",
+            "task_cancel",
+            "task_history",
+            "task_clear_history",
+        ),
+        sensitive=False,
+        protected_by_default=False,
+    ),
+    "skills.manage": PermissionSpec(
+        permission_key="skills.manage",
+        category="skills",
+        description="List, execute, and propose reusable RIYA skills.",
+        tools=("run_skill", "list_skills", "propose_skill"),
+        sensitive=True,
+        protected_by_default=False,
+    ),
+}
+
+_TOOL_TO_PRIMARY_KEY: dict[str, str] = {
+    "list_files": "filesystem.read",
+    "find_files": "filesystem.read",
+    "read_file": "filesystem.read",
+    "inspect_file_metadata": "filesystem.read",
+    "create_folder": "filesystem.create",
+    "write_file": "filesystem.create",  # Dynamically upgrades to filesystem.modify if file exists
+    "recall_memory": "memory.read",
+    "list_memories": "memory.read",
+    "search_memory": "memory.read",
+    "remember": "memory.write",
+    "forget_memory": "memory.delete",
+    "open_application": "system.open_app",
+    "close_application": "system.close_app",
+    "take_screenshot": "system.screenshot",
+    "set_volume": "system.volume",
+    "mute_volume": "system.volume",
+    "unmute_volume": "system.volume",
+    "lock_screen": "system.lock_screen",
+    "current_time": "system.info",
+    "battery_status": "system.info",
+    "system_information": "system.info",
+    "storage_status": "system.info",
+    "network_status": "system.info",
+    "check_application": "system.info",
+    "platform_capabilities": "system.info",
+    "clipboard_read": "system.clipboard",
+    "clipboard_write": "system.clipboard",
+    "send_notification": "system.notification",
+    "calculate": "compute.calculate",
+    "python_sandbox": "python.sandbox",
+    "terminal_command": "terminal.execute",
+    "local_db_query": "database.local",
+    "browser_open_local": "browser.interact",
+    "browser_inspect_page": "browser.interact",
+    "browser_extract_links": "browser.interact",
+    "browser_fetch_url": "browser.interact",
+    "browser_submit_form": "browser.interact",
+    "desktop_list_apps": "desktop.automate",
+    "desktop_running_apps": "desktop.automate",
+    "desktop_app_state": "desktop.automate",
+    "desktop_focus_app": "desktop.automate",
+    "active_window_info": "desktop.automate",
+}
+
+_SENSITIVE_TOOLS: frozenset[str] = frozenset(
+    {
+        "write_file",
+        "create_folder",
+        "remember",
+        "forget_memory",
+        "open_application",
+        "close_application",
+        "take_screenshot",
+        "set_volume",
+        "mute_volume",
+        "unmute_volume",
+        "lock_screen",
+        "clipboard_write",
+        "python_sandbox",
+        "terminal_command",
+        "local_db_query",
+        "browser_open_local",
+        "browser_fetch_url",
+        "browser_submit_form",
+        "desktop_focus_app",
+    }
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def normalize_resource_scope(permission_key: str, resource_scope: str | None) -> str:
+    """Normalize resource scope strings so path/app scopes match reliably."""
+    if resource_scope is None or not str(resource_scope).strip():
+        return "*"
+    raw = str(resource_scope).strip()
+    if raw == "*":
+        return "*"
+    if raw.startswith("dir:"):
+        target = raw[4:].strip()
+        if not target:
+            raise ValueError("Directory scope 'dir:' cannot be empty.")
+        resolved = Path(target).expanduser().resolve(strict=False)
+        return f"dir:{resolved}"
+    if raw.startswith("path:"):
+        target = raw[5:].strip()
+        if not target:
+            raise ValueError("Path scope 'path:' cannot be empty.")
+        resolved = Path(target).expanduser().resolve(strict=False)
+        return f"path:{resolved}"
+    if raw.startswith("app:"):
+        app = raw[4:].strip().lower()
+        if not app:
+            raise ValueError("Application scope 'app:' cannot be empty.")
+        return f"app:{app}"
+    if raw.startswith("tool:"):
+        tool = raw[5:].strip().lower()
+        if not tool:
+            raise ValueError("Tool scope 'tool:' cannot be empty.")
+        return f"tool:{tool}"
+    if raw.startswith("device:"):
+        dev = raw[7:].strip().lower()
+        if not dev:
+            raise ValueError("Device scope 'device:' cannot be empty.")
+        return f"device:{dev}"
+    if raw.startswith("origin:"):
+        origin = raw[7:].strip().lower()
+        if not origin:
+            raise ValueError("Origin scope 'origin:' cannot be empty.")
+        return f"origin:{origin}"
+    if raw.startswith("cmd:"):
+        cmd = raw[4:].strip().lower()
+        if not cmd:
+            raise ValueError("Command scope 'cmd:' cannot be empty.")
+        return f"cmd:{cmd}"
+    if raw.startswith("db:"):
+        db_target = raw[3:].strip().lower()
+        if not db_target:
+            raise ValueError("Database scope 'db:' cannot be empty.")
+        return f"db:{db_target}"
+    if raw.startswith("skill:"):
+        skill = raw[6:].strip().lower()
+        if not skill:
+            raise ValueError("Skill scope 'skill:' cannot be empty.")
+        return f"skill:{skill}"
+
+    if permission_key == "filesystem.directory":
+        resolved = Path(raw).expanduser().resolve(strict=False)
+        return f"dir:{resolved}"
+    if permission_key.startswith("filesystem."):
+        resolved = Path(raw).expanduser().resolve(strict=False)
+        if resolved.exists() and resolved.is_dir():
+            return f"dir:{resolved}"
+        return f"path:{resolved}"
+    if permission_key in {"system.open_app", "system.close_app"}:
+        return f"app:{raw.lower()}"
+    if permission_key == "voice.device":
+        return f"device:{raw.lower()}"
+    if permission_key == "browser.interact":
+        return f"origin:{raw.lower()}"
+    if permission_key == "terminal.execute":
+        return f"cmd:{raw.lower()}"
+    if permission_key == "database.local":
+        return f"db:{raw.lower()}"
+    if permission_key == "skills.manage":
+        return f"skill:{raw.lower()}"
+    return raw
+
+
+def _safe_resolve_fs_target(
+    raw_path: str | None,
+    workspace_dir: Path | None,
+) -> Path | None:
+    base = (workspace_dir or Path.cwd()).expanduser().resolve(strict=False)
+    if not isinstance(raw_path, str) or not raw_path.strip() or raw_path.strip() in {".", "./"}:
+        return base
+    candidate = Path(raw_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    return candidate.resolve(strict=False)
+
+
+def _scope_specificity(scope: str, target_resource: str) -> tuple[bool, int]:
+    """Return (matches, specificity_rank). Higher rank is more specific."""
+    if scope == "*":
+        return True, 1
+
+    if scope.startswith("tool:") and target_resource.startswith("tool:"):
+        return (scope == target_resource), 100
+
+    if scope.startswith("app:") and target_resource.startswith("app:"):
+        if scope == "app:*":
+            return True, 50
+        return (scope == target_resource), 200
+
+    if scope.startswith("device:") and target_resource.startswith("device:"):
+        if scope == "device:*":
+            return True, 50
+        return (scope == target_resource), 200
+
+    for prefix in ("origin:", "cmd:", "db:", "skill:"):
+        if scope.startswith(prefix) and target_resource.startswith(prefix):
+            if scope == f"{prefix}*":
+                return True, 50
+            return (scope == target_resource), 200
+
+    if scope.startswith("path:"):
+        if not target_resource.startswith("path:"):
+            return False, 0
+        scope_path = Path(scope[5:])
+        target_path = Path(target_resource[5:])
+        if scope_path == target_path:
+            return True, 1000
+        return False, 0
+
+    if scope.startswith("dir:"):
+        scope_dir = Path(scope[4:])
+        if target_resource.startswith("dir:"):
+            target_path = Path(target_resource[4:])
+        elif target_resource.startswith("path:"):
+            target_path = Path(target_resource[5:])
+        else:
+            return False, 0
+        try:
+            if target_path == scope_dir or target_path.is_relative_to(scope_dir):
+                return True, 300 + len(scope_dir.parts)
+        except (ValueError, OSError):
+            return False, 0
+        return False, 0
+
+    return (scope == target_resource), 200
+
+
+@dataclass(frozen=True)
+class ToolPermissionRequirement:
+    permission_key: str
+    target_resource: str
+    secondary_dir_target: str | None = None
+    require_secondary_dir_when_unconfigured: bool = False
+    unknown_tool: bool = False
+
+
+def resolve_permissions_for_tool(
+    tool_name: str,
+    parameters: dict[str, Any] | None = None,
+    *,
+    workspace_dir: str | Path | None = None,
+) -> ToolPermissionRequirement:
+    """Resolve an executed tool name + params to its authoritative permission key & scope."""
+    params = parameters if isinstance(parameters, dict) else {}
+    cleaned = str(tool_name or "").strip()
+    ws_path = (
+        Path(workspace_dir).expanduser().resolve(strict=False)
+        if workspace_dir is not None
+        else None
+    )
+
+    if cleaned in {
+        "list_files",
+        "find_files",
+        "create_folder",
+        "read_file",
+        "write_file",
+        "inspect_file_metadata",
+    }:
+        raw_path = params.get("path")
+        resolved_target = _safe_resolve_fs_target(
+            str(raw_path) if raw_path is not None else ".",
+            ws_path,
+        )
+        assert resolved_target is not None
+        primary_key = _TOOL_TO_PRIMARY_KEY[cleaned]
+        if cleaned == "write_file":
+            try:
+                if resolved_target.exists():
+                    primary_key = "filesystem.modify"
+            except OSError:
+                pass
+
+        is_dir_op = cleaned in {"list_files", "find_files", "create_folder"}
+        dir_path = resolved_target if is_dir_op else resolved_target.parent
+        outside_workspace = False
+        if ws_path is not None:
+            try:
+                outside_workspace = not (
+                    dir_path == ws_path or dir_path.is_relative_to(ws_path)
+                )
+            except (ValueError, OSError):
+                outside_workspace = True
+
+        target_label = (
+            f"dir:{resolved_target}" if is_dir_op else f"path:{resolved_target}"
+        )
+        return ToolPermissionRequirement(
+            permission_key=primary_key,
+            target_resource=target_label,
+            secondary_dir_target=f"dir:{dir_path}",
+            require_secondary_dir_when_unconfigured=outside_workspace,
+        )
+
+    if cleaned in {"open_application", "close_application", "desktop_app_state", "desktop_focus_app"}:
+        app_raw = str(params.get("app_name") or "").strip().lower()
+        target = f"app:{app_raw}" if app_raw else f"tool:{cleaned}"
+        return ToolPermissionRequirement(
+            permission_key=_TOOL_TO_PRIMARY_KEY[cleaned],
+            target_resource=target,
+        )
+
+    if cleaned == "terminal_command":
+        cmd_raw = str(params.get("command") or "").strip().lower()
+        base_cmd = cmd_raw.split()[0] if cmd_raw else ""
+        return ToolPermissionRequirement(
+            permission_key="terminal.execute",
+            target_resource=f"cmd:{base_cmd}" if base_cmd else "tool:terminal_command",
+        )
+
+    if cleaned == "local_db_query":
+        db_raw = str(params.get("db_name") or "workspace.db").strip().lower()
+        return ToolPermissionRequirement(
+            permission_key="database.local",
+            target_resource=f"db:{db_raw}" if db_raw else "db:workspace.db",
+        )
+
+    if cleaned in {
+        "browser_open_local",
+        "browser_inspect_page",
+        "browser_extract_links",
+        "browser_fetch_url",
+        "browser_submit_form",
+    }:
+        url_raw = str(params.get("url") or params.get("path") or "").strip().lower()
+        if url_raw.startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+
+            host = (urlparse(url_raw).hostname or "").lower()
+            target = f"origin:{host}" if host else f"tool:{cleaned}"
+        elif url_raw:
+            target = "origin:local"
+        else:
+            target = f"tool:{cleaned}"
+        return ToolPermissionRequirement(
+            permission_key="browser.interact",
+            target_resource=target,
+        )
+
+    primary = _TOOL_TO_PRIMARY_KEY.get(cleaned)
+    if primary is None:
+        return ToolPermissionRequirement(
+            permission_key=f"unknown.{cleaned}",
+            target_resource=f"tool:{cleaned}",
+            unknown_tool=True,
+        )
+
+    return ToolPermissionRequirement(
+        permission_key=primary,
+        target_resource=f"tool:{cleaned}",
+    )
+
+
+@dataclass(frozen=True)
+class PermissionGrant:
+    grant_id: str
+    user_id: str
+    permission_key: str
+    resource_scope: str
+    decision: PermissionDecision
+    lifetime: PermissionLifetime
+    session_id: str | None
+    expires_at: str | None
+    max_uses: int | None
+    use_count: int
+    granted_by: str
+    reason: str
+    revoked_at: str | None
+    revoked_reason: str | None
+    created_at: str
+    updated_at: str
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        current = now or _utc_now()
+        if self.revoked_at is not None:
+            return True
+        if self.lifetime == PermissionLifetime.TIME_LIMITED:
+            exp = _parse_iso_dt(self.expires_at)
+            if exp is None or exp <= current:
+                return True
+        if self.lifetime == PermissionLifetime.ONE_TIME:
+            if self.max_uses is not None and self.use_count >= self.max_uses:
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class PermissionEvaluation:
+    permission_key: str
+    category: str
+    decision: PermissionDecision
+    allowed: bool
+    blocked: bool
+    requires_confirmation: bool
+    reason: str
+    matched_grant_id: str | None = None
+    matched_lifetime: PermissionLifetime | None = None
+    matched_scope: str | None = None
+    consumed_grant_id: str | None = None
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+
+class PermissionManager:
+    """Authoritative per-user permission & trust engine backed by SQLite."""
+
+    def __init__(
+        self,
+        identity_manager: IdentityManager,
+        *,
+        audit_logger: PermissionAuditLogger | None = None,
+        strict_default_deny: bool = True,
+    ):
+        self.identity_manager = identity_manager
+        self.database = identity_manager.database
+        self.audit_logger = audit_logger or PermissionAuditLogger(
+            identity_manager.database,
+            identity_manager=identity_manager,
+        )
+        self.strict_default_deny = bool(strict_default_deny)
+        self._lock = threading.RLock()
+        self._revocation_listeners: list[
+            Callable[[str, str | None, str | None, str], None]
+        ] = []
+
+    def register_revocation_listener(
+        self,
+        callback: Callable[[str, str | None, str | None, str], None],
+    ) -> None:
+        """Register callback(user_id, permission_key_or_none, session_id_or_none, reason)."""
+        with self._lock:
+            if callback not in self._revocation_listeners:
+                self._revocation_listeners.append(callback)
+
+    def _notify_revocation(
+        self,
+        user_id: str,
+        permission_key: str | None,
+        session_id: str | None,
+        reason: str,
+    ) -> None:
+        with self._lock:
+            listeners = list(self._revocation_listeners)
+        for listener in listeners:
+            try:
+                listener(user_id, permission_key, session_id, reason)
+            except Exception:
+                # Never allow listener failure to mask revocation or allow execution.
+                pass
+
+    @staticmethod
+    def list_catalog() -> list[PermissionSpec]:
+        return [PERMISSION_SPECS[key] for key in sorted(PERMISSION_SPECS.keys())]
+
+    @staticmethod
+    def _validate_permission_key(permission_key: str) -> PermissionSpec:
+        if not isinstance(permission_key, str) or not permission_key.strip():
+            raise ValueError("permission_key must be a non-empty string.")
+        cleaned = permission_key.strip()
+        spec = PERMISSION_SPECS.get(cleaned)
+        if spec is None:
+            raise ValueError(
+                f"Unknown permission key {cleaned!r}; only real RIYA capabilities may be configured."
+            )
+        return spec
+
+    @staticmethod
+    def _validate_actor(actor: str) -> str:
+        cleaned = str(actor or "user").strip().lower()
+        if not cleaned or cleaned in _UNTRUSTED_ACTORS:
+            raise PermissionAuthorityError(
+                "AI/LLM/planner/tool components cannot grant, revoke, or modify permissions."
+            )
+        return cleaned
+
+    @staticmethod
+    def _row_to_grant(row: sqlite3.Row) -> PermissionGrant:
+        return PermissionGrant(
+            grant_id=str(row["grant_id"]),
+            user_id=str(row["user_id"]),
+            permission_key=str(row["permission_key"]),
+            resource_scope=str(row["resource_scope"]),
+            decision=PermissionDecision(str(row["decision"])),
+            lifetime=PermissionLifetime(str(row["lifetime"])),
+            session_id=str(row["session_id"]) if row["session_id"] is not None else None,
+            expires_at=str(row["expires_at"]) if row["expires_at"] is not None else None,
+            max_uses=int(row["max_uses"]) if row["max_uses"] is not None else None,
+            use_count=int(row["use_count"]),
+            granted_by=str(row["granted_by"]),
+            reason=str(row["reason"]),
+            revoked_at=str(row["revoked_at"]) if row["revoked_at"] is not None else None,
+            revoked_reason=(
+                str(row["revoked_reason"]) if row["revoked_reason"] is not None else None
+            ),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _audit(
+        self,
+        *,
+        user_id: str | None,
+        session_id: str | None,
+        category: str,
+        permission_key: str,
+        resource_or_tool: str,
+        decision: str,
+        reason: str,
+        actor: str,
+    ) -> None:
+        self.audit_logger.log_event(
+            user_id=user_id,
+            session_id=session_id,
+            permission_category=category,
+            permission_key=permission_key,
+            resource_or_tool=resource_or_tool,
+            decision=decision,
+            reason=reason,
+            actor=actor,
+        )
+
+    def _validate_identity_or_audit(
+        self,
+        identity: Any,
+        *,
+        permission_key: str = "identity.session",
+        resource_or_tool: str = "session",
+    ) -> AuthenticatedIdentity:
+        try:
+            return self.identity_manager.validate_session(identity)
+        except (MissingIdentityError, InvalidIdentityError) as exc:
+            self._audit(
+                user_id=getattr(identity, "user_id", None)
+                if isinstance(getattr(identity, "user_id", None), str)
+                else None,
+                session_id=getattr(identity, "session_id", None)
+                if isinstance(getattr(identity, "session_id", None), str)
+                else None,
+                category="security",
+                permission_key=permission_key,
+                resource_or_tool=resource_or_tool,
+                decision="denied_unauthenticated",
+                reason=str(exc),
+                actor="system",
+            )
+            raise
+
+    def grant_permission(
+        self,
+        identity: AuthenticatedIdentity,
+        permission_key: str,
+        *,
+        decision: PermissionDecision | str = PermissionDecision.ALLOW,
+        lifetime: PermissionLifetime | str = PermissionLifetime.SESSION,
+        resource_scope: str = "*",
+        ttl_seconds: float | None = None,
+        reason: str = "",
+        actor: str = "user",
+        explicit_user_approval: bool = False,
+    ) -> PermissionGrant:
+        """Grant or configure a permission strictly for the authenticated user."""
+        spec = self._validate_permission_key(permission_key)
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=spec.permission_key,
+            resource_or_tool=f"grant:{spec.permission_key}",
+        )
+        try:
+            safe_actor = self._validate_actor(actor)
+        except PermissionAuthorityError as exc:
+            self._audit(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                category=spec.category,
+                permission_key=spec.permission_key,
+                resource_or_tool=f"grant:{spec.permission_key}",
+                decision="blocked_untrusted_actor",
+                reason=str(exc),
+                actor=str(actor or "unknown"),
+            )
+            raise
+
+        parsed_decision = (
+            decision
+            if isinstance(decision, PermissionDecision)
+            else PermissionDecision(str(decision).strip().lower())
+        )
+        if parsed_decision not in {
+            PermissionDecision.ALLOW,
+            PermissionDecision.CONFIRM,
+            PermissionDecision.DENY,
+        }:
+            raise ValueError(f"Unsupported permission decision {decision!r}.")
+
+        if parsed_decision == PermissionDecision.DENY:
+            return self.deny_permission(
+                validated,
+                spec.permission_key,
+                resource_scope=resource_scope,
+                lifetime=lifetime,
+                ttl_seconds=ttl_seconds,
+                reason=reason or "Explicit user deny",
+                actor=safe_actor,
+            )
+
+        parsed_lifetime = (
+            lifetime
+            if isinstance(lifetime, PermissionLifetime)
+            else PermissionLifetime(str(lifetime).strip().lower())
+        )
+        if (
+            parsed_lifetime == PermissionLifetime.PERSISTENT
+            and not explicit_user_approval
+        ):
+            self._audit(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                category=spec.category,
+                permission_key=spec.permission_key,
+                resource_or_tool=f"grant:{spec.permission_key}",
+                decision="blocked_missing_explicit_approval",
+                reason="Persistent grant rejected without explicit_user_approval=True.",
+                actor=safe_actor,
+            )
+            raise PermissionAuthorityError(
+                "Persistent permissions require explicit user approval (explicit_user_approval=True)."
+            )
+
+        normalized_scope = normalize_resource_scope(spec.permission_key, resource_scope)
+        now = _utc_now()
+        now_iso = now.isoformat()
+        bound_session_id: str | None = None
+        expires_at: str | None = None
+        max_uses: int | None = None
+
+        if parsed_lifetime == PermissionLifetime.ONE_TIME:
+            bound_session_id = validated.session_id
+            max_uses = 1
+            if ttl_seconds is not None:
+                ttl = float(ttl_seconds)
+                if ttl <= 0 or ttl > _MAX_TIME_LIMITED_SECONDS:
+                    raise ValueError("ttl_seconds must be > 0.")
+                expires_at = (now + timedelta(seconds=ttl)).isoformat()
+        elif parsed_lifetime == PermissionLifetime.SESSION:
+            bound_session_id = validated.session_id
+        elif parsed_lifetime == PermissionLifetime.TIME_LIMITED:
+            if ttl_seconds is None:
+                raise ValueError("ttl_seconds is required for time_limited permissions.")
+            ttl = float(ttl_seconds)
+            if ttl <= 0 or ttl > _MAX_TIME_LIMITED_SECONDS:
+                raise ValueError(
+                    f"ttl_seconds must be between 0 and {_MAX_TIME_LIMITED_SECONDS}."
+                )
+            expires_at = (now + timedelta(seconds=ttl)).isoformat()
+        elif parsed_lifetime == PermissionLifetime.PERSISTENT:
+            pass
+
+        with self._lock:
+            self.expire_stale_permissions(user_id=validated.user_id)
+            active_grants = self._load_active_grants_locked(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                permission_key=spec.permission_key,
+                now=now,
+            )
+            # Active DENY covering this scope cannot be bypassed by adding ALLOW/CONFIRM.
+            target_probe = normalized_scope
+            for existing in active_grants:
+                if existing.decision != PermissionDecision.DENY:
+                    continue
+                if existing.resource_scope == "*" or existing.resource_scope == normalized_scope:
+                    self._audit(
+                        user_id=validated.user_id,
+                        session_id=validated.session_id,
+                        category=spec.category,
+                        permission_key=spec.permission_key,
+                        resource_or_tool=sanitize_resource_label(target_probe),
+                        decision="blocked_active_deny",
+                        reason="Cannot grant permission while an active DENY rule applies.",
+                        actor=safe_actor,
+                    )
+                    raise PermissionConflictError(
+                        f"Permission {spec.permission_key!r} is explicitly DENIED; "
+                        "revoke the DENY rule before granting."
+                    )
+                if normalized_scope.startswith(("path:", "dir:")):
+                    matched, _ = _scope_specificity(existing.resource_scope, target_probe)
+                    if matched:
+                        raise PermissionConflictError(
+                            f"Permission {spec.permission_key!r} is explicitly DENIED for scope "
+                            f"{existing.resource_scope!r}; revoke the DENY rule first."
+                        )
+
+            grant_id = f"prm_{uuid4().hex}"
+            safe_reason = sanitize_reason(
+                reason or f"User configured {parsed_decision.value} ({parsed_lifetime.value})"
+            )
+
+            conn = self.database.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # Replace prior active non-DENY grants for the exact same
+                # (user_id, permission_key, resource_scope) so rules stay clean.
+                conn.execute(
+                    """
+                    UPDATE permission_grants
+                    SET revoked_at = ?, revoked_reason = ?, updated_at = ?
+                    WHERE user_id = ?
+                      AND permission_key = ?
+                      AND resource_scope = ?
+                      AND decision != 'deny'
+                      AND revoked_at IS NULL
+                    """,
+                    (
+                        now_iso,
+                        "superseded_by_newer_user_grant",
+                        now_iso,
+                        validated.user_id,
+                        spec.permission_key,
+                        normalized_scope,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO permission_grants (
+                        grant_id,
+                        user_id,
+                        permission_key,
+                        resource_scope,
+                        decision,
+                        lifetime,
+                        session_id,
+                        expires_at,
+                        max_uses,
+                        use_count,
+                        granted_by,
+                        reason,
+                        revoked_at,
+                        revoked_reason,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        grant_id,
+                        validated.user_id,
+                        spec.permission_key,
+                        normalized_scope,
+                        parsed_decision.value,
+                        parsed_lifetime.value,
+                        bound_session_id,
+                        expires_at,
+                        max_uses,
+                        safe_actor,
+                        safe_reason,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM permission_grants WHERE grant_id = ?",
+                    (grant_id,),
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        assert row is not None
+        grant = self._row_to_grant(row)
+        self._audit(
+            user_id=validated.user_id,
+            session_id=validated.session_id,
+            category=spec.category,
+            permission_key=spec.permission_key,
+            resource_or_tool=normalized_scope,
+            decision=f"granted_{parsed_decision.value}",
+            reason=f"lifetime={parsed_lifetime.value}; {safe_reason}",
+            actor=safe_actor,
+        )
+        if parsed_decision == PermissionDecision.CONFIRM:
+            self._notify_revocation(
+                validated.user_id,
+                spec.permission_key,
+                validated.session_id,
+                "permission_downgraded_to_confirm",
+            )
+        return grant
+
+    def deny_permission(
+        self,
+        identity: AuthenticatedIdentity,
+        permission_key: str,
+        *,
+        resource_scope: str = "*",
+        lifetime: PermissionLifetime | str = PermissionLifetime.PERSISTENT,
+        ttl_seconds: float | None = None,
+        reason: str = "",
+        actor: str = "user",
+    ) -> PermissionGrant:
+        """Create an authoritative DENY rule that overrides grants and confirmations."""
+        spec = self._validate_permission_key(permission_key)
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=spec.permission_key,
+            resource_or_tool=f"deny:{spec.permission_key}",
+        )
+        safe_actor = self._validate_actor(actor)
+        parsed_lifetime = (
+            lifetime
+            if isinstance(lifetime, PermissionLifetime)
+            else PermissionLifetime(str(lifetime).strip().lower())
+        )
+        if parsed_lifetime == PermissionLifetime.ONE_TIME:
+            raise ValueError("DENY rules must use session, time_limited, or persistent lifetime.")
+
+        normalized_scope = normalize_resource_scope(spec.permission_key, resource_scope)
+        now = _utc_now()
+        now_iso = now.isoformat()
+        bound_session_id = (
+            validated.session_id if parsed_lifetime == PermissionLifetime.SESSION else None
+        )
+        expires_at: str | None = None
+        if parsed_lifetime == PermissionLifetime.TIME_LIMITED:
+            if ttl_seconds is None or float(ttl_seconds) <= 0:
+                raise ValueError("ttl_seconds > 0 required for time_limited DENY.")
+            expires_at = (now + timedelta(seconds=float(ttl_seconds))).isoformat()
+
+        grant_id = f"prm_{uuid4().hex}"
+        safe_reason = sanitize_reason(reason or "Explicit user deny rule")
+
+        with self._lock:
+            conn = self.database.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # Revoke weaker non-DENY grants on the exact same scope so UI/status stay accurate.
+                conn.execute(
+                    """
+                    UPDATE permission_grants
+                    SET revoked_at = ?, revoked_reason = ?, updated_at = ?
+                    WHERE user_id = ?
+                      AND permission_key = ?
+                      AND resource_scope = ?
+                      AND revoked_at IS NULL
+                    """,
+                    (
+                        now_iso,
+                        "overridden_by_explicit_deny",
+                        now_iso,
+                        validated.user_id,
+                        spec.permission_key,
+                        normalized_scope,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO permission_grants (
+                        grant_id,
+                        user_id,
+                        permission_key,
+                        resource_scope,
+                        decision,
+                        lifetime,
+                        session_id,
+                        expires_at,
+                        max_uses,
+                        use_count,
+                        granted_by,
+                        reason,
+                        revoked_at,
+                        revoked_reason,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 'deny', ?, ?, ?, NULL, 0, ?, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        grant_id,
+                        validated.user_id,
+                        spec.permission_key,
+                        normalized_scope,
+                        parsed_lifetime.value,
+                        bound_session_id,
+                        expires_at,
+                        safe_actor,
+                        safe_reason,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM permission_grants WHERE grant_id = ?",
+                    (grant_id,),
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        assert row is not None
+        grant = self._row_to_grant(row)
+        self._audit(
+            user_id=validated.user_id,
+            session_id=validated.session_id,
+            category=spec.category,
+            permission_key=spec.permission_key,
+            resource_or_tool=normalized_scope,
+            decision="denied_rule_set",
+            reason=safe_reason,
+            actor=safe_actor,
+        )
+        self._notify_revocation(
+            validated.user_id,
+            spec.permission_key,
+            None,
+            "permission_denied",
+        )
+        return grant
+
+    def revoke_permission(
+        self,
+        identity: AuthenticatedIdentity,
+        permission_key: str,
+        *,
+        resource_scope: str | None = None,
+        grant_id: str | None = None,
+        reason: str = "",
+        actor: str = "user",
+    ) -> int:
+        """Immediately revoke matching active grants/denies for the authenticated user."""
+        spec = self._validate_permission_key(permission_key)
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=spec.permission_key,
+            resource_or_tool=f"revoke:{spec.permission_key}",
+        )
+        safe_actor = self._validate_actor(actor)
+        now_iso = _utc_now().isoformat()
+        safe_reason = sanitize_reason(reason or "Revoked by user")
+
+        clauses = ["user_id = ?", "permission_key = ?", "revoked_at IS NULL"]
+        params: list[Any] = [validated.user_id, spec.permission_key]
+        if grant_id is not None and grant_id.strip():
+            clauses.append("grant_id = ?")
+            params.append(grant_id.strip())
+        if resource_scope is not None and str(resource_scope).strip():
+            norm = normalize_resource_scope(spec.permission_key, resource_scope)
+            clauses.append("resource_scope = ?")
+            params.append(norm)
+
+        where_sql = " AND ".join(clauses)
+        with self._lock:
+            conn = self.database.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    f"""
+                    UPDATE permission_grants
+                    SET revoked_at = ?, revoked_reason = ?, updated_at = ?
+                    WHERE {where_sql}
+                    """,
+                    (now_iso, safe_reason, now_iso, *params),
+                )
+                revoked_count = int(cursor.rowcount)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        self._audit(
+            user_id=validated.user_id,
+            session_id=validated.session_id,
+            category=spec.category,
+            permission_key=spec.permission_key,
+            resource_or_tool=sanitize_resource_label(resource_scope or spec.permission_key),
+            decision="revoked",
+            reason=f"revoked_count={revoked_count}; {safe_reason}",
+            actor=safe_actor,
+        )
+        self._notify_revocation(
+            validated.user_id,
+            spec.permission_key,
+            None,
+            "permission_revoked",
+        )
+        return revoked_count
+
+    def reset_permissions(
+        self,
+        identity: AuthenticatedIdentity,
+        *,
+        category: str | None = None,
+        reason: str = "",
+        actor: str = "user",
+    ) -> int:
+        """Revoke all active permissions (or one category) for the authenticated user."""
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key="permissions.reset",
+            resource_or_tool=f"reset:{category or 'all'}",
+        )
+        safe_actor = self._validate_actor(actor)
+        now_iso = _utc_now().isoformat()
+        safe_reason = sanitize_reason(reason or "User reset permissions")
+
+        key_filter: list[str] | None = None
+        if category is not None and category.strip():
+            cat = category.strip().lower()
+            key_filter = [
+                k for k, spec in PERMISSION_SPECS.items() if spec.category == cat
+            ]
+            if not key_filter:
+                raise ValueError(f"Unknown permission category {category!r}.")
+
+        with self._lock:
+            conn = self.database.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if key_filter is None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE permission_grants
+                        SET revoked_at = ?, revoked_reason = ?, updated_at = ?
+                        WHERE user_id = ? AND revoked_at IS NULL
+                        """,
+                        (now_iso, safe_reason, now_iso, validated.user_id),
+                    )
+                else:
+                    placeholders = ", ".join("?" for _ in key_filter)
+                    cursor = conn.execute(
+                        f"""
+                        UPDATE permission_grants
+                        SET revoked_at = ?, revoked_reason = ?, updated_at = ?
+                        WHERE user_id = ?
+                          AND revoked_at IS NULL
+                          AND permission_key IN ({placeholders})
+                        """,
+                        (now_iso, safe_reason, now_iso, validated.user_id, *key_filter),
+                    )
+                revoked_count = int(cursor.rowcount)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        self._audit(
+            user_id=validated.user_id,
+            session_id=validated.session_id,
+            category=(category or "all").strip().lower(),
+            permission_key="permissions.reset",
+            resource_or_tool=category or "all",
+            decision="reset",
+            reason=f"revoked_count={revoked_count}; {safe_reason}",
+            actor=safe_actor,
+        )
+        if key_filter is None:
+            self._notify_revocation(validated.user_id, None, None, "permissions_reset")
+        else:
+            for k in key_filter:
+                self._notify_revocation(validated.user_id, k, None, "permissions_reset")
+        return revoked_count
+
+    def expire_stale_permissions(self, *, user_id: str | None = None) -> int:
+        """Mark expired time_limited and exhausted one_time grants as revoked/expired."""
+        now_iso = _utc_now().isoformat()
+        with self._lock:
+            conn = self.database.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                user_clause = "AND user_id = ?" if user_id is not None else ""
+                params: tuple[Any, ...] = (
+                    (now_iso, now_iso, now_iso, user_id)
+                    if user_id is not None
+                    else (now_iso, now_iso, now_iso)
+                )
+                cursor = conn.execute(
+                    f"""
+                    UPDATE permission_grants
+                    SET revoked_at = ?, revoked_reason = 'expired', updated_at = ?
+                    WHERE revoked_at IS NULL
+                      AND (
+                        (expires_at IS NOT NULL AND expires_at <= ?)
+                        OR (lifetime = 'one_time' AND max_uses IS NOT NULL AND use_count >= max_uses)
+                      )
+                      {user_clause}
+                    """,
+                    params,
+                )
+                count = int(cursor.rowcount)
+                conn.commit()
+                return count
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _load_active_grants_locked(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        permission_key: str | None = None,
+        now: datetime | None = None,
+    ) -> list[PermissionGrant]:
+        current = now or _utc_now()
+        conn = self.database.connect()
+        try:
+            if permission_key is not None:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM permission_grants
+                    WHERE user_id = ?
+                      AND permission_key = ?
+                      AND revoked_at IS NULL
+                    ORDER BY created_at DESC, grant_id DESC
+                    """,
+                    (user_id, permission_key),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM permission_grants
+                    WHERE user_id = ?
+                      AND revoked_at IS NULL
+                    ORDER BY permission_key ASC, created_at DESC
+                    """,
+                    (user_id,),
+                ).fetchall()
+        finally:
+            conn.close()
+
+        active: list[PermissionGrant] = []
+        for row in rows:
+            grant = self._row_to_grant(row)
+            if grant.is_expired(current):
+                continue
+            if (
+                grant.lifetime in (PermissionLifetime.SESSION, PermissionLifetime.ONE_TIME)
+                and grant.session_id != session_id
+            ):
+                continue
+            active.append(grant)
+        return active
+
+    def list_permissions(
+        self,
+        identity: AuthenticatedIdentity,
+        *,
+        category: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[PermissionGrant]:
+        """List permission grants strictly belonging to the authenticated user."""
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key="permissions.list",
+            resource_or_tool="list_permissions",
+        )
+        with self._lock:
+            self.expire_stale_permissions(user_id=validated.user_id)
+            conn = self.database.connect()
+            try:
+                clauses = ["user_id = ?"]
+                params: list[Any] = [validated.user_id]
+                if not include_revoked:
+                    clauses.append("revoked_at IS NULL")
+                if category is not None and category.strip():
+                    cat = category.strip().lower()
+                    keys = [
+                        k for k, spec in PERMISSION_SPECS.items() if spec.category == cat
+                    ]
+                    if not keys:
+                        return []
+                    placeholders = ", ".join("?" for _ in keys)
+                    clauses.append(f"permission_key IN ({placeholders})")
+                    params.extend(keys)
+
+                where_sql = " AND ".join(clauses)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM permission_grants
+                    WHERE {where_sql}
+                    ORDER BY permission_key ASC, created_at DESC
+                    """,
+                    tuple(params),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        grants = [self._row_to_grant(row) for row in rows]
+        if include_revoked:
+            return grants
+        now = _utc_now()
+        return [
+            g
+            for g in grants
+            if not g.is_expired(now)
+            and (
+                g.lifetime not in (PermissionLifetime.SESSION, PermissionLifetime.ONE_TIME)
+                or g.session_id == validated.session_id
+            )
+        ]
+
+    def _select_winning_grant(
+        self,
+        grants: Iterable[PermissionGrant],
+        target_resource: str,
+    ) -> tuple[PermissionGrant | None, list[PermissionGrant]]:
+        """Apply strict precedence rules: DENY wins first, then specificity, then safety."""
+        matching: list[tuple[int, PermissionGrant]] = []
+        for grant in grants:
+            matched, rank = _scope_specificity(grant.resource_scope, target_resource)
+            if matched:
+                matching.append((rank, grant))
+
+        if not matching:
+            return None, []
+
+        # Rule 1: Any matching DENY always wins, regardless of specificity or lifetime.
+        denies = [pair for pair in matching if pair[1].decision == PermissionDecision.DENY]
+        if denies:
+            denies.sort(key=lambda pair: (pair[0], pair[1].created_at), reverse=True)
+            return denies[0][1], [p[1] for p in matching]
+
+        # Rule 2 & 3: Among non-DENY grants, highest specificity wins; tie -> CONFIRM safer than ALLOW.
+        max_rank = max(pair[0] for pair in matching)
+        top_tier = [pair[1] for pair in matching if pair[0] == max_rank]
+        confirms = [g for g in top_tier if g.decision == PermissionDecision.CONFIRM]
+        if confirms:
+            confirms.sort(key=lambda g: g.created_at, reverse=True)
+            return confirms[0], [p[1] for p in matching]
+
+        top_tier.sort(key=lambda g: g.created_at, reverse=True)
+        return top_tier[0], [p[1] for p in matching]
+
+    def _evaluate_single_key(
+        self,
+        validated: AuthenticatedIdentity,
+        permission_key: str,
+        target_resource: str,
+        *,
+        enforce_default_deny_if_unconfigured: bool | None = None,
+    ) -> PermissionEvaluation:
+        spec = PERMISSION_SPECS.get(permission_key)
+        if spec is None:
+            return PermissionEvaluation(
+                permission_key=permission_key,
+                category="unknown",
+                decision=PermissionDecision.DENY,
+                allowed=False,
+                blocked=True,
+                requires_confirmation=False,
+                reason=f"Unknown capability {permission_key!r} is blocked by fail-closed policy.",
+            )
+
+        now = _utc_now()
+        with self._lock:
+            self.expire_stale_permissions(user_id=validated.user_id)
+            grants = self._load_active_grants_locked(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                permission_key=spec.permission_key,
+                now=now,
+            )
+
+        winner, _ = self._select_winning_grant(grants, target_resource)
+        if winner is not None:
+            if winner.decision == PermissionDecision.DENY:
+                return PermissionEvaluation(
+                    permission_key=spec.permission_key,
+                    category=spec.category,
+                    decision=PermissionDecision.DENY,
+                    allowed=False,
+                    blocked=True,
+                    requires_confirmation=False,
+                    reason=(
+                        f"Permission {spec.permission_key!r} is explicitly DENIED for this user."
+                    ),
+                    matched_grant_id=winner.grant_id,
+                    matched_lifetime=winner.lifetime,
+                    matched_scope=winner.resource_scope,
+                )
+            if winner.decision == PermissionDecision.CONFIRM:
+                return PermissionEvaluation(
+                    permission_key=spec.permission_key,
+                    category=spec.category,
+                    decision=PermissionDecision.CONFIRM,
+                    allowed=True,
+                    blocked=False,
+                    requires_confirmation=True,
+                    reason=(
+                        f"Permission {spec.permission_key!r} requires explicit confirmation."
+                    ),
+                    matched_grant_id=winner.grant_id,
+                    matched_lifetime=winner.lifetime,
+                    matched_scope=winner.resource_scope,
+                )
+            return PermissionEvaluation(
+                permission_key=spec.permission_key,
+                category=spec.category,
+                decision=PermissionDecision.ALLOW,
+                allowed=True,
+                blocked=False,
+                requires_confirmation=spec.sensitive,
+                reason=(
+                    f"Permission {spec.permission_key!r} granted ({winner.lifetime.value})."
+                ),
+                matched_grant_id=winner.grant_id,
+                matched_lifetime=winner.lifetime,
+                matched_scope=winner.resource_scope,
+            )
+
+        # No active grant matched -> NOT_CONFIGURED
+        should_default_deny = (
+            enforce_default_deny_if_unconfigured
+            if enforce_default_deny_if_unconfigured is not None
+            else (self.strict_default_deny or spec.protected_by_default)
+        )
+        if should_default_deny:
+            return PermissionEvaluation(
+                permission_key=spec.permission_key,
+                category=spec.category,
+                decision=PermissionDecision.NOT_CONFIGURED,
+                allowed=False,
+                blocked=True,
+                requires_confirmation=False,
+                reason=(
+                    f"Permission {spec.permission_key!r} is not configured and blocked by default-deny. "
+                    "Grant it with /permissions grant."
+                ),
+            )
+
+        # Protected compatibility mode for non-protected user-private sandbox capabilities
+        return PermissionEvaluation(
+            permission_key=spec.permission_key,
+            category=spec.category,
+            decision=PermissionDecision.NOT_CONFIGURED,
+            allowed=True,
+            blocked=False,
+            requires_confirmation=spec.sensitive,
+            reason=(
+                f"Permission {spec.permission_key!r} not configured; using user-sandbox "
+                f"{'confirm' if spec.sensitive else 'allow'} policy."
+            ),
+        )
+
+    def evaluate(
+        self,
+        identity: AuthenticatedIdentity,
+        permission_key: str,
+        *,
+        resource_or_target: str = "*",
+        secondary_dir_target: str | None = None,
+        require_secondary_dir: bool = False,
+        record_audit: bool = True,
+        actor: str = "system",
+    ) -> PermissionEvaluation:
+        """Evaluate permission(s) read-only without consuming one-time grants."""
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=permission_key,
+            resource_or_tool=resource_or_target,
+        )
+        target = (
+            normalize_resource_scope(permission_key, resource_or_target)
+            if resource_or_target != "*"
+            else "*"
+        )
+
+        primary = self._evaluate_single_key(validated, permission_key, target)
+        final_eval = primary
+
+        # Evaluate secondary directory scope if applicable (e.g. filesystem.directory DENY/CONFIRM or outside workspace)
+        if secondary_dir_target is not None:
+            dir_target = normalize_resource_scope(
+                "filesystem.directory", secondary_dir_target
+            )
+            dir_eval = self._evaluate_single_key(
+                validated,
+                "filesystem.directory",
+                dir_target,
+                enforce_default_deny_if_unconfigured=(
+                    True if (require_secondary_dir and self.strict_default_deny) else False
+                ),
+            )
+            if dir_eval.blocked:
+                final_eval = dir_eval
+            elif (
+                not final_eval.blocked
+                and dir_eval.decision == PermissionDecision.CONFIRM
+                and not final_eval.requires_confirmation
+            ):
+                final_eval = PermissionEvaluation(
+                    permission_key=final_eval.permission_key,
+                    category=final_eval.category,
+                    decision=PermissionDecision.CONFIRM,
+                    allowed=True,
+                    blocked=False,
+                    requires_confirmation=True,
+                    reason=dir_eval.reason,
+                    matched_grant_id=dir_eval.matched_grant_id,
+                    matched_lifetime=dir_eval.matched_lifetime,
+                    matched_scope=dir_eval.matched_scope,
+                )
+
+        if record_audit:
+            self._audit(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                category=final_eval.category,
+                permission_key=final_eval.permission_key,
+                resource_or_tool=target,
+                decision=(
+                    "blocked_" + final_eval.decision.value
+                    if final_eval.blocked
+                    else f"checked_{final_eval.decision.value}"
+                ),
+                reason=final_eval.reason,
+                actor=actor,
+            )
+        return final_eval
+
+    @staticmethod
+    def _apply_tool_sensitivity(
+        tool_name: str,
+        evaluation: PermissionEvaluation,
+    ) -> PermissionEvaluation:
+        """Respect per-tool sensitivity when an umbrella capability is explicitly ALLOWed."""
+        cleaned = str(tool_name or "").strip()
+        if (
+            evaluation.allowed
+            and not evaluation.blocked
+            and evaluation.decision == PermissionDecision.ALLOW
+            and evaluation.requires_confirmation
+            and cleaned
+            and cleaned not in _SENSITIVE_TOOLS
+        ):
+            return PermissionEvaluation(
+                permission_key=evaluation.permission_key,
+                category=evaluation.category,
+                decision=evaluation.decision,
+                allowed=evaluation.allowed,
+                blocked=evaluation.blocked,
+                requires_confirmation=False,
+                reason=evaluation.reason,
+                matched_grant_id=evaluation.matched_grant_id,
+                matched_lifetime=evaluation.matched_lifetime,
+                matched_scope=evaluation.matched_scope,
+                consumed_grant_id=evaluation.consumed_grant_id,
+                warnings=evaluation.warnings,
+            )
+        return evaluation
+
+    def evaluate_tool(
+        self,
+        identity: AuthenticatedIdentity,
+        tool_name: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        workspace_dir: str | Path | None = None,
+        record_audit: bool = True,
+        actor: str = "system",
+    ) -> PermissionEvaluation:
+        """Evaluate permission requirements for a real tool call."""
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=f"tool.{tool_name}",
+            resource_or_tool=f"tool:{tool_name}",
+        )
+        req = resolve_permissions_for_tool(
+            tool_name,
+            parameters,
+            workspace_dir=workspace_dir or validated.workspace_dir,
+        )
+        evaluation = self.evaluate(
+            validated,
+            req.permission_key,
+            resource_or_target=req.target_resource,
+            secondary_dir_target=req.secondary_dir_target,
+            require_secondary_dir=req.require_secondary_dir_when_unconfigured,
+            record_audit=record_audit,
+            actor=actor,
+        )
+        return self._apply_tool_sensitivity(tool_name, evaluation)
+
+    def consume_if_authorized(
+        self,
+        identity: AuthenticatedIdentity,
+        permission_key: str,
+        *,
+        resource_or_target: str = "*",
+        secondary_dir_target: str | None = None,
+        require_secondary_dir: bool = False,
+        actor: str = "executor",
+    ) -> PermissionEvaluation:
+        """Atomically evaluate and consume a matching ONE_TIME grant right before execution."""
+        with self._lock:
+            result = self.evaluate(
+                identity,
+                permission_key,
+                resource_or_target=resource_or_target,
+                secondary_dir_target=secondary_dir_target,
+                require_secondary_dir=require_secondary_dir,
+                record_audit=False,
+                actor=actor,
+            )
+            if result.blocked:
+                validated = self.identity_manager.validate_session(identity)
+                self._audit(
+                    user_id=validated.user_id,
+                    session_id=validated.session_id,
+                    category=result.category,
+                    permission_key=result.permission_key,
+                    resource_or_tool=resource_or_target,
+                    decision=f"blocked_{result.decision.value}",
+                    reason=result.reason,
+                    actor=actor,
+                )
+                return result
+
+            consumed_id: str | None = None
+            if (
+                result.matched_grant_id is not None
+                and result.matched_lifetime == PermissionLifetime.ONE_TIME
+            ):
+                validated = self.identity_manager.validate_session(identity)
+                now_iso = _utc_now().isoformat()
+                conn = self.database.connect()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute(
+                        """
+                        UPDATE permission_grants
+                        SET
+                            use_count = use_count + 1,
+                            revoked_at = CASE
+                                WHEN use_count + 1 >= COALESCE(max_uses, 1) THEN ?
+                                ELSE revoked_at
+                            END,
+                            revoked_reason = CASE
+                                WHEN use_count + 1 >= COALESCE(max_uses, 1) THEN 'one_time_consumed'
+                                ELSE revoked_reason
+                            END,
+                            updated_at = ?
+                        WHERE grant_id = ?
+                          AND user_id = ?
+                          AND revoked_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > ?)
+                          AND use_count < COALESCE(max_uses, 1)
+                        """,
+                        (
+                            now_iso,
+                            now_iso,
+                            result.matched_grant_id,
+                            validated.user_id,
+                            now_iso,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        denied = PermissionEvaluation(
+                            permission_key=result.permission_key,
+                            category=result.category,
+                            decision=PermissionDecision.DENY,
+                            allowed=False,
+                            blocked=True,
+                            requires_confirmation=False,
+                            reason="One-time permission grant was already consumed or revoked.",
+                            matched_grant_id=result.matched_grant_id,
+                            matched_lifetime=PermissionLifetime.ONE_TIME,
+                            matched_scope=result.matched_scope,
+                        )
+                        self._audit(
+                            user_id=validated.user_id,
+                            session_id=validated.session_id,
+                            category=denied.category,
+                            permission_key=denied.permission_key,
+                            resource_or_tool=resource_or_target,
+                            decision="blocked_one_time_exhausted",
+                            reason=denied.reason,
+                            actor=actor,
+                        )
+                        return denied
+                    conn.commit()
+                    consumed_id = result.matched_grant_id
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+
+            validated = self.identity_manager.validate_session(identity)
+            final_result = PermissionEvaluation(
+                permission_key=result.permission_key,
+                category=result.category,
+                decision=result.decision,
+                allowed=result.allowed,
+                blocked=result.blocked,
+                requires_confirmation=result.requires_confirmation,
+                reason=result.reason,
+                matched_grant_id=result.matched_grant_id,
+                matched_lifetime=result.matched_lifetime,
+                matched_scope=result.matched_scope,
+                consumed_grant_id=consumed_id,
+                warnings=result.warnings,
+            )
+            self._audit(
+                user_id=validated.user_id,
+                session_id=validated.session_id,
+                category=final_result.category,
+                permission_key=final_result.permission_key,
+                resource_or_tool=resource_or_target,
+                decision=(
+                    "consumed_one_time"
+                    if consumed_id is not None
+                    else f"executed_{final_result.decision.value}"
+                ),
+                reason=final_result.reason,
+                actor=actor,
+            )
+            return final_result
+
+    def consume_tool_if_authorized(
+        self,
+        identity: AuthenticatedIdentity,
+        tool_name: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        workspace_dir: str | Path | None = None,
+        actor: str = "executor",
+    ) -> PermissionEvaluation:
+        """Resolve a real tool call and atomically evaluate/consume permission."""
+        validated = self._validate_identity_or_audit(
+            identity,
+            permission_key=f"tool.{tool_name}",
+            resource_or_tool=f"tool:{tool_name}",
+        )
+        req = resolve_permissions_for_tool(
+            tool_name,
+            parameters,
+            workspace_dir=workspace_dir or validated.workspace_dir,
+        )
+        evaluation = self.consume_if_authorized(
+            validated,
+            req.permission_key,
+            resource_or_target=req.target_resource,
+            secondary_dir_target=req.secondary_dir_target,
+            require_secondary_dir=req.require_secondary_dir_when_unconfigured,
+            actor=actor,
+        )
+        return self._apply_tool_sensitivity(tool_name, evaluation)

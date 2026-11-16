@@ -1,0 +1,213 @@
+import ctypes
+from pathlib import Path
+import threading
+
+from core.ai.safety import (
+    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    MAX_CONTEXT_SIZE,
+    MAX_GENERATION_TOKENS,
+    MAX_MODEL_RESPONSE_CHARS,
+    MIN_CONTEXT_SIZE,
+    InferenceCancelledError,
+    InferenceTimeoutError,
+    bound_model_output,
+    run_with_timeout,
+    sanitize_untrusted_text,
+)
+
+
+class NativeLlamaRuntime:
+    VALID_BACKENDS = {"auto", "metal", "cpu"}
+
+    def __init__(
+        self,
+        model_path: str,
+        context_size: int = 4096,
+        backend: str = "auto",
+    ):
+        if backend not in self.VALID_BACKENDS:
+            raise ValueError(
+                f"Invalid backend '{backend}'. "
+                f"Choose from {sorted(self.VALID_BACKENDS)}."
+            )
+
+        if (
+            isinstance(context_size, bool)
+            or not isinstance(context_size, int)
+            or not (MIN_CONTEXT_SIZE <= context_size <= MAX_CONTEXT_SIZE)
+        ):
+            raise ValueError(
+                f"context_size must be an integer between {MIN_CONTEXT_SIZE} "
+                f"and {MAX_CONTEXT_SIZE}."
+            )
+
+        if not isinstance(model_path, (str, Path)) or "\x00" in str(model_path):
+            raise ValueError("Invalid model path.")
+
+        self.handle = None
+        self.backend = "unloaded"
+        self.context_size = context_size
+        self._lock = threading.Lock()
+        self._in_flight = False
+        self._close_requested = False
+        self._cancel_event = threading.Event()
+
+        project_root = Path(__file__).resolve().parents[3]
+        bridge_path = (
+            project_root / "core" / "ai" / "native"
+            / "bridge" / "libriya_llama.dylib"
+        )
+
+        if not bridge_path.is_file():
+            raise FileNotFoundError(
+                f"RIYA native bridge not found: {bridge_path}"
+            )
+
+        resolved_model_path = Path(model_path).expanduser().resolve()
+        if not resolved_model_path.is_file():
+            raise FileNotFoundError(f"Model not found: {resolved_model_path}")
+
+        self.lib = ctypes.CDLL(str(bridge_path))
+
+        self.lib.riya_load_model_with_backend.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_char_p,
+        ]
+        self.lib.riya_load_model_with_backend.restype = ctypes.c_void_p
+
+        self.lib.riya_get_backend.argtypes = [ctypes.c_void_p]
+        self.lib.riya_get_backend.restype = ctypes.c_char_p
+
+        self.lib.riya_free_model.argtypes = [ctypes.c_void_p]
+        self.lib.riya_free_model.restype = None
+
+        self.lib.riya_generate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+        ]
+        self.lib.riya_generate.restype = ctypes.c_int
+
+        self.handle = self.lib.riya_load_model_with_backend(
+            str(resolved_model_path).encode("utf-8"),
+            context_size,
+            backend.encode("ascii"),
+        )
+
+        if not self.handle:
+            raise RuntimeError(
+                f"RIYA failed to load model using '{backend}'."
+            )
+
+        selected = self.lib.riya_get_backend(self.handle)
+        self.backend = (
+            selected.decode("ascii") if selected else "unknown"
+        )
+
+    def cancel(self) -> None:
+        """Signal an in-progress generation request to cancel safely."""
+
+        self._cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        """Clear cancellation state before a new request."""
+
+        self._cancel_event.clear()
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        *,
+        timeout_seconds: float | None = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    ) -> str:
+        if not isinstance(prompt, str):
+            raise ValueError("Prompt must be a string.")
+
+        if (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or not (1 <= max_tokens <= min(MAX_GENERATION_TOKENS, self.context_size))
+        ):
+            raise ValueError(
+                f"max_tokens must be an integer between 1 and "
+                f"{min(MAX_GENERATION_TOKENS, self.context_size)}."
+            )
+
+        cleaned_prompt = sanitize_untrusted_text(prompt, allow_newlines=True).strip()
+        if not cleaned_prompt:
+            raise ValueError("Prompt cannot be empty.")
+
+        max_prompt_bytes = min(self.context_size * 8, 65536)
+        encoded_prompt = cleaned_prompt.encode("utf-8")
+        if len(encoded_prompt) > max_prompt_bytes:
+            raise ValueError(
+                f"Prompt exceeds native maximum byte limit ({max_prompt_bytes} bytes)."
+            )
+
+        with self._lock:
+            if self._cancel_event.is_set():
+                raise InferenceCancelledError("Native AI inference was cancelled.")
+            if not self.handle or self._close_requested:
+                raise RuntimeError("Native model is not loaded.")
+            if self._in_flight:
+                raise RuntimeError(
+                    "Native AI runtime is busy with an active or recovering inference call."
+                )
+            self._in_flight = True
+            handle = self.handle
+
+        def _invoke_native() -> str:
+            try:
+                output = ctypes.create_string_buffer(16384)
+                result = self.lib.riya_generate(
+                    handle,
+                    encoded_prompt,
+                    output,
+                    len(output),
+                    max_tokens,
+                )
+
+                if result < 0:
+                    raise RuntimeError(
+                        f"RIYA generation failed with code {result}"
+                    )
+
+                decoded = output.value.decode("utf-8", errors="replace").strip()
+                return bound_model_output(
+                    decoded,
+                    max_chars=MAX_MODEL_RESPONSE_CHARS,
+                )
+            finally:
+                with self._lock:
+                    self._in_flight = False
+                    if self._close_requested and self.handle:
+                        self.lib.riya_free_model(self.handle)
+                        self.handle = None
+                        self.backend = "unloaded"
+
+        return run_with_timeout(
+            _invoke_native,
+            timeout_seconds=timeout_seconds,
+            cancel_event=self._cancel_event,
+        )
+
+    def close(self):
+        with self._lock:
+            self._cancel_event.set()
+            self._close_requested = True
+            if not self._in_flight and self.handle:
+                self.lib.riya_free_model(self.handle)
+                self.handle = None
+                self.backend = "unloaded"
+            elif not self._in_flight:
+                self.backend = "unloaded"
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

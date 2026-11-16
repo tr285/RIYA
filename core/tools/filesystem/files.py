@@ -1,12 +1,150 @@
+import errno
+import os
+from dataclasses import dataclass
 from pathlib import Path
+import stat
+
+from core.config import settings
+from core.identity.context import get_current_execution_context
+
+
+class FilesystemAccessError(PermissionError):
+    """Raised when a filesystem tool is asked to leave an allowed root."""
+
+
+@dataclass(frozen=True)
+class _PathContext:
+    """A resolved policy path and its descriptor-safe root-relative form."""
+
+    resolved: Path
+    root: Path
+    parts: tuple[str, ...]
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+MAX_READ_FILE_BYTES = 262_144
+MAX_WRITE_CHARS = 200_000
+MAX_LIST_ENTRIES = 500
+
+_SENSITIVE_NAMES = frozenset({
+    ".git",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".bash_history",
+    ".zsh_history",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "known_hosts",
+    "authorized_keys",
+    "credentials.json",
+    "secrets.json",
+    "token.json",
+    "riya.db",
+    "riya.db-wal",
+    "riya.db-shm",
+    "voice_settings.json",
+    "voice_recordings",
+})
+
+_SENSITIVE_SUFFIXES = (
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".kdbx",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+)
+
+
+def _is_sensitive_component(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered in _SENSITIVE_NAMES
+        or lowered.startswith(".env.")
+        or lowered.endswith(_SENSITIVE_SUFFIXES)
+    )
+
+
+def _is_sensitive_relative_path(parts: tuple[str, ...]) -> bool:
+    return any(_is_sensitive_component(part) for part in parts)
+
+
+def _allowed_roots() -> tuple[Path, ...]:
+    """Return resolved allowed roots from the active user context or runtime configuration."""
+
+    ctx = get_current_execution_context()
+    if ctx is not None:
+        return tuple(
+            Path(root).expanduser().resolve()
+            for root in ctx.allowed_roots
+        )
+
+    return tuple(
+        Path(root).expanduser().resolve()
+        for root in settings.FILESYSTEM_ALLOWED_ROOTS
+    )
+
+
+def _is_within_allowed_root(path: Path) -> bool:
+    return any(
+        path == root or root in path.parents
+        for root in _allowed_roots()
+    )
+
+
+def _is_protected_user_store_path(resolved: Path) -> bool:
+    """Prevent access to other users' isolated storage or system data roots."""
+    ctx = get_current_execution_context()
+    protected_users_root = (settings.PROJECT_ROOT / "data" / "users").resolve()
+    if resolved == protected_users_root or protected_users_root in resolved.parents:
+        if ctx is None:
+            return True
+        if not any(resolved == r or r in resolved.parents for r in ctx.allowed_roots):
+            return True
+    return False
+
+
+def _reject_symlinks_under_roots(unfollowed: Path, roots: tuple[Path, ...]) -> None:
+    """Reject any symlink leaf or intermediate symlink directory before Path.resolve()."""
+    if unfollowed.is_symlink():
+        raise FilesystemAccessError(
+            f"Access denied: unsafe path component (symlink blocked): {unfollowed}"
+        )
+    for cur in (unfollowed, *unfollowed.parents):
+        if cur.is_symlink():
+            raise FilesystemAccessError(
+                f"Access denied: unsafe path component (symlink blocked): {cur}"
+            )
+        try:
+            if cur in roots or cur.resolve() in roots:
+                break
+        except OSError:
+            continue
 
 
 def _resolve_path(path: str) -> Path:
-    """
-    Resolve common user-facing paths.
-    """
+    """Resolve aliases and enforce the allowed-root policy before access."""
+
+    if not isinstance(path, str) or "\x00" in path:
+        raise FilesystemAccessError("Access denied: invalid filesystem path.")
 
     path = path.strip()
+
+    if not path:
+        raise FilesystemAccessError("Access denied: empty filesystem path.")
 
     aliases = {
         "desktop": "~/Desktop",
@@ -16,11 +154,165 @@ def _resolve_path(path: str) -> Path:
     }
 
     normalized = path.lower()
+    ctx = get_current_execution_context()
 
     if normalized in aliases:
         path = aliases[normalized]
 
-    return Path(path).expanduser().resolve()
+    candidate = Path(path).expanduser()
+    if ctx is not None and not candidate.is_absolute():
+        unfollowed = ctx.workspace_dir / candidate
+    else:
+        unfollowed = candidate
+
+    roots = _allowed_roots()
+    _reject_symlinks_under_roots(unfollowed, roots)
+    resolved = unfollowed.resolve()
+
+    if _is_protected_user_store_path(resolved) or not _is_within_allowed_root(resolved):
+        raise FilesystemAccessError(
+            "Access denied: RIYA can only access configured "
+            f"filesystem roots. Requested path: {resolved}"
+        )
+
+    return resolved
+
+
+def _path_context(path: str) -> _PathContext:
+    """Bind a policy-approved path to its most specific allowed root."""
+
+    resolved = _resolve_path(path)
+    roots = [
+        root
+        for root in _allowed_roots()
+        if resolved == root or root in resolved.parents
+    ]
+    root = max(roots, key=lambda item: len(item.parts))
+    parts = resolved.relative_to(root).parts
+
+    if _is_sensitive_relative_path(parts):
+        raise FilesystemAccessError(
+            f"Access denied: sensitive private path is protected: {resolved}"
+        )
+
+    return _PathContext(
+        resolved=resolved,
+        root=root,
+        parts=parts,
+    )
+
+
+def _access_error(path: Path, exc: OSError) -> FilesystemAccessError:
+    """Do not expose a symlink/race as an ordinary filesystem failure."""
+
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return FilesystemAccessError(
+            f"Access denied: unsafe path component: {path}"
+        )
+
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return FilesystemAccessError(
+            f"Access denied by operating-system or macOS TCC privacy permissions while opening path: {path}"
+        )
+
+    return FilesystemAccessError(
+        f"Access denied while opening path: {path}"
+    )
+
+
+def _open_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    try:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _access_error(path, exc) from exc
+
+
+def _open_directory(
+    context: _PathContext,
+    create_parents: bool = False,
+) -> int:
+    """Open a directory component-by-component without following links."""
+
+    try:
+        descriptor = os.open(context.root, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise _access_error(context.root, exc) from exc
+
+    current_path = context.root
+
+    try:
+        for part in context.parts:
+            current_path = current_path / part
+
+            try:
+                child = _open_directory_at(
+                    descriptor,
+                    part,
+                    current_path,
+                )
+            except FilesystemAccessError as exc:
+                if not create_parents or not isinstance(
+                    exc.__cause__, FileNotFoundError
+                ):
+                    raise
+
+                try:
+                    os.mkdir(part, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+
+                child = _open_directory_at(
+                    descriptor,
+                    part,
+                    current_path,
+                )
+
+            os.close(descriptor)
+            descriptor = child
+
+        return descriptor
+
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_parent_directory(
+    context: _PathContext,
+    create_parents: bool = False,
+) -> tuple[int, str | None]:
+    """Open a target's parent through no-follow directory descriptors."""
+
+    if not context.parts:
+        root_context = _PathContext(context.root, context.root, ())
+        return _open_directory(root_context), None
+
+    parent = _PathContext(
+        resolved=context.resolved.parent,
+        root=context.root,
+        parts=context.parts[:-1],
+    )
+
+    return _open_directory(parent, create_parents), context.parts[-1]
+
+
+def _entry_stat(parent_fd: int, name: str, path: Path):
+    try:
+        return os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _access_error(path, exc) from exc
+
+
+def _safe_scandir(directory_fd: int):
+    """Return a scan over a duplicated descriptor owned by scandir."""
+
+    return os.scandir(os.dup(directory_fd))
 
 
 def list_files(
@@ -31,156 +323,455 @@ def list_files(
     if directory is not None:
         path = directory
 
-    directory_path = _resolve_path(path)
+    context = _path_context(path)
 
-    if not directory_path.exists():
-        return (
-            f"Directory not found: "
-            f"{directory_path}"
-        )
+    try:
+        directory_fd = _open_directory(context)
+    except FilesystemAccessError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return f"Directory not found: {context.resolved}"
+        raise
 
-    if not directory_path.is_dir():
-        return (
-            f"Not a directory: "
-            f"{directory_path}"
-        )
+    try:
+        entries = []
+        list_limited = False
 
-    entries = sorted(
-        directory_path.iterdir(),
-        key=lambda item: (
-            not item.is_dir(),
-            item.name.lower(),
-        ),
-    )
+        with _safe_scandir(directory_fd) as scan:
+            for entry in scan:
+                if _is_sensitive_component(entry.name):
+                    continue
+
+                if len(entries) >= MAX_LIST_ENTRIES:
+                    list_limited = True
+                    break
+
+                entry_path = context.resolved / entry.name
+                entry_stat = _entry_stat(
+                    directory_fd,
+                    entry.name,
+                    entry_path,
+                )
+
+                # Never report a symlink that may change target after listing.
+                if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                    continue
+
+                entries.append((
+                    entry.name,
+                    stat.S_ISDIR(entry_stat.st_mode),
+                ))
+
+    finally:
+        os.close(directory_fd)
+
+    entries.sort(key=lambda item: (not item[1], item[0].lower()))
 
     if not entries:
-        return (
-            f"{directory_path} is empty."
+        return f"{context.resolved} is empty."
+
+    listing = "\n".join(
+        f"{'[DIR]' if is_directory else '[FILE]'} {name}"
+        for name, is_directory in entries
+    )
+    if list_limited:
+        listing += (
+            f"\nDirectory listing truncated at {MAX_LIST_ENTRIES} entries "
+            "to protect system resources."
         )
+    return listing
 
-    lines = []
 
-    for entry in entries:
-
-        prefix = (
-            "[DIR]"
-            if entry.is_dir()
-            else "[FILE]"
-        )
-
-        lines.append(
-            f"{prefix} {entry.name}"
-        )
-
-    return "\n".join(lines)
+MAX_SEARCH_DEPTH = 20
+MAX_SEARCH_ENTRIES = 10_000
+MAX_SEARCH_MATCHES = 50
 
 
 def find_files(
     name: str,
-    path: str = "~",
+    path: str | None = None,
 ) -> str:
 
-    root = _resolve_path(path)
+    if path is None:
+        path = str(settings.PROJECT_ROOT)
 
-    if not root.exists():
-        return (
-            f"Directory not found: "
-            f"{root}"
-        )
+    context = _path_context(path)
 
-    matches = []
+    try:
+        root_fd = _open_directory(context)
+    except FilesystemAccessError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return f"Directory not found: {context.resolved}"
+        raise
 
-    for item in root.rglob("*"):
+    matches: list[str] = []
+    needle = name.lower()
+    visited_entries = 0
+    depth_limited = False
+    entry_limited = False
 
-        if name.lower() in item.name.lower():
-            matches.append(str(item))
+    def walk(directory_fd: int, directory_path: Path, depth: int) -> None:
+        nonlocal visited_entries, depth_limited, entry_limited
 
-        if len(matches) >= 50:
-            break
+        if len(matches) >= MAX_SEARCH_MATCHES:
+            return
+
+        with _safe_scandir(directory_fd) as scan:
+            for entry in scan:
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    return
+
+                if visited_entries >= MAX_SEARCH_ENTRIES:
+                    entry_limited = True
+                    return
+
+                visited_entries += 1
+
+                if _is_sensitive_component(entry.name):
+                    continue
+
+                entry_path = directory_path / entry.name
+                entry_stat = _entry_stat(
+                    directory_fd,
+                    entry.name,
+                    entry_path,
+                )
+
+                if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                    continue
+
+                if needle in entry.name.lower():
+                    matches.append(str(entry_path))
+
+                if not stat.S_ISDIR(entry_stat.st_mode):
+                    continue
+
+                if depth >= MAX_SEARCH_DEPTH:
+                    depth_limited = True
+                    continue
+
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    return
+
+                try:
+                    child_fd = _open_directory_at(
+                        directory_fd,
+                        entry.name,
+                        entry_path,
+                    )
+                except FilesystemAccessError:
+                    # The entry changed after stat. It is never followed.
+                    continue
+
+                try:
+                    walk(child_fd, entry_path, depth + 1)
+                finally:
+                    os.close(child_fd)
+
+                if (
+                    len(matches) >= MAX_SEARCH_MATCHES
+                    or entry_limited
+                ):
+                    return
+
+    try:
+        walk(root_fd, context.resolved, 0)
+    finally:
+        os.close(root_fd)
 
     if not matches:
-        return (
-            f"No files or folders found "
-            f"matching '{name}'."
+        result = f"No files or folders found matching '{name}'."
+    else:
+        result = "\\n".join(matches)
+
+    if entry_limited or depth_limited:
+        result += (
+            "\\nSearch was limited to protect system resources. "
+            "Try searching a smaller directory."
         )
 
-    return "\n".join(matches)
-
+    return result
 
 def create_folder(path: str) -> str:
 
-    directory = _resolve_path(path)
+    context = _path_context(path)
 
-    if directory.exists():
+    if not context.parts:
+        return f"Folder already exists: {context.resolved}"
 
-        if directory.is_dir():
-            return (
-                f"Folder already exists: "
-                f"{directory}"
-            )
-
-        return (
-            f"A file already exists at: "
-            f"{directory}"
-        )
-
-    directory.mkdir(
-        parents=True,
-        exist_ok=False,
+    parent_fd, name = _open_parent_directory(
+        context,
+        create_parents=True,
     )
+    assert name is not None
 
-    return (
-        f"Folder created: "
-        f"{directory}"
-    )
+    try:
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError:
+            entry_stat = _entry_stat(parent_fd, name, context.resolved)
+
+            if entry_stat is None or stat.S_ISLNK(entry_stat.st_mode):
+                raise FilesystemAccessError(
+                    f"Access denied: unsafe path component: {context.resolved}"
+                )
+
+            if stat.S_ISDIR(entry_stat.st_mode):
+                return f"Folder already exists: {context.resolved}"
+
+            return f"A file already exists at: {context.resolved}"
+
+    finally:
+        os.close(parent_fd)
+
+    return f"Folder created: {context.resolved}"
 
 
 def read_file(path: str) -> str:
 
-    file_path = _resolve_path(path)
+    context = _path_context(path)
 
-    if not file_path.exists():
-        return (
-            f"File not found: "
-            f"{file_path}"
-        )
+    if not context.parts:
+        return f"Not a file: {context.resolved}"
 
-    if not file_path.is_file():
-        return (
-            f"Not a file: "
-            f"{file_path}"
-        )
+    parent_fd, name = _open_parent_directory(context)
+    assert name is not None
 
     try:
-        return file_path.read_text(
-            encoding="utf-8"
-        )
+        try:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return f"File not found: {context.resolved}"
+        except OSError as exc:
+            if exc.errno == errno.EISDIR:
+                return f"Not a file: {context.resolved}"
+            raise _access_error(context.resolved, exc) from exc
 
-    except UnicodeDecodeError:
-        return (
-            "I can't read this as a UTF-8 "
-            f"text file: {file_path}"
-        )
+    finally:
+        os.close(parent_fd)
 
+    try:
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return f"Not a file: {context.resolved}"
+
+        if file_stat.st_size > MAX_READ_FILE_BYTES:
+            return (
+                f"File exceeds maximum readable size ({MAX_READ_FILE_BYTES} bytes): "
+                f"{context.resolved}"
+            )
+
+        raw = bytearray()
+        while len(raw) <= MAX_READ_FILE_BYTES:
+            chunk = os.read(file_fd, MAX_READ_FILE_BYTES + 1 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+
+        if len(raw) > MAX_READ_FILE_BYTES:
+            return (
+                f"File exceeds maximum readable size ({MAX_READ_FILE_BYTES} bytes): "
+                f"{context.resolved}"
+            )
+
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return "I can't read this as a UTF-8 text file: " f"{context.resolved}"
+    finally:
+        os.close(file_fd)
+
+
+
+
+def verify_file_content(path: str, expected_content: str) -> bool:
+    """Verify exact UTF-8 content using safe descriptor-based access."""
+    if not isinstance(expected_content, str):
+        return False
+
+    try:
+        expected = expected_content.encode("utf-8")
+        context = _path_context(path)
+
+        if not context.parts:
+            return False
+
+        parent_fd, name = _open_parent_directory(context)
+        assert name is not None
+
+        try:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                return False
+
+            actual = bytearray()
+            limit = len(expected) + 1
+
+            while len(actual) < limit:
+                chunk = os.read(file_fd, limit - len(actual))
+                if not chunk:
+                    break
+                actual.extend(chunk)
+
+            return bytes(actual) == expected
+        finally:
+            os.close(file_fd)
+
+    except (OSError, UnicodeEncodeError, FilesystemAccessError):
+        return False
 
 def write_file(
     path: str,
     content: str,
 ) -> str:
 
-    file_path = _resolve_path(path)
+    if not isinstance(content, str):
+        raise TypeError("File content must be text.")
 
-    file_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if len(content) > MAX_WRITE_CHARS:
+        raise ValueError(
+            f"File content exceeds maximum allowed length ({MAX_WRITE_CHARS} characters)."
+        )
 
-    file_path.write_text(
-        content,
-        encoding="utf-8",
-    )
+    context = _path_context(path)
 
-    return (
-        f"File written: "
-        f"{file_path}"
+    if not context.parts:
+        return f"Not a file: {context.resolved}"
+
+    parent_fd, name = _open_parent_directory(
+        context,
+        create_parents=True,
     )
+    assert name is not None
+
+    try:
+        try:
+            file_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EISDIR:
+                return f"Not a file: {context.resolved}"
+            raise _access_error(context.resolved, exc) from exc
+
+    finally:
+        os.close(parent_fd)
+
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            return f"Not a file: {context.resolved}"
+
+        os.ftruncate(file_fd, 0)
+
+        with os.fdopen(file_fd, "w", encoding="utf-8") as file:
+            file_fd = None
+            file.write(content)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+    return f"File written: {context.resolved}"
+
+
+def inspect_file_metadata_structured(path: str) -> dict[str, object]:
+    """Inspect safe file or directory metadata inside allowed roots without following symlinks."""
+    from datetime import datetime, timezone
+
+    raw_path = path.strip() if isinstance(path, str) else ""
+    if raw_path:
+        aliases = {
+            "desktop": "~/Desktop",
+            "documents": "~/Documents",
+            "downloads": "~/Downloads",
+            "home": "~",
+        }
+        mapped = aliases.get(raw_path.lower(), raw_path)
+        candidate = Path(mapped).expanduser()
+        ctx = get_current_execution_context()
+        if ctx is not None and not candidate.is_absolute():
+            unfollowed = ctx.workspace_dir / candidate
+        else:
+            unfollowed = candidate
+        if unfollowed.is_symlink():
+            raise FilesystemAccessError(
+                f"Access denied: unsafe path component (symlink blocked): {unfollowed}"
+            )
+        for root in _allowed_roots():
+            try:
+                rel = unfollowed.relative_to(root)
+            except ValueError:
+                continue
+            cur = root
+            for part in rel.parts:
+                cur = cur / part
+                if cur.is_symlink():
+                    raise FilesystemAccessError(
+                        f"Access denied: unsafe path component (symlink blocked): {cur}"
+                    )
+
+    context = _path_context(path)
+    parent_fd, name = _open_parent_directory(context)
+    try:
+        if name is None:
+            entry_stat = os.fstat(parent_fd)
+        else:
+            entry_stat = _entry_stat(parent_fd, name, context.resolved)
+            if entry_stat is None:
+                raise FileNotFoundError(f"Path not found: {context.resolved}")
+    finally:
+        os.close(parent_fd)
+
+    if stat.S_ISLNK(entry_stat.st_mode):
+        raise FilesystemAccessError(
+            f"Access denied: unsafe path component (symlink blocked): {context.resolved}"
+        )
+
+    entry_type = (
+        "directory"
+        if stat.S_ISDIR(entry_stat.st_mode)
+        else ("file" if stat.S_ISREG(entry_stat.st_mode) else "other")
+    )
+    mtime_iso = datetime.fromtimestamp(entry_stat.st_mtime, tz=timezone.utc).isoformat()
+    birthtime = getattr(entry_stat, "st_birthtime", entry_stat.st_ctime)
+    ctime_iso = datetime.fromtimestamp(birthtime, tz=timezone.utc).isoformat()
+    mode_octal = oct(stat.S_IMODE(entry_stat.st_mode))
+    return {
+        "name": context.resolved.name or str(context.resolved),
+        "path": str(context.resolved),
+        "allowed_root": str(context.root),
+        "type": entry_type,
+        "size_bytes": int(entry_stat.st_size),
+        "mode_octal": mode_octal,
+        "modified_at": mtime_iso,
+        "created_at": ctime_iso,
+        "is_symlink": False,
+        "readable": bool(entry_stat.st_mode & stat.S_IRUSR),
+        "writable": bool(entry_stat.st_mode & stat.S_IWUSR),
+    }
+
+
+def inspect_file_metadata(path: str) -> str:
+    """Return a formatted & JSON-serializable summary of file or folder metadata within allowed roots."""
+    import json
+
+    try:
+        meta = inspect_file_metadata_structured(path)
+    except FileNotFoundError:
+        resolved = _resolve_path(path)
+        return f"Path not found: {resolved}"
+    return json.dumps(meta, ensure_ascii=False)
+

@@ -4,6 +4,11 @@ from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from core.memory.semantic_memory import (
+    get_cached_local_embedding_model,
+    set_shared_embedding_model,
+)
+
 
 @dataclass
 class SemanticMatch:
@@ -66,24 +71,32 @@ class SemanticToolEngine:
         """
         Load the pretrained embedding model.
 
-        First execution may download the model.
-        Later executions use the local cache.
+        Semantic retrieval is strictly local. If the embedding model is not
+        already cached, the caller can fall back to the complete tool registry
+        without downloading anything during startup.
         """
 
+        if model_name == self.MODEL_NAME:
+            cached = get_cached_local_embedding_model(allow_load=False)
+            if cached is not None:
+                return cached
+
         try:
-            return SentenceTransformer(
-                model_name
+            loaded = SentenceTransformer(
+                model_name,
+                local_files_only=True,
             )
+            if model_name == self.MODEL_NAME:
+                set_shared_embedding_model(loaded)
+            return loaded
 
         except Exception as exc:
 
             raise RuntimeError(
                 "RIYA could not load the local "
                 "embedding model.\n\n"
-                "The first run requires internet access "
-                "to download the pretrained model.\n"
-                "After that, RIYA can use the cached model "
-                "offline.\n\n"
+                "The embedding model is not available in the local cache.\n"
+                "RIYA will continue without semantic retrieval.\n\n"
                 f"Original error: {exc}"
             ) from exc
 
@@ -278,23 +291,9 @@ class SemanticToolEngine:
             )
 
             if parameters:
-
-                lines.append(
-                    f"- {tool.name}"
-                    f"({parameters}): "
-                    f"{tool.description}"
-                    f" [semantic_score="
-                    f"{match.score:.3f}]"
-                )
-
+                lines.append(f"- {tool.name}({parameters}): {tool.description}")
             else:
-
-                lines.append(
-                    f"- {tool.name}(): "
-                    f"{tool.description}"
-                    f" [semantic_score="
-                    f"{match.score:.3f}]"
-                )
+                lines.append(f"- {tool.name}(): {tool.description}")
 
         return "\n".join(
             lines

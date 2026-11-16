@@ -1,0 +1,698 @@
+"""RIYA interactive entry point supporting multi-user local authentication, setup, CLI, and desktop UI."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+from pathlib import Path
+import shlex
+import sys
+
+from core.agent.assistant import RIYAAssistant
+from core.config.settings import APP_NAME, APP_VERSION, DEVELOPER_NAME
+from core.identity import (
+    AuthenticatedIdentity,
+    IdentityError,
+    IdentityManager,
+    UserAlreadyExistsError,
+    UserNotFoundError,
+)
+from core.memory.database import DATABASE_PATH, MemoryDatabase
+from core.memory.manager import MemoryManager
+from core.onboarding.manager import OnboardingCoordinator
+from core.onboarding.state import InstallState
+from core.security.permissions import (
+    PERMISSION_SPECS,
+    PermissionErrorBase,
+    PermissionLifetime,
+)
+
+
+def _prompt_create_user(identity_manager: IdentityManager) -> AuthenticatedIdentity:
+    while True:
+        username = input("Choose username (2-32 chars): ").strip()
+        display_name = input("Display name (optional): ").strip() or username
+        method = (
+            input("Auth method [local_password/local_pin/local_unlock] (default: local_password): ")
+            .strip()
+            .lower()
+            or "local_password"
+        )
+        password: str | None = None
+        if method in {"local_password", "local_pin"}:
+            secret = getpass.getpass(f"Enter {method.replace('local_', '')}: ")
+            confirm = getpass.getpass("Confirm credential: ")
+            if secret != confirm:
+                print("Credentials did not match. Please try again.")
+                continue
+            password = secret
+        try:
+            profile = identity_manager.create_user(
+                username,
+                password=password,
+                display_name=display_name,
+                auth_method=method,
+            )
+            return identity_manager.authenticate(
+                profile.username,
+                password=password,
+                auth_method=method,
+            )
+        except (ValueError, UserAlreadyExistsError, IdentityError) as exc:
+            print(f"Account creation error: {exc}")
+
+
+def _authenticate_cli_user(
+    identity_manager: IdentityManager,
+    preferred_username: str | None = None,
+) -> AuthenticatedIdentity:
+    users = identity_manager.list_users()
+    if not users:
+        print("No local users found. Create your first RIYA user profile:")
+        return _prompt_create_user(identity_manager)
+
+    if preferred_username:
+        profile = identity_manager.get_profile_by_username(preferred_username)
+        password = (
+            None
+            if profile.auth_method == "local_unlock"
+            else getpass.getpass(f"Password/PIN for {profile.username}: ")
+        )
+        return identity_manager.authenticate(
+            profile.username,
+            password=password,
+            auth_method=profile.auth_method,
+        )
+
+    print("Available RIYA accounts:")
+    for idx, profile in enumerate(users, start=1):
+        print(f"  {idx}. {profile.display_name} (@{profile.username}, method={profile.auth_method})")
+
+    while True:
+        choice = input("Enter username (or 'new' to create an account): ").strip()
+        if choice.lower() == "new":
+            return _prompt_create_user(identity_manager)
+        try:
+            profile = identity_manager.get_profile_by_username(choice)
+        except (ValueError, UserNotFoundError) as exc:
+            print(f"Account error: {exc}")
+            continue
+
+        password = (
+            None
+            if profile.auth_method == "local_unlock"
+            else getpass.getpass(f"Password/PIN for {profile.username}: ")
+        )
+        try:
+            return identity_manager.authenticate(
+                profile.username,
+                password=password,
+                auth_method=profile.auth_method,
+            )
+        except IdentityError as exc:
+            print(f"Authentication failed: {exc}")
+
+
+def _print_diagnostics_report(report) -> None:
+    print("=" * 60)
+    print(f"{APP_NAME} System Readiness & Health Check ({report.checked_at})")
+    print("=" * 60)
+    for chk in report.checks:
+        print(f"  [{chk.status.value.upper():14s}] {chk.name} ({chk.category}): {chk.summary}")
+        print(f"      {chk.detail}")
+        if chk.recovery_action:
+            print(f"      Recovery: {chk.recovery_action}")
+    if report.degraded_capabilities:
+        print(f"  Degraded optional capabilities: {', '.join(report.degraded_capabilities)}")
+    print(
+        f"Summary: mandatory_passed={report.mandatory_passed} | can_enter_app={report.can_enter_app}"
+    )
+
+
+def _run_cli_setup(coordinator: OnboardingCoordinator) -> AuthenticatedIdentity | None:
+    welcome = coordinator.welcome_info()
+    det = welcome.detection
+    print("=" * 60)
+    print(f"{welcome.title} — First-Time Setup & Onboarding")
+    print(welcome.tagline)
+    print("=" * 60)
+    print(welcome.privacy_details)
+    print(f"\nDetected state: {det.install_state.value} — {det.message}")
+
+    if det.checkpoint_corrupted:
+        ans = input("Corrupted onboarding checkpoint detected. Back up & repair it? [Y/n]: ").strip().lower()
+        if ans in {"", "y", "yes"}:
+            backup = coordinator.recover_corrupted_checkpoint()
+            print(f"Checkpoint backed up to: {backup}")
+        else:
+            print("Setup paused without modifying files.")
+            return None
+
+    _, identity_manager, _, _ = coordinator.initialize_services()
+    coordinator.start_or_resume_setup(step=det.resume_step if det.can_resume else "welcome")
+
+    # Account step
+    print("\n--- Step 1: Local Account Setup ---")
+    if coordinator.active_identity is None:
+        identity = _authenticate_cli_user(identity_manager)
+        coordinator.active_identity = identity
+    else:
+        identity = coordinator.active_identity
+        print(f"Using active account: {identity.display_name} (@{identity.username})")
+
+    det_after = coordinator.detect_initial_state()
+    if det_after.legacy_memories_count > 0:
+        claim_ans = (
+            input(
+                f"Found {det_after.legacy_memories_count} preserved v0.4 memories. "
+                "Import them into this profile? [y/N]: "
+            )
+            .strip()
+            .lower()
+        )
+        if claim_ans in {"y", "yes"}:
+            db, _, _, _ = coordinator.initialize_services()
+            claimed = MemoryManager(db, identity_manager=identity_manager).claim_legacy_memories(
+                identity,
+                identity_manager=identity_manager,
+            )
+            print(f"Imported {claimed} preserved v0.4 memories into @{identity.username}.")
+
+    # AI Engine step
+    print("\n--- Step 2: Local AI Engine Setup (Offline GGUF) ---")
+    ai_status = coordinator.inspect_ai()
+    ram_gb = ai_status.total_ram_bytes / float(1024**3) if ai_status.total_ram_bytes else 0.0
+    disk_gb = ai_status.free_disk_bytes / float(1024**3) if ai_status.free_disk_bytes else 0.0
+    print(
+        f"Hardware: {ai_status.architecture} | RAM: {ram_gb:.1f} GB | Free Disk: {disk_gb:.1f} GB | "
+        f"Native llama.cpp: {'Ready' if ai_status.native_library_loadable else 'Unavailable'}"
+    )
+    if ai_status.discovered_models:
+        print("Discovered local GGUF models:")
+        for idx, m in enumerate(ai_status.discovered_models, start=1):
+            state_lbl = "valid" if m.valid_gguf else f"invalid: {m.error}"
+            print(f"  {idx}. {m.name} ({m.size_gb:.2f} GB, {state_lbl}) — {m.path}")
+        choice = input(
+            "Select model number, enter full .gguf path, or type 'skip' for Limited Mode [1]: "
+        ).strip()
+        if choice.lower() == "skip":
+            coordinator.continue_without_ai()
+        else:
+            chosen_path: str | None = None
+            if not choice:
+                chosen_path = ai_status.discovered_models[0].path
+            elif choice.isdigit() and 1 <= int(choice) <= len(ai_status.discovered_models):
+                chosen_path = ai_status.discovered_models[int(choice) - 1].path
+            else:
+                chosen_path = choice
+            backend = input("Backend [auto/metal/cpu] (default auto): ").strip().lower() or "auto"
+            print("Verifying model with real offline inference...")
+            ver = coordinator.configure_and_verify_ai(model_path=chosen_path, backend=backend)
+            if ver.success:
+                print(f"AI verified ({ver.backend_used}): {ver.output_preview[:120]}")
+            else:
+                print(f"AI verification failed: {ver.error_message}")
+                cont = input("Continue in Limited Mode (deterministic tools + memory still work)? [Y/n]: ").strip().lower()
+                if cont in {"", "y", "yes"}:
+                    coordinator.continue_without_ai()
+    else:
+        print("No local .gguf models discovered in ./models.")
+        custom = input("Enter path to a local .gguf file, or type 'skip' / Enter for Limited Mode: ").strip()
+        if custom and custom.lower() != "skip":
+            ver = coordinator.configure_and_verify_ai(model_path=custom, backend="auto")
+            if ver.success:
+                print(f"AI verified ({ver.backend_used}): {ver.output_preview[:120]}")
+            else:
+                print(f"AI verification failed: {ver.error_message}")
+                coordinator.continue_without_ai()
+        else:
+            coordinator.continue_without_ai()
+
+    # Voice setup step (permission-gated)
+    print("\n--- Step 3: Voice & Audio Setup ---")
+    cfg, cfg_err = coordinator.load_current_voice_config()
+    if cfg_err:
+        print(f"Note: {cfg_err}")
+    vst = coordinator.inspect_voice(config=cfg)
+    print(f"Input devices: {len(vst.input_devices)} | Output devices: {len(vst.output_devices)}")
+    print(f"STT ({vst.stt_model}): {vst.stt_status_detail} | VAD: {vst.vad_backend}")
+    print(f"Languages: {', '.join(lbl for _, lbl in vst.language_options)}")
+    if input("Save default voice configuration now? [y/N]: ").strip().lower() in {"y", "yes"}:
+        try:
+            coordinator.save_voice_setup(cfg)
+            print("Voice settings saved.")
+        except PermissionError as exc:
+            print(f"Voice config requires explicit permission ({exc}). Skipped without auto-granting.")
+            coordinator.skip_voice_setup()
+    else:
+        coordinator.skip_voice_setup()
+
+    # Permissions onboarding step (never auto-grants)
+    print("\n--- Step 4: Permissions & Privacy Model ---")
+    print(coordinator.permission_guide_text())
+    input("Press Enter after reviewing RIYA's permission rules (no permissions are auto-granted)...")
+    coordinator.acknowledge_permissions_reviewed()
+
+    # Diagnostics & completion
+    print("\n--- Step 5: System Readiness Check ---")
+    report = coordinator.run_diagnostics()
+    _print_diagnostics_report(report)
+    if report.mandatory_passed:
+        coordinator.complete_onboarding()
+        print("Setup completed successfully.")
+    else:
+        print("Mandatory checks must pass before marking onboarding complete.")
+    return identity
+
+
+def main_ui(argv: list[str] | None = None) -> None:
+    """Launch RIYA's desktop UI directly (used by `riya-ui` and macOS app launcher)."""
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} Desktop UI")
+    parser.add_argument("--database", type=str, default=None, help="Optional SQLite database path")
+    args = parser.parse_args(argv)
+
+    from core.onboarding.ui import launch_desktop_app
+
+    db_path = Path(args.database).expanduser().resolve() if args.database else DATABASE_PATH
+    coordinator = OnboardingCoordinator(database_path=db_path)
+    launch_desktop_app(coordinator=coordinator)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} Offline Assistant")
+    parser.add_argument("--voice", action="store_true", help="Start directly in voice conversation mode")
+    parser.add_argument("--ui", action="store_true", help="Launch desktop conversation UI")
+    parser.add_argument("--setup", action="store_true", help="Run interactive first-time setup wizard")
+    parser.add_argument("--diagnostics", action="store_true", help="Run system readiness diagnostics and exit")
+    parser.add_argument("--user", type=str, default=None, help="Authenticate as a specific local username")
+    parser.add_argument("--database", type=str, default=None, help="Optional SQLite database path")
+    args = parser.parse_args(argv)
+
+    db_path = Path(args.database).expanduser().resolve() if args.database else DATABASE_PATH
+    coordinator = OnboardingCoordinator(database_path=db_path)
+
+    if args.ui:
+        from core.onboarding.ui import launch_desktop_app
+
+        launch_desktop_app(coordinator=coordinator)
+        return
+
+    if args.diagnostics:
+        report = coordinator.run_diagnostics()
+        _print_diagnostics_report(report)
+        return
+
+    database, identity_manager, permission_manager, state_store = coordinator.initialize_services()
+
+    if args.setup:
+        try:
+            identity = _run_cli_setup(coordinator)
+        except (EOFError, KeyboardInterrupt):
+            print("\nSetup cancelled.")
+            return
+        if identity is None:
+            return
+    else:
+        det = coordinator.detect_initial_state()
+        if det.checkpoint_corrupted:
+            print(f"[Notice: {det.checkpoint_error} Run '--setup' or '--diagnostics' to inspect recovery.]")
+        try:
+            identity = _authenticate_cli_user(identity_manager, preferred_username=args.user)
+        except (EOFError, KeyboardInterrupt):
+            print("\nAuthentication cancelled.")
+            return
+        coordinator.active_identity = identity
+
+    model_path, ai_backend = state_store.get_effective_model_config(identity.user_id)
+    assistant = RIYAAssistant(
+        identity_manager=identity_manager,
+        default_identity=identity,
+        require_identity=True,
+        permission_manager=permission_manager,
+        model_path=model_path,
+        ai_backend=ai_backend,
+        allow_degraded_ai=True,
+    )
+
+    print("=" * 50)
+    print(f"{APP_NAME} {APP_VERSION}")
+    print(f"Developer: {DEVELOPER_NAME}")
+    print(f"Signed in as: {identity.display_name} (@{identity.username})")
+    print("=" * 50)
+    print(
+        "RIYA is ready. Commands: /voice, /text, /interrupt, /status, /diagnostics, "
+        "/onboarding, /memories, /settings, /permissions, /whoami, /create-user, "
+        "/switch-user, /logout, or 'exit'.\n"
+    )
+
+    orchestrator = None
+
+    def _get_orchestrator():
+        nonlocal orchestrator
+        current = assistant.current_identity
+        if current is None:
+            raise IdentityError("Please sign in first with /switch-user.")
+        if orchestrator is None:
+            from core.voice.config import VoiceConfig
+            from core.voice.orchestrator import VoiceOrchestrator
+            from core.voice.session import VoiceSession
+
+            cfg = VoiceConfig.load_for_user(identity_manager.users_root, current.user_id)
+            session = VoiceSession(
+                cfg,
+                user_id=current.user_id,
+                auth_session_id=current.session_id,
+            )
+            orchestrator = VoiceOrchestrator(
+                assistant,
+                config=cfg,
+                session=session,
+                identity_manager=identity_manager,
+                permission_manager=assistant.permission_manager,
+                identity=current,
+            )
+        return orchestrator
+
+    try:
+        if args.voice:
+            orch = _get_orchestrator()
+            orch.switch_mode("voice")
+            print("[Voice mode ON - Microphone active. Type /text or /interrupt anytime.]")
+
+        while True:
+            try:
+                user = input("You: ").strip()
+            except EOFError:
+                break
+
+            if not user:
+                continue
+
+            lower = user.lower()
+            if lower in {"exit", "quit", "stop"}:
+                response = assistant.process(user)
+                print(f"RIYA: {response}")
+                break
+
+            if lower == "/whoami":
+                current = assistant.current_identity
+                if current is None:
+                    print("[Signed out]")
+                else:
+                    print(
+                        f"[user=@{current.username} display={current.display_name!r} "
+                        f"user_id={current.user_id} workspace={current.workspace_dir}]"
+                    )
+                continue
+
+            if lower == "/create-user":
+                try:
+                    new_identity = _prompt_create_user(identity_manager)
+                    assistant.set_identity(new_identity)
+                    coordinator.active_identity = new_identity
+                    if orchestrator is not None:
+                        from core.voice.config import VoiceConfig
+                        cfg = VoiceConfig.load_for_user(
+                            identity_manager.users_root, new_identity.user_id
+                        )
+                        orchestrator.switch_identity(new_identity, config=cfg)
+                    print(f"[Created and switched to @{new_identity.username}]")
+                except (EOFError, KeyboardInterrupt, IdentityError, ValueError) as exc:
+                    print(f"[Account creation failed: {exc}]")
+                continue
+
+            if lower == "/switch-user":
+                try:
+                    new_identity = _authenticate_cli_user(identity_manager)
+                    previous = assistant.current_identity
+                    if previous is not None:
+                        identity_manager.logout(previous)
+                    assistant.set_identity(new_identity)
+                    coordinator.active_identity = new_identity
+                    if orchestrator is not None:
+                        from core.voice.config import VoiceConfig
+                        cfg = VoiceConfig.load_for_user(
+                            identity_manager.users_root, new_identity.user_id
+                        )
+                        orchestrator.switch_identity(new_identity, config=cfg)
+                    print(f"[Switched user to {new_identity.display_name} (@{new_identity.username})]")
+                except (EOFError, KeyboardInterrupt, IdentityError, ValueError) as exc:
+                    print(f"[Switch user failed: {exc}]")
+                continue
+
+            if lower == "/logout":
+                assistant.logout()
+                coordinator.active_identity = None
+                if orchestrator is not None:
+                    orchestrator.switch_identity(None)
+                print("[Signed out. Use /switch-user to sign in or 'exit' to quit.]")
+                continue
+
+            if lower.startswith("/permissions"):
+                _handle_permissions_cli(assistant, user)
+                continue
+
+            if lower == "/voice":
+                try:
+                    orch = _get_orchestrator()
+                    orch.switch_mode("voice")
+                    print("[Voice mode ON - Microphone active]")
+                except (IdentityError, PermissionError) as exc:
+                    print(f"[Voice error: {exc}]")
+                continue
+
+            if lower == "/text":
+                if orchestrator is not None:
+                    orchestrator.switch_mode("text")
+                print("[Text mode ON - Microphone off]")
+                continue
+
+            if lower == "/interrupt":
+                if orchestrator is not None:
+                    orchestrator.interrupt("cli_interrupt")
+                    print("[Playback interrupted]")
+                continue
+
+            if lower == "/status":
+                current = assistant.current_identity
+                user_label = f"@{current.username}" if current is not None else "signed_out"
+                ai_st = assistant.ai_status()
+                ai_label = f"ready ({ai_st.get('backend', 'local')})" if ai_st.get("loaded") else "limited (no AI model loaded)"
+                if orchestrator is None:
+                    print(f"[user={user_label} ai={ai_label} mode=text voice_state=idle mic=OFF]")
+                else:
+                    print(
+                        f"[user={user_label} ai={ai_label} mode={orchestrator.mode} voice_state={orchestrator.state.value} "
+                        f"mic={'LIVE' if orchestrator.session.microphone_active else 'OFF'}]"
+                    )
+                continue
+
+            if lower == "/diagnostics":
+                report = coordinator.run_diagnostics(assistant=assistant)
+                _print_diagnostics_report(report)
+                continue
+
+            if lower == "/onboarding":
+                det_now = coordinator.detect_initial_state()
+                print(
+                    f"[Onboarding state={det_now.install_state.value} step={det_now.resume_step} "
+                    f"legacy_v04_memories={det_now.legacy_memories_count}: {det_now.message}]"
+                )
+                continue
+
+            if lower == "/memories":
+                current = assistant.current_identity
+                if current is None:
+                    print("[Sign in first with /switch-user.]")
+                else:
+                    try:
+                        rows = assistant.memory.manager.for_identity(current).list_memories()
+                        print(f"[Stored memories for @{current.username} ({len(rows)})]")
+                        for row in rows:
+                            print(f"  - [{row.get('category', 'general')}] {row.get('key')} = {row.get('value')}")
+                    except Exception as exc:
+                        print(f"[Memory access blocked/error: {exc}]")
+                continue
+
+            if lower == "/settings":
+                orch = _get_orchestrator()
+                print(orch.config.to_dict())
+                continue
+
+            if orchestrator is not None:
+                response = orchestrator.send_text(user)
+            else:
+                response = assistant.process(user)
+
+            print(f"RIYA: {response}")
+    finally:
+        if orchestrator is not None:
+            orchestrator.close()
+        assistant.logout()
+        assistant.close()
+
+
+def _confirm_cli_prompt(prompt_text: str) -> bool:
+    ans = input(f"{prompt_text} Type 'yes' to confirm: ").strip().lower()
+    return ans == "yes"
+
+
+def _handle_permissions_cli(assistant: RIYAAssistant, raw_command: str) -> None:
+    pm = getattr(assistant, "permission_manager", None)
+    current = assistant.current_identity
+    if pm is None or current is None:
+        print("[Permissions unavailable: sign in first with /switch-user.]")
+        return
+
+    try:
+        tokens = shlex.split(raw_command)
+    except ValueError as exc:
+        print(f"[Invalid command syntax: {exc}]")
+        return
+
+    sub = tokens[1].lower() if len(tokens) > 1 else "list"
+    args = tokens[2:]
+
+    try:
+        if sub == "list":
+            cat_filter = args[0].lower() if args else None
+            grants = pm.list_permissions(current, category=cat_filter)
+            by_key: dict[str, list] = {}
+            for g in grants:
+                by_key.setdefault(g.permission_key, []).append(g)
+
+            print(f"[Permissions for @{current.username}]")
+            for spec in pm.list_catalog():
+                if cat_filter and spec.category != cat_filter:
+                    continue
+                active = by_key.get(spec.permission_key, [])
+                if not active:
+                    default_lbl = (
+                        "NOT_CONFIGURED (default-deny)"
+                        if (pm.strict_default_deny or spec.protected_by_default)
+                        else ("NOT_CONFIGURED (confirm)" if spec.sensitive else "NOT_CONFIGURED (sandbox-allow)")
+                    )
+                    print(f"  - {spec.permission_key} [{spec.category}]: {default_lbl} — {spec.description}")
+                else:
+                    for g in active:
+                        exp = f" expires={g.expires_at}" if g.expires_at else ""
+                        print(
+                            f"  - {spec.permission_key} [{spec.category}]: {g.decision.value.upper()} "
+                            f"lifetime={g.lifetime.value} scope={g.resource_scope}{exp}"
+                        )
+            return
+
+        if sub == "audit":
+            limit = int(args[0]) if args else 25
+            events = pm.audit_logger.list_audit_events(current, limit=limit)
+            print(f"[Recent Permission Audit Events ({len(events)})]")
+            for ev in events:
+                print(
+                    f"  #{ev.audit_id} [{ev.created_at}] {ev.permission_category}/{ev.permission_key} "
+                    f"({ev.resource_or_tool}) -> {ev.decision} ({ev.actor}): {ev.reason}"
+                )
+            return
+
+        if sub == "reset":
+            category = args[0].lower() if args else None
+            target_desc = f"category '{category}'" if category else "ALL permissions"
+            if not _confirm_cli_prompt(f"Reset {target_desc} for @{current.username}?"):
+                print("[Permission reset cancelled.]")
+                return
+            count = pm.reset_permissions(current, category=category, actor="user_cli")
+            print(f"[Reset {count} permission rule(s).]")
+            return
+
+        if sub in {"grant", "deny", "revoke"}:
+            if not args:
+                print(f"[Usage: /permissions {sub} <permission_key> [--scope S] [--lifetime L] [--ttl SEC] [--mode allow|confirm]]")
+                return
+            perm_key = args[0]
+            scope = "*"
+            lifetime = "persistent" if sub == "deny" else "session"
+            ttl_seconds: float | None = None
+            mode = "allow"
+
+            idx = 1
+            while idx < len(args):
+                flag = args[idx]
+                if flag == "--scope" and idx + 1 < len(args):
+                    scope = args[idx + 1]
+                    idx += 2
+                elif flag == "--lifetime" and idx + 1 < len(args):
+                    lifetime = args[idx + 1].lower()
+                    idx += 2
+                elif flag == "--ttl" and idx + 1 < len(args):
+                    ttl_seconds = float(args[idx + 1])
+                    idx += 2
+                elif flag == "--mode" and idx + 1 < len(args):
+                    mode = args[idx + 1].lower()
+                    idx += 2
+                else:
+                    print(f"[Unknown or incomplete option: {flag}]")
+                    return
+
+            if sub == "revoke":
+                count = pm.revoke_permission(
+                    current,
+                    perm_key,
+                    resource_scope=None if scope == "*" else scope,
+                    actor="user_cli",
+                )
+                print(f"[Revoked {count} grant(s) for {perm_key}.]")
+                return
+
+            if sub == "deny":
+                grant = pm.deny_permission(
+                    current,
+                    perm_key,
+                    resource_scope=scope,
+                    lifetime=lifetime,
+                    ttl_seconds=ttl_seconds,
+                    actor="user_cli",
+                )
+                print(f"[Set DENY rule on {grant.permission_key} scope={grant.resource_scope} lifetime={grant.lifetime.value}.]")
+                return
+
+            spec = PERMISSION_SPECS.get(perm_key)
+            if spec is None:
+                print(f"[Unknown permission key: {perm_key}]")
+                return
+
+            explicit_ok = True
+            if lifetime == PermissionLifetime.PERSISTENT.value or spec.sensitive:
+                explicit_ok = _confirm_cli_prompt(
+                    f"Grant {mode.upper()} on {perm_key} (lifetime={lifetime}, scope={scope}) for @{current.username}?"
+                )
+                if not explicit_ok:
+                    print("[Permission grant cancelled.]")
+                    return
+
+            grant = pm.grant_permission(
+                current,
+                perm_key,
+                decision=mode,
+                lifetime=lifetime,
+                resource_scope=scope,
+                ttl_seconds=ttl_seconds,
+                actor="user_cli",
+                explicit_user_approval=explicit_ok,
+            )
+            print(
+                f"[Granted {grant.decision.value.upper()} on {grant.permission_key} "
+                f"lifetime={grant.lifetime.value} scope={grant.resource_scope}.]"
+            )
+            return
+
+        print(
+            "[Commands: /permissions [list [cat]] | /permissions grant <key> [--scope S] "
+            "[--lifetime one_time|session|time_limited|persistent] [--ttl SEC] [--mode allow|confirm] | "
+            "/permissions deny <key> [--scope S] | /permissions revoke <key> | "
+            "/permissions reset [cat] | /permissions audit [limit]]"
+        )
+    except (ValueError, PermissionErrorBase, IdentityError) as exc:
+        print(f"[Permission error: {exc}]")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

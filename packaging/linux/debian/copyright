@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: RIYA
+Upstream-Contact: Tukaram <developer@riya.ai>
+Source: https://github.com/tukaramgore/RIYA
+
+Files: *
+Copyright: 2026 Tukaram <developer@riya.ai>
+License: Proprietary-Personal-Use
+ All rights reserved. RIYA is personal offline-first software designed
+ for autonomous personal intelligence on user-owned hardware.
+

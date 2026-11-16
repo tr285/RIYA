@@ -1,0 +1,142 @@
+"""Thread-safe voice conversation state machine (UI-independent)."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from enum import Enum
+from typing import Callable
+
+from core.voice.errors import InvalidStateTransition
+
+logger = logging.getLogger("riya.voice.state")
+
+
+class VoiceState(str, Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    TRANSCRIBING = "transcribing"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    INTERRUPTED = "interrupted"
+    ERROR = "error"
+    STOPPING = "stopping"
+
+
+ACTIVE_STATES = frozenset(
+    {
+        VoiceState.LISTENING,
+        VoiceState.TRANSCRIBING,
+        VoiceState.THINKING,
+        VoiceState.SPEAKING,
+        VoiceState.INTERRUPTED,
+    }
+)
+
+# States in which the microphone stream is open.
+MICROPHONE_OPEN_STATES = ACTIVE_STATES
+
+# Allowed transitions. The required transitions from the Phase 5 spec are all
+# present. Additional transitions (each documented) are required for honest
+# behaviour:
+#   TRANSCRIBING -> LISTENING : nothing intelligible was recognised.
+#   THINKING     -> LISTENING : voice responses disabled (text shown only).
+#   LISTENING    -> THINKING  : typed message submitted during a voice session.
+#   THINKING     -> INTERRUPTED: user barged in / pressed interrupt while
+#                                RIYA was still thinking (response discarded).
+#   active       -> ERROR     : unrecoverable audio failure.
+_ALLOWED_TRANSITIONS: dict[VoiceState, frozenset[VoiceState]] = {
+    VoiceState.IDLE: frozenset({VoiceState.LISTENING}),
+    VoiceState.LISTENING: frozenset(
+        {VoiceState.TRANSCRIBING, VoiceState.THINKING, VoiceState.STOPPING, VoiceState.ERROR}
+    ),
+    VoiceState.TRANSCRIBING: frozenset(
+        {VoiceState.THINKING, VoiceState.LISTENING, VoiceState.STOPPING, VoiceState.ERROR}
+    ),
+    VoiceState.THINKING: frozenset(
+        {
+            VoiceState.SPEAKING,
+            VoiceState.LISTENING,
+            VoiceState.INTERRUPTED,
+            VoiceState.STOPPING,
+            VoiceState.ERROR,
+        }
+    ),
+    VoiceState.SPEAKING: frozenset(
+        {VoiceState.LISTENING, VoiceState.INTERRUPTED, VoiceState.STOPPING, VoiceState.ERROR}
+    ),
+    VoiceState.INTERRUPTED: frozenset(
+        {VoiceState.LISTENING, VoiceState.STOPPING, VoiceState.ERROR}
+    ),
+    VoiceState.ERROR: frozenset({VoiceState.IDLE}),
+    VoiceState.STOPPING: frozenset({VoiceState.IDLE}),
+}
+
+
+StateListener = Callable[[VoiceState, VoiceState, str], None]
+
+
+def allowed_transitions(state: VoiceState) -> frozenset[VoiceState]:
+    return _ALLOWED_TRANSITIONS[state]
+
+
+class VoiceStateMachine:
+    """Validates and publishes voice state transitions.
+
+    Listeners are invoked *outside* the internal lock so a listener may safely
+    query ``state`` without deadlocking. Listener exceptions are contained.
+    """
+
+    def __init__(self, initial: VoiceState = VoiceState.IDLE):
+        if not isinstance(initial, VoiceState):
+            raise TypeError("initial must be a VoiceState")
+        self._state = initial
+        self._lock = threading.RLock()
+        self._listeners: list[StateListener] = []
+
+    @property
+    def state(self) -> VoiceState:
+        with self._lock:
+            return self._state
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Re-entrant lock for compound check-then-transition operations."""
+        return self._lock
+
+    def is_active(self) -> bool:
+        return self.state in ACTIVE_STATES
+
+    def add_listener(self, listener: StateListener) -> None:
+        with self._lock:
+            self._listeners.append(listener)
+
+    def can_transition(self, new_state: VoiceState) -> bool:
+        with self._lock:
+            return new_state in _ALLOWED_TRANSITIONS[self._state]
+
+    def transition(self, new_state: VoiceState, reason: str = "") -> VoiceState:
+        if not isinstance(new_state, VoiceState):
+            raise InvalidStateTransition(f"Unknown voice state: {new_state!r}")
+        with self._lock:
+            previous = self._state
+            if new_state not in _ALLOWED_TRANSITIONS[previous]:
+                raise InvalidStateTransition(
+                    f"Invalid voice state transition {previous.value} -> {new_state.value}"
+                )
+            self._state = new_state
+            listeners = list(self._listeners)
+        logger.debug("voice state %s -> %s", previous.value, new_state.value)
+        for listener in listeners:
+            try:
+                listener(previous, new_state, reason)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("voice state listener failed")
+        return previous
+
+    def try_transition(self, new_state: VoiceState, reason: str = "") -> bool:
+        try:
+            self.transition(new_state, reason)
+            return True
+        except InvalidStateTransition:
+            return False

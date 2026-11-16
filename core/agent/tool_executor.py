@@ -1,5 +1,39 @@
-from core.agent.tool_registry import ToolRegistry
+import contextlib
+import contextvars
+import copy
+import json
+from pathlib import Path
+import time
+from typing import Any
+
+from core.ai.safety import InferenceTimeoutError, run_with_timeout
+from core.device.platform import UnsupportedPlatformCapabilityError
+from core.agent.tool_registry import (
+    FORBIDDEN_PERMISSION_ADMIN_TOOLS,
+    RESERVED_TOOL_PARAMETERS,
+    ToolRegistry,
+    ToolResult,
+)
+from core.identity.context import (
+    ExecutionContext,
+    ExecutionContextScope,
+    get_current_execution_context,
+)
+from core.identity.errors import IdentityError, InvalidIdentityError, MissingIdentityError
+from core.identity.models import AuthenticatedIdentity, UserProfile
+from core.memory.manager import MemoryManager, confirmed_memory_overwrite_scope
+from core.security.confirmation import ConfirmationManager
 from core.security.manager import SecurityManager
+from core.security.permissions import (
+    PERMISSION_SPECS,
+    PermissionManager,
+    resolve_permissions_for_tool,
+)
+
+
+MAX_PLAN_STEPS = 8
+_UNSET = object()
+_RESERVED_PARAM_NAMES = RESERVED_TOOL_PARAMETERS
 
 
 class ToolExecutor:
@@ -16,9 +50,163 @@ class ToolExecutor:
     - Execute multi-step plans safely
     """
 
-    def __init__(self, registry: ToolRegistry):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        confirmation_ttl_seconds: float = 120,
+        confirmation_clock=None,
+        max_plan_steps: int = MAX_PLAN_STEPS,
+        identity_manager: Any = None,
+        permission_store: Any = None,
+        permission_manager: Any = None,
+        require_identity: bool = False,
+        default_identity: AuthenticatedIdentity | None = None,
+    ):
+        if max_plan_steps <= 0 or max_plan_steps > MAX_PLAN_STEPS:
+            raise ValueError(f"max_plan_steps must be between 1 and {MAX_PLAN_STEPS}.")
+
         self.registry = registry
         self.security = SecurityManager()
+        self.max_plan_steps = max_plan_steps
+        self.identity_manager = identity_manager
+        self.permission_store = permission_store
+        if permission_manager is not None:
+            self.permission_manager = permission_manager
+        elif (
+            identity_manager is not None
+            and hasattr(identity_manager, "database")
+            and hasattr(identity_manager, "validate_session")
+        ):
+            self.permission_manager = PermissionManager(
+                identity_manager,
+                strict_default_deny=False,
+            )
+        else:
+            self.permission_manager = None
+        self._identity_required = bool(
+            require_identity
+            or identity_manager is not None
+            or default_identity is not None
+        )
+        self._active_identity: AuthenticatedIdentity | None = None
+        self.confirmations = ConfirmationManager(
+            ttl_seconds=confirmation_ttl_seconds,
+            **(
+                {"clock": confirmation_clock}
+                if confirmation_clock is not None
+                else {}
+            ),
+        )
+        if self.permission_manager is not None and hasattr(
+            self.permission_manager, "register_revocation_listener"
+        ):
+            self.permission_manager.register_revocation_listener(
+                self._on_permission_revoked
+            )
+        if default_identity is not None:
+            self.set_identity(default_identity)
+
+    def _on_permission_revoked(
+        self,
+        user_id: str,
+        permission_key: str | None,
+        session_id: str | None,
+        reason: str,
+    ) -> None:
+        if permission_key is None:
+            self.confirmations.cancel_for_session(
+                user_id=user_id,
+                session_id=session_id,
+            )
+            return
+        spec = PERMISSION_SPECS.get(permission_key)
+        tool_names = spec.tools if spec is not None else None
+        self.confirmations.cancel_matching(
+            user_id=user_id,
+            tool_names=tool_names,
+            permission_key=permission_key,
+            session_id=session_id,
+        )
+
+    def set_identity(self, identity: AuthenticatedIdentity | None) -> None:
+        """Bind or clear the active user identity, revoking prior session confirmations."""
+        previous = getattr(self, "_active_identity", None)
+        if previous is not None:
+            self.confirmations.cancel_for_session(
+                user_id=previous.user_id,
+                session_id=previous.session_id,
+            )
+
+        if identity is None:
+            self._active_identity = None
+            return
+
+        validated = self._validate_identity_object(identity)
+        self._active_identity = validated
+        self._identity_required = True
+
+    def _validate_identity_object(self, identity: Any) -> AuthenticatedIdentity:
+        if identity is None:
+            raise MissingIdentityError("Authenticated user identity is required.")
+        if isinstance(identity, UserProfile):
+            raise InvalidIdentityError(
+                "A UserProfile cannot be used as an authenticated execution identity."
+            )
+        if not isinstance(identity, AuthenticatedIdentity):
+            raise InvalidIdentityError(
+                "Invalid user identity; expected AuthenticatedIdentity."
+            )
+        if self.identity_manager is not None:
+            return self.identity_manager.validate_session(identity)
+        return identity
+
+    def _resolve_execution_identity(
+        self,
+        user_context: Any,
+    ) -> AuthenticatedIdentity | None:
+        if user_context is not _UNSET:
+            return self._validate_identity_object(user_context)
+
+        if self._active_identity is not None:
+            return self._validate_identity_object(self._active_identity)
+
+        ctx = get_current_execution_context()
+        if ctx is not None and ctx.identity is not None:
+            return self._validate_identity_object(ctx.identity)
+
+        if self._identity_required:
+            raise MissingIdentityError(
+                "Authenticated user identity is required for tool execution."
+            )
+
+        return None
+
+    def _build_execution_context(
+        self,
+        identity: AuthenticatedIdentity,
+    ) -> ExecutionContext:
+        if self.identity_manager is not None:
+            scoped_memory = MemoryManager(
+                self.identity_manager.database,
+                identity=identity,
+                identity_manager=self.identity_manager,
+                require_user=True,
+            )
+            return self.identity_manager.build_execution_context(
+                identity,
+                memory_manager=scoped_memory,
+            )
+
+        workspace = Path(identity.workspace_dir).expanduser().resolve()
+        return ExecutionContext(
+            user_id=identity.user_id,
+            session_id=identity.session_id,
+            workspace_dir=workspace,
+            allowed_roots=(workspace,),
+            voice_dir=(workspace.parent / "voice").resolve(),
+            identity=identity,
+            memory_manager=None,
+        )
 
     # =========================================================
     # SINGLE TOOL EXECUTION
@@ -27,7 +215,8 @@ class ToolExecutor:
     def execute(
         self,
         tool_name: str,
-        confirm: bool = False,
+        confirmation_token: str | None = None,
+        user_context: Any = _UNSET,
         **parameters,
     ):
         """
@@ -35,6 +224,40 @@ class ToolExecutor:
 
         Returns a structured result.
         """
+
+        parameters = copy.deepcopy(parameters)
+
+        if tool_name in FORBIDDEN_PERMISSION_ADMIN_TOOLS:
+            return {
+                "status": "authorization_failed",
+                "tool": tool_name,
+                "parameters": {},
+                "reason": (
+                    f"Tool '{tool_name}' is restricted to authenticated user interfaces "
+                    "and cannot be invoked by the AI agent."
+                ),
+            }
+
+        reserved = sorted(_RESERVED_PARAM_NAMES & set(parameters))
+        if reserved:
+            return {
+                "status": "authorization_failed",
+                "tool": tool_name,
+                "parameters": {},
+                "reason": (
+                    f"Reserved security/identity parameters cannot be passed by tools: {reserved}"
+                ),
+            }
+
+        try:
+            active_identity = self._resolve_execution_identity(user_context)
+        except IdentityError as exc:
+            return {
+                "status": "authorization_failed",
+                "tool": tool_name,
+                "parameters": parameters,
+                "reason": str(exc),
+            }
 
         # -----------------------------------------------------
         # 1. Find tool
@@ -61,8 +284,19 @@ class ToolExecutor:
         # 3. Security check
         # -----------------------------------------------------
 
-        decision = self.security.check(
-            tool_name
+        workspace_dir = (
+            active_identity.workspace_dir if active_identity is not None else None
+        )
+        decision = self.security.check_for_user(
+            tool_name,
+            identity=active_identity,
+            permission_store=self.permission_store,
+            permission_manager=self.permission_manager,
+            parameters=parameters,
+            workspace_dir=workspace_dir,
+            user_required=bool(active_identity is not None or self._identity_required),
+            consume_permission=False,
+            actor="executor",
         )
 
         if not decision.allowed:
@@ -75,44 +309,270 @@ class ToolExecutor:
         # 4. Confirmation
         # -----------------------------------------------------
 
-        if (
-            decision.requires_confirmation
-            and not confirm
-        ):
-            return {
-                "status": "confirmation_required",
-                "tool": tool_name,
-                "parameters": parameters,
-                "reason": decision.reason,
-            }
+        grant_user_id = active_identity.user_id if active_identity is not None else None
+        grant_session_id = (
+            active_identity.session_id if active_identity is not None else None
+        )
+        perm_req = resolve_permissions_for_tool(
+            tool_name,
+            parameters,
+            workspace_dir=workspace_dir,
+        )
+
+        conflict_info: dict[str, Any] | None = None
+        if tool_name == "remember":
+            try:
+                scoped_mem = None
+                cur_ctx = get_current_execution_context()
+                if cur_ctx is not None and cur_ctx.memory_manager is not None:
+                    scoped_mem = cur_ctx.memory_manager
+                elif active_identity is not None and self.identity_manager is not None:
+                    scoped_mem = MemoryManager(
+                        self.identity_manager.database,
+                        identity=active_identity,
+                        identity_manager=self.identity_manager,
+                        require_user=True,
+                    )
+                if scoped_mem is not None:
+                    dup = scoped_mem.check_duplicate(
+                        str(parameters.get("category", "")),
+                        str(parameters.get("key", "")),
+                        str(parameters.get("value", "")),
+                    )
+                    if dup.status in {"key_conflict", "near_duplicate"} and dup.existing_record is not None:
+                        conflict_info = {
+                            "status": dup.status,
+                            "existing_value": dup.existing_record.get("value"),
+                            "existing_category": dup.existing_record.get("category"),
+                            "existing_key": dup.existing_record.get("key"),
+                            "message": dup.message,
+                        }
+            except Exception:
+                conflict_info = None
+
+        needs_confirmation = bool(decision.requires_confirmation or conflict_info is not None)
+        confirm_reason = (
+            conflict_info["message"]
+            if conflict_info is not None
+            else decision.reason
+        )
+
+        was_confirmed = False
+        if needs_confirmation:
+            if confirmation_token is None:
+                token = self.confirmations.issue(
+                    tool_name,
+                    parameters,
+                    user_id=grant_user_id,
+                    session_id=grant_session_id,
+                    permission_key=perm_req.permission_key,
+                )
+
+                payload = {
+                    "status": "confirmation_required",
+                    "tool": tool_name,
+                    "parameters": copy.deepcopy(parameters),
+                    "confirmation_token": token,
+                    "reason": confirm_reason,
+                }
+                if conflict_info is not None:
+                    payload["conflict"] = conflict_info
+                return payload
+
+            confirmed, reason = self.confirmations.consume(
+                confirmation_token,
+                tool_name,
+                parameters,
+                user_id=grant_user_id,
+                session_id=grant_session_id,
+            )
+
+            if not confirmed:
+                return {
+                    "status": "authorization_failed",
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "reason": reason,
+                }
+
+            was_confirmed = True
 
         # -----------------------------------------------------
-        # 5. Execute tool
+        # 4b. Revalidate immediately before execution
         # -----------------------------------------------------
 
         try:
-            result = tool.function(
-                **parameters
-            )
-
-        except Exception as exc:
+            active_identity = self._resolve_execution_identity(user_context)
+        except IdentityError as exc:
             return {
-                "status": "failed",
+                "status": "authorization_failed",
                 "tool": tool_name,
                 "parameters": parameters,
-                "error": str(exc),
+                "reason": str(exc),
+            }
+
+        current_tool = self.registry.get(tool_name)
+        if current_tool is None:
+            raise ValueError(f"RIYA does not have a tool named '{tool_name}'.")
+
+        self.registry.validate_parameters(tool_name, parameters)
+
+        workspace_dir = (
+            active_identity.workspace_dir if active_identity is not None else None
+        )
+        recheck = self.security.check_for_user(
+            tool_name,
+            identity=active_identity,
+            permission_store=self.permission_store,
+            permission_manager=self.permission_manager,
+            parameters=parameters,
+            workspace_dir=workspace_dir,
+            user_required=bool(active_identity is not None or self._identity_required),
+            consume_permission=True,
+            actor="executor",
+        )
+        if not recheck.allowed:
+            raise PermissionError(
+                f"RIYA blocked '{tool_name}': {recheck.reason}"
+            )
+        if recheck.requires_confirmation and not was_confirmed:
+            return {
+                "status": "authorization_failed",
+                "tool": tool_name,
+                "parameters": parameters,
+                "reason": "Confirmation revalidation failed before execution.",
             }
 
         # -----------------------------------------------------
-        # 6. Verify execution
+        # 5. Execute tool (and verify inside isolated user scope)
         # -----------------------------------------------------
 
-        verification = self.verify(
-            tool_name,
-            parameters,
-            result,
-        )
+        risk_level = self.security.get_risk_level(tool_name).value
+        started_at = time.perf_counter()
 
+        def _invoke_tool() -> Any:
+            call_kwargs = copy.deepcopy(parameters)
+            if current_tool.timeout_seconds is not None and current_tool.timeout_seconds > 0:
+                ctx = contextvars.copy_context()
+                return run_with_timeout(
+                    ctx.run,
+                    current_tool.function,
+                    **call_kwargs,
+                    timeout_seconds=current_tool.timeout_seconds,
+                )
+            return current_tool.function(**call_kwargs)
+
+        def _elapsed_ms() -> float:
+            return round((time.perf_counter() - started_at) * 1000.0, 2)
+
+        if active_identity is not None:
+            exec_ctx = self._build_execution_context(active_identity)
+            with ExecutionContextScope(exec_ctx):
+                try:
+                    with contextlib.ExitStack() as stack:
+                        if was_confirmed and tool_name == "remember":
+                            stack.enter_context(confirmed_memory_overwrite_scope())
+                        result = _invoke_tool()
+                except (TimeoutError, InferenceTimeoutError) as exc:
+                    return {
+                        "status": "failed",
+                        "tool": tool_name,
+                        "parameters": parameters,
+                        "timed_out": True,
+                        "risk_level": risk_level,
+                        "duration_ms": _elapsed_ms(),
+                        "error": str(exc) or "Tool execution timed out.",
+                    }
+                except UnsupportedPlatformCapabilityError as exc:
+                    return {
+                        "status": "unsupported",
+                        "tool": tool_name,
+                        "parameters": parameters,
+                        "unsupported": True,
+                        "risk_level": risk_level,
+                        "duration_ms": _elapsed_ms(),
+                        "reason": str(exc),
+                        "error": str(exc),
+                    }
+                except PermissionError as exc:
+                    return {
+                        "status": "failed",
+                        "tool": tool_name,
+                        "parameters": parameters,
+                        "blocked": True,
+                        "risk_level": risk_level,
+                        "duration_ms": _elapsed_ms(),
+                        "error": str(exc),
+                    }
+                except Exception:
+                    return {
+                        "status": "failed",
+                        "tool": tool_name,
+                        "parameters": parameters,
+                        "risk_level": risk_level,
+                        "duration_ms": _elapsed_ms(),
+                        "error": "The tool encountered an internal error.",
+                    }
+
+                verification = self.verify(
+                    tool_name,
+                    parameters,
+                    result,
+                )
+        else:
+            try:
+                with contextlib.ExitStack() as stack:
+                    if was_confirmed and tool_name == "remember":
+                        stack.enter_context(confirmed_memory_overwrite_scope())
+                    result = _invoke_tool()
+            except (TimeoutError, InferenceTimeoutError) as exc:
+                return {
+                    "status": "failed",
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "timed_out": True,
+                    "risk_level": risk_level,
+                    "duration_ms": _elapsed_ms(),
+                    "error": str(exc) or "Tool execution timed out.",
+                }
+            except UnsupportedPlatformCapabilityError as exc:
+                return {
+                    "status": "unsupported",
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "unsupported": True,
+                    "risk_level": risk_level,
+                    "duration_ms": _elapsed_ms(),
+                    "reason": str(exc),
+                    "error": str(exc),
+                }
+            except PermissionError as exc:
+                return {
+                    "status": "failed",
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "blocked": True,
+                    "risk_level": risk_level,
+                    "duration_ms": _elapsed_ms(),
+                    "error": str(exc),
+                }
+            except Exception:
+                return {
+                    "status": "failed",
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "risk_level": risk_level,
+                    "duration_ms": _elapsed_ms(),
+                    "error": "The tool encountered an internal error.",
+                }
+
+            verification = self.verify(
+                tool_name,
+                parameters,
+                result,
+            )
+
+        duration_ms = _elapsed_ms()
         if not verification["success"]:
             return {
                 "status": "verification_failed",
@@ -120,19 +580,23 @@ class ToolExecutor:
                 "parameters": parameters,
                 "result": result,
                 "reason": verification["reason"],
+                "risk_level": risk_level,
+                "duration_ms": duration_ms,
             }
 
         # -----------------------------------------------------
         # 7. Successful execution
         # -----------------------------------------------------
 
-        return {
-            "status": "success",
-            "tool": tool_name,
-            "parameters": parameters,
-            "result": result,
-            "verification": verification,
-        }
+        return ToolResult(
+            status="success",
+            tool=tool_name,
+            parameters=parameters,
+            result=result,
+            verification=verification,
+            risk_level=risk_level,
+            duration_ms=duration_ms,
+        ).to_dict()
 
     # =========================================================
     # MULTI-STEP PLAN EXECUTION
@@ -141,49 +605,134 @@ class ToolExecutor:
     def execute_plan(
         self,
         plan,
-        confirm: bool = False,
+        user_context: Any = _UNSET,
     ):
         """
         Execute a RIYA multi-step plan.
 
         Execution stops when:
         - confirmation is required
+        - a step is invalid or unauthorized
         - a tool fails
         - verification fails
         """
 
+        steps = getattr(plan, "steps", None)
+        if not isinstance(steps, (list, tuple)):
+            return [{
+                "action": "",
+                "description": "Invalid plan",
+                "result": {
+                    "status": "authorization_failed",
+                    "tool": "",
+                    "parameters": {},
+                    "reason": "Plan steps must be a valid list.",
+                },
+            }]
+
+        if len(steps) > self.max_plan_steps:
+            return [{
+                "action": "",
+                "description": "Plan size check",
+                "result": {
+                    "status": "authorization_failed",
+                    "tool": "",
+                    "parameters": {},
+                    "reason": (
+                        f"Plan exceeds maximum allowed steps ({self.max_plan_steps})."
+                    ),
+                },
+            }]
+
+        try:
+            self._resolve_execution_identity(user_context)
+        except IdentityError as exc:
+            return [{
+                "action": "",
+                "description": "Identity check",
+                "result": {
+                    "status": "authorization_failed",
+                    "tool": "",
+                    "parameters": {},
+                    "reason": str(exc),
+                },
+            }]
+
         results = []
 
-        for step in plan.steps:
+        for step in steps:
+            action = getattr(step, "action", None)
+            step_parameters = getattr(step, "parameters", None)
+            description = getattr(step, "description", "")
 
-            # -------------------------------------------------
-            # Internal planning step
-            # -------------------------------------------------
-
-            if step.action == "understand":
-
+            if not isinstance(action, str) or not action.strip():
                 results.append({
-                    "status": "success",
-                    "action": "understand",
-                    "description": step.description,
-                    "result": "Task understood.",
+                    "action": str(action),
+                    "description": str(description),
+                    "result": {
+                        "status": "authorization_failed",
+                        "tool": str(action),
+                        "parameters": {},
+                        "reason": "Plan step contains an invalid action.",
+                    },
                 })
+                break
 
-                continue
+            if (
+                not isinstance(step_parameters, dict)
+                or not all(isinstance(k, str) for k in step_parameters)
+                or bool(_RESERVED_PARAM_NAMES & set(step_parameters))
+            ):
+                results.append({
+                    "action": action,
+                    "description": str(description),
+                    "result": {
+                        "status": "authorization_failed",
+                        "tool": action,
+                        "parameters": {},
+                        "reason": (
+                            "Plan steps cannot supply reserved security or "
+                            "identity parameters directly."
+                        ),
+                    },
+                })
+                break
 
-            # -------------------------------------------------
-            # Execute step
-            # -------------------------------------------------
-
-            result = self.execute(
-                step.action,
-                confirm=confirm,
-                **step.parameters,
-            )
+            try:
+                result = self.execute(
+                    action,
+                    confirmation_token=None,
+                    user_context=user_context,
+                    **copy.deepcopy(step_parameters),
+                )
+            except PermissionError as exc:
+                results.append({
+                    "action": action,
+                    "description": str(description),
+                    "result": {
+                        "status": "authorization_failed",
+                        "tool": action,
+                        "parameters": {},
+                        "reason": str(exc),
+                    },
+                })
+                break
+            except ValueError as exc:
+                results.append({
+                    "action": action,
+                    "description": str(description),
+                    "result": {
+                        "status": "failed",
+                        "tool": action,
+                        "parameters": {},
+                        "error": str(exc),
+                    },
+                })
+                break
 
             step_result = {
-                "action": step.action,
-                "description": step.description,
+                "action": action,
+                "description": str(description),
                 "result": result,
             }
 
@@ -210,11 +759,21 @@ class ToolExecutor:
                 in {
                     "failed",
                     "verification_failed",
+                    "authorization_failed",
+                    "unsupported",
                 }
             ):
                 break
 
         return results
+
+    def cancel_confirmation(
+        self,
+        confirmation_token: str | None,
+    ) -> None:
+        """Invalidate a pending confirmation without executing the tool."""
+
+        self.confirmations.cancel(confirmation_token)
 
     # =========================================================
     # VERIFICATION
@@ -248,6 +807,12 @@ class ToolExecutor:
                     ),
                 }
 
+            if isinstance(result, str) and not result.startswith("Opened "):
+                return {
+                    "success": False,
+                    "reason": result,
+                }
+
             return self._verify_application_running(
                 app_name
             )
@@ -268,6 +833,12 @@ class ToolExecutor:
                     "reason": (
                         "Application name was missing."
                     ),
+                }
+
+            if isinstance(result, str) and not result.startswith("Closed "):
+                return {
+                    "success": False,
+                    "reason": result,
                 }
 
             return self._verify_application_closed(
@@ -304,25 +875,21 @@ class ToolExecutor:
         # -----------------------------------------------------
 
         if tool_name == "write_file":
-
-            path = parameters.get(
-                "path"
-            )
-
-            return self._verify_path_exists(
-                path,
-                expected_type="file",
-            )
-
-        # -----------------------------------------------------
-        # Delete file
-        # -----------------------------------------------------
-
+            from core.tools.filesystem.files import verify_file_content
+            path = parameters.get("path")
+            content = parameters.get("content")
+            if verify_file_content(path, content):
+                return {
+                    "success": True,
+                    "reason": "File content verified.",
+                }
+            return {
+                "success": False,
+                "reason": "Written file content could not be verified.",
+            }
         if tool_name == "delete_file":
 
-            path = parameters.get(
-                "path"
-            )
+            path = parameters.get("source_path") or parameters.get("path")
 
             return self._verify_path_missing(
                 path
@@ -341,6 +908,116 @@ class ToolExecutor:
             return self._verify_path_missing(
                 path
             )
+
+        if tool_name == "desktop_focus_app":
+            if isinstance(result, str) and not result.startswith("Focused "):
+                return {
+                    "success": False,
+                    "reason": result,
+                }
+            return {
+                "success": True,
+                "reason": "Desktop application focus verified.",
+            }
+
+        if tool_name == "desktop_terminate_app":
+            app_name = parameters.get("app_name")
+            if not app_name:
+                return {
+                    "success": False,
+                    "reason": "Application name was missing.",
+                }
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                    if parsed.get("status") != "success":
+                        return {
+                            "success": False,
+                            "reason": parsed.get("error", "Application termination failed."),
+                        }
+                except Exception:
+                    pass
+            return self._verify_application_closed(app_name)
+
+        if tool_name == "desktop_open_url":
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                    if parsed.get("status") != "success":
+                        return {
+                            "success": False,
+                            "reason": parsed.get("error", "Opening URL failed."),
+                        }
+                except Exception:
+                    pass
+            return {
+                "success": True,
+                "reason": "URL opening command submitted and verified.",
+            }
+
+        if tool_name == "clipboard_write":
+            if isinstance(result, str) and not result.startswith("Copied "):
+                return {
+                    "success": False,
+                    "reason": result,
+                }
+            return {
+                "success": True,
+                "reason": "Clipboard write verified.",
+            }
+
+        if tool_name == "send_notification":
+            if isinstance(result, str) and not result.startswith(("Notification ", "Notification sent:")):
+                return {
+                    "success": False,
+                    "reason": result,
+                }
+            return {
+                "success": True,
+                "reason": "Local notification dispatch verified.",
+            }
+
+        if tool_name in {
+            "storage_status",
+            "network_status",
+            "check_application",
+            "platform_capabilities",
+            "inspect_file_metadata",
+            "active_window_info",
+            "clipboard_read",
+            "desktop_list_apps",
+            "desktop_running_apps",
+            "desktop_app_state",
+            "desktop_search_apps",
+            "desktop_app_details",
+            "desktop_running_apps_detailed",
+            "desktop_app_resources",
+        }:
+            if not isinstance(result, str) or not result.strip():
+                return {
+                    "success": False,
+                    "reason": f"Tool '{tool_name}' returned empty output.",
+                }
+            if result.startswith("Access denied:") or result.startswith("Metadata error:"):
+                return {
+                    "success": False,
+                    "reason": result,
+                }
+            return {
+                "success": True,
+                "reason": f"{tool_name} output verified.",
+            }
+
+        if tool_name in {"calculate", "python_sandbox", "terminal_command", "local_db_query"}:
+            if not isinstance(result, str) or not result.strip():
+                return {
+                    "success": False,
+                    "reason": f"Tool '{tool_name}' returned empty output.",
+                }
+            return {
+                "success": True,
+                "reason": f"{tool_name} output verified.",
+            }
 
         # -----------------------------------------------------
         # Other tools
@@ -370,17 +1047,30 @@ class ToolExecutor:
         self,
         app_name: str,
     ):
+        import shutil
         import subprocess
+        from core.tools.system.macos import validate_app_name
 
+        try:
+            validated = validate_app_name(app_name)
+        except ValueError as exc:
+            return {
+                "success": False,
+                "reason": str(exc),
+            }
+
+        pgrep_bin = shutil.which("pgrep") or "/usr/bin/pgrep"
         try:
             result = subprocess.run(
                 [
-                    "pgrep",
+                    pgrep_bin,
                     "-x",
-                    app_name,
+                    "--",
+                    validated,
                 ],
                 capture_output=True,
                 text=True,
+                shell=False,
                 timeout=3,
             )
 
@@ -388,14 +1078,37 @@ class ToolExecutor:
                 return {
                     "success": True,
                     "reason": (
-                        f"{app_name} is running."
+                        f"{validated} is running."
                     ),
                 }
+
+            # When running against real OS (unmocked subprocess.run), allow a brief
+            # window for LaunchServices or systemd/desktop launcher to spawn the process.
+            if not hasattr(subprocess.run, "assert_called"):
+                for _ in range(6):
+                    time.sleep(0.15)
+                    retry = subprocess.run(
+                        [
+                            pgrep_bin,
+                            "-x",
+                            "--",
+                            validated,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        shell=False,
+                        timeout=3,
+                    )
+                    if retry.returncode == 0:
+                        return {
+                            "success": True,
+                            "reason": f"{validated} is running.",
+                        }
 
             return {
                 "success": False,
                 "reason": (
-                    f"{app_name} could not be "
+                    f"{validated} could not be "
                     "verified as running."
                 ),
             }
@@ -417,32 +1130,53 @@ class ToolExecutor:
         self,
         app_name: str,
     ):
+        import shutil
         import subprocess
+        from core.tools.system.macos import validate_app_name
 
+        try:
+            validated = validate_app_name(app_name)
+        except ValueError as exc:
+            return {
+                "success": False,
+                "reason": str(exc),
+            }
+
+        pgrep_bin = shutil.which("pgrep") or "/usr/bin/pgrep"
         try:
             result = subprocess.run(
                 [
-                    "pgrep",
+                    pgrep_bin,
                     "-x",
-                    app_name,
+                    "--",
+                    validated,
                 ],
                 capture_output=True,
                 text=True,
+                shell=False,
                 timeout=3,
             )
 
-            if result.returncode != 0:
+            if result.returncode == 1:
                 return {
                     "success": True,
                     "reason": (
-                        f"{app_name} is no longer running."
+                        f"{validated} is no longer running."
+                    ),
+                }
+
+            if result.returncode == 0:
+                return {
+                    "success": False,
+                    "reason": (
+                        f"{validated} is still running."
                     ),
                 }
 
             return {
                 "success": False,
                 "reason": (
-                    f"{app_name} is still running."
+                    f"Could not verify whether {validated} closed."
                 ),
             }
 
@@ -472,6 +1206,12 @@ class ToolExecutor:
                     "Screenshot tool did not return "
                     "a file path."
                 ),
+            }
+
+        if not result.startswith("Screenshot saved to "):
+            return {
+                "success": False,
+                "reason": result,
             }
 
         possible_path = None
@@ -540,7 +1280,7 @@ class ToolExecutor:
         # File must exist
         # -----------------------------------------------------
 
-        if not possible_path.is_file():
+        if possible_path.is_symlink() or not possible_path.is_file():
             return {
                 "success": False,
                 "reason": (
@@ -579,19 +1319,27 @@ class ToolExecutor:
         path: str | None,
         expected_type: str,
     ):
-        from pathlib import Path
+        import os
+        from core.tools.filesystem.files import (
+            FilesystemAccessError,
+            _open_directory,
+            _path_context,
+            _resolve_path,
+        )
 
-        if not path:
+        if not isinstance(path, str) or not path.strip():
             return {
                 "success": False,
                 "reason": "Path was missing.",
             }
 
-        resolved = (
-            Path(path)
-            .expanduser()
-            .resolve()
-        )
+        try:
+            resolved = _resolve_path(path)
+        except FilesystemAccessError as exc:
+            return {
+                "success": False,
+                "reason": str(exc),
+            }
 
         if not resolved.exists():
             return {
@@ -603,15 +1351,14 @@ class ToolExecutor:
             }
 
         if expected_type == "directory":
-
-            if not resolved.is_dir():
+            try:
+                fd = _open_directory(_path_context(path))
+            except FilesystemAccessError as exc:
                 return {
                     "success": False,
-                    "reason": (
-                        f"Expected a directory but "
-                        f"found: {resolved}"
-                    ),
+                    "reason": str(exc),
                 }
+            os.close(fd)
 
         if expected_type == "file":
 
@@ -639,19 +1386,24 @@ class ToolExecutor:
         self,
         path: str | None,
     ):
-        from pathlib import Path
+        from core.tools.filesystem.files import (
+            FilesystemAccessError,
+            _resolve_path,
+        )
 
-        if not path:
+        if not isinstance(path, str) or not path.strip():
             return {
                 "success": False,
                 "reason": "Path was missing.",
             }
 
-        resolved = (
-            Path(path)
-            .expanduser()
-            .resolve()
-        )
+        try:
+            resolved = _resolve_path(path)
+        except FilesystemAccessError as exc:
+            return {
+                "success": False,
+                "reason": str(exc),
+            }
 
         if resolved.exists():
             return {

@@ -1,0 +1,15 @@
+Package: riya
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Tukaram <developer@riya.ai>
+Depends: python3 (>= 3.10), python3-tk, python3-pil, python3-numpy, python3-psutil, libportaudio2, libsndfile1, libgomp1, espeak-ng | piper, libnotify-bin
+Recommends: wl-clipboard | xclip
+Homepage: https://riya.ai
+Description: Universal offline-first personal AI assistant
+ RIYA is an offline-first personal AI assistant providing private local neural
+ intelligence, speech recognition, speech synthesis, and desktop OS integration.
+ Powered by local Qwen3 GGUF inference, faster-whisper STT, Silero VAD, and
+ multi-backend Linux TTS without cloud dependencies or external telemetry.
+

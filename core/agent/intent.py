@@ -13,6 +13,11 @@ class IntentType(str, Enum):
 
     SCREENSHOT = "screenshot"
     CURRENT_TIME = "current_time"
+    SYSTEM_INFORMATION = "system_information"
+    STORAGE_STATUS = "storage_status"
+    CHECK_APPLICATION = "check_application"
+    NETWORK_STATUS = "network_status"
+    BATTERY_STATUS = "battery_status"
 
     EXIT = "exit"
 
@@ -73,6 +78,52 @@ class IntentDetector:
         "what's the time",
         "whats the time",
         "can you tell me the time",
+    }
+
+    SYSTEM_INFORMATION_COMMANDS = {
+        "system information",
+        "system info",
+        "what macos version am i running",
+        "what macos version is this",
+        "what os version am i running",
+        "what operating system am i running",
+        "what system am i running",
+        "show system information",
+        "get system information",
+    }
+
+    STORAGE_STATUS_COMMANDS = {
+        "storage status",
+        "disk space",
+        "available disk space",
+        "how much disk space is available",
+        "how much storage is available",
+        "how much storage space is available",
+        "how much free disk space is available",
+        "what is my available disk space",
+        "check disk space",
+    }
+
+    LIST_INSTALLED_APPS_COMMANDS = {
+        "which applications are installed",
+        "what applications are installed",
+        "list installed applications",
+        "show installed applications",
+        "which apps are installed",
+        "what apps are installed",
+    }
+
+    NETWORK_STATUS_COMMANDS = {
+        "network status",
+        "what is my network status",
+        "check network status",
+    }
+
+    BATTERY_STATUS_COMMANDS = {
+        "battery",
+        "battery status",
+        "what is my battery status",
+        "check battery status",
     }
 
     # =========================================================
@@ -184,6 +235,28 @@ class IntentDetector:
 
             return Intent(
                 IntentType.CURRENT_TIME
+            )
+
+        if normalized in self.SYSTEM_INFORMATION_COMMANDS:
+            return Intent(IntentType.SYSTEM_INFORMATION)
+
+        if normalized in self.STORAGE_STATUS_COMMANDS:
+            return Intent(IntentType.STORAGE_STATUS, {"path": "/"})
+
+        if normalized in self.NETWORK_STATUS_COMMANDS:
+            return Intent(IntentType.NETWORK_STATUS)
+
+        if normalized in self.BATTERY_STATUS_COMMANDS:
+            return Intent(IntentType.BATTERY_STATUS)
+
+        if normalized in self.LIST_INSTALLED_APPS_COMMANDS:
+            return Intent(IntentType.CHECK_APPLICATION, {})
+
+        checked_app = self._extract_checked_application_name(text, normalized)
+        if checked_app is not None:
+            return Intent(
+                IntentType.CHECK_APPLICATION,
+                {"app_name": checked_app} if checked_app else {},
             )
 
         # -----------------------------------------------------
@@ -364,6 +437,53 @@ class IntentDetector:
 
             return None
 
+        return None
+
+    def _extract_checked_application_name(
+        self,
+        original_text: str,
+        normalized_text: str,
+    ) -> str | None:
+        if normalized_text in {
+            "check whether a particular application is installed",
+            "check whether an application is installed",
+            "check if an application is installed",
+        }:
+            return ""
+
+        prefixes = (
+            "check whether the application ",
+            "check if the application ",
+            "check whether application ",
+            "check if application ",
+            "check whether ",
+            "check if ",
+            "is the application ",
+            "is application ",
+            "is ",
+        )
+        suffix = " is installed"
+        alt_suffix = " installed"
+        cleaned_orig = original_text.strip().rstrip("!?.,").strip()
+        lowered_orig = cleaned_orig.lower()
+
+        for prefix in prefixes:
+            if not lowered_orig.startswith(prefix):
+                continue
+            if prefix.startswith("is "):
+                if not lowered_orig.endswith(alt_suffix):
+                    continue
+                candidate = cleaned_orig[len(prefix) : -len(alt_suffix)].strip()
+            else:
+                if lowered_orig.endswith(suffix):
+                    candidate = cleaned_orig[len(prefix) : -len(suffix)].strip()
+                elif lowered_orig.endswith(alt_suffix):
+                    candidate = cleaned_orig[len(prefix) : -len(alt_suffix)].strip()
+                else:
+                    continue
+            candidate = candidate.strip("\"' ")
+            if candidate and candidate.lower() not in {"a particular application", "an application", "it"}:
+                return candidate
         return None
 
     # =========================================================

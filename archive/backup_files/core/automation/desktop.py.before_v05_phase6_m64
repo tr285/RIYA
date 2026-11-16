@@ -1,0 +1,63 @@
+"""Desktop interaction & workflow automation tools layered cleanly over PlatformInterface."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from core.device.macos import MacOSPlatform
+
+
+_DEFAULT_PLATFORM = MacOSPlatform()
+
+
+def desktop_list_apps(filter_text: str = "") -> str:
+    """List installed desktop applications (optionally filtered)."""
+    apps = _DEFAULT_PLATFORM.list_installed_applications()
+    needle = str(filter_text or "").strip().lower()
+    if needle:
+        apps = [a for a in apps if needle in a.lower()]
+    return json.dumps({"installed_apps": apps[:80], "count": len(apps)}, ensure_ascii=False)
+
+
+def desktop_running_apps() -> str:
+    """List currently running non-background desktop applications."""
+    apps = _DEFAULT_PLATFORM.list_running_applications()
+    return json.dumps({"running_apps": apps[:80], "count": len(apps)}, ensure_ascii=False)
+
+
+def desktop_app_state(app_name: str) -> str:
+    """Inspect whether an application is not_running, running, or frontmost."""
+    return _DEFAULT_PLATFORM.get_application_state(app_name)
+
+
+def desktop_focus_app(app_name: str) -> str:
+    """Focus a running desktop application (requires user confirmation & permission)."""
+    return _DEFAULT_PLATFORM.focus_application(app_name)
+
+
+class DesktopController:
+    """Coordinates desktop app inspection and confirmed focus/launch actions via ToolExecutor."""
+
+    def __init__(self, tool_executor=None, platform=None):
+        self.tool_executor = tool_executor
+        self.platform = platform or _DEFAULT_PLATFORM
+
+    def discover_apps(self, *, user_context=None) -> str:
+        if self.tool_executor is not None:
+            return self.tool_executor.execute("desktop_list_apps", user_context=user_context)
+        return desktop_list_apps()
+
+    def running_apps(self, *, user_context=None) -> str:
+        if self.tool_executor is not None:
+            return self.tool_executor.execute("desktop_running_apps", user_context=user_context)
+        return desktop_running_apps()
+
+    def app_state(self, app_name: str, *, user_context=None) -> Any:
+        if self.tool_executor is not None:
+            return self.tool_executor.execute(
+                "desktop_app_state",
+                user_context=user_context,
+                app_name=app_name,
+            )
+        return self.platform.get_application_state(app_name)

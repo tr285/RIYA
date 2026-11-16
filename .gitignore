@@ -44,3 +44,4 @@ dist/
 # Temporary files
 *.tmp
 *.temp
+data/riya.db

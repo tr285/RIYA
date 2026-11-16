@@ -1,0 +1,371 @@
+from core.ai.safety import strip_unsafe_control_chars
+from core.memory.database import MemoryDatabase
+
+
+MAX_MEMORY_CATEGORY_CHARS = 64
+MAX_MEMORY_KEY_CHARS = 128
+MAX_MEMORY_VALUE_CHARS = 2000
+MAX_MEMORY_SEARCH_RESULTS = 50
+MAX_MEMORY_LIST_RESULTS = 100
+
+
+class MemoryManager:
+
+    def __init__(self, database=None):
+        self.database = database or MemoryDatabase()
+
+    @staticmethod
+    def _validate_identifier(
+        value: str,
+        field_name: str,
+        max_chars: int,
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"Memory {field_name} must be a string.")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(
+                f"Memory {field_name} contains unsafe control characters."
+            )
+        cleaned = strip_unsafe_control_chars(value, allow_newlines=False).strip()
+        if not cleaned:
+            raise ValueError(f"Memory {field_name} cannot be empty.")
+        if len(cleaned) > max_chars:
+            raise ValueError(
+                f"Memory {field_name} exceeds maximum length ({max_chars})."
+            )
+        return cleaned
+
+    def remember(
+        self,
+        category: str,
+        key: str,
+        value: str,
+    ) -> str:
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        if not isinstance(value, str):
+            raise ValueError("Memory value must be a string.")
+        value = strip_unsafe_control_chars(value, allow_newlines=True).strip()
+        if not value:
+            raise ValueError(
+                "Memory value cannot be empty."
+            )
+        if len(value) > MAX_MEMORY_VALUE_CHARS:
+            raise ValueError(
+                f"Memory value exceeds maximum length ({MAX_MEMORY_VALUE_CHARS})."
+            )
+
+        with self.database.connect() as connection:
+
+            connection.execute(
+                """
+                INSERT INTO memories (
+                    category,
+                    key,
+                    value
+                )
+                VALUES (?, ?, ?)
+
+                ON CONFLICT(category, key)
+                DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    category,
+                    key,
+                    value,
+                ),
+            )
+
+            connection.commit()
+
+        return (
+            f"Remembered '{key}' "
+            f"under '{category}'."
+        )
+
+    def recall(
+        self,
+        category: str,
+        key: str,
+    ) -> str | None:
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+
+            row = connection.execute(
+                """
+                SELECT value
+                FROM memories
+                WHERE category = ?
+                  AND key = ?
+                """,
+                (
+                    category,
+                    key,
+                ),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return row["value"]
+
+    def search(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = MAX_MEMORY_SEARCH_RESULTS,
+    ) -> list[dict]:
+        if not isinstance(query, str):
+            raise ValueError("Memory search query must be a string.")
+
+        query = strip_unsafe_control_chars(query, allow_newlines=False).strip()
+
+        if not query:
+            return []
+
+        if len(query) > MAX_MEMORY_KEY_CHARS * 2:
+            query = query[: MAX_MEMORY_KEY_CHARS * 2]
+
+        limit = max(1, min(int(limit), MAX_MEMORY_SEARCH_RESULTS))
+
+        category_value = (
+            self._validate_identifier(
+                category,
+                "category",
+                MAX_MEMORY_CATEGORY_CHARS,
+            )
+            if category is not None
+            else None
+        )
+
+        # Split the query into useful words.
+        words = [
+            word.lower()
+            for word in query.split()
+            if len(word) >= 2
+        ]
+
+        with self.database.connect() as connection:
+
+            if category_value is None:
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    FROM memories
+                    ORDER BY
+                        updated_at DESC,
+                        id DESC
+                    """
+                ).fetchall()
+
+            else:
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    FROM memories
+                    WHERE category = ?
+                    ORDER BY
+                        updated_at DESC,
+                        id DESC
+                    """,
+                    (category_value,),
+                ).fetchall()
+
+        memories = [
+            dict(row)
+            for row in rows
+        ]
+
+        if not words:
+            return memories[:limit]
+
+        matches = []
+
+        for memory in memories:
+
+            searchable = " ".join(
+                [
+                    memory["category"],
+                    memory["key"],
+                    memory["value"],
+                ]
+            ).lower()
+
+            score = 0
+
+            for word in words:
+
+                if word in searchable:
+                    score += 1
+
+            if score > 0:
+
+                memory["_score"] = score
+                matches.append(memory)
+
+        matches.sort(
+            key=lambda item: (
+                item["_score"],
+                item["updated_at"],
+                item["id"],
+            ),
+            reverse=True,
+        )
+
+        for memory in matches:
+            memory.pop("_score", None)
+
+        return matches[:limit]
+
+    def list_memories(
+        self,
+        category: str | None = None,
+        limit: int = MAX_MEMORY_LIST_RESULTS,
+    ) -> list[dict]:
+        if category is not None:
+            category = self._validate_identifier(
+                category,
+                "category",
+                MAX_MEMORY_CATEGORY_CHARS,
+            )
+
+        limit = max(1, min(int(limit), MAX_MEMORY_LIST_RESULTS))
+
+        with self.database.connect() as connection:
+
+            if category is None:
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    FROM memories
+                    ORDER BY
+                        category,
+                        key
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+
+            else:
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        category,
+                        key,
+                        value,
+                        created_at,
+                        updated_at
+                    FROM memories
+                    WHERE category = ?
+                    ORDER BY key
+                    LIMIT ?
+                    """,
+                    (category, limit),
+                ).fetchall()
+
+        return [
+            dict(row)
+            for row in rows
+        ]
+
+    def forget(
+        self,
+        category: str,
+        key: str,
+    ) -> bool:
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+        key = self._validate_identifier(
+            key,
+            "key",
+            MAX_MEMORY_KEY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+
+            cursor = connection.execute(
+                """
+                DELETE FROM memories
+                WHERE category = ?
+                  AND key = ?
+                """,
+                (
+                    category,
+                    key,
+                ),
+            )
+
+            connection.commit()
+
+        return cursor.rowcount > 0
+
+    def clear_category(
+        self,
+        category: str,
+    ) -> int:
+        category = self._validate_identifier(
+            category,
+            "category",
+            MAX_MEMORY_CATEGORY_CHARS,
+        )
+
+        with self.database.connect() as connection:
+
+            cursor = connection.execute(
+                """
+                DELETE FROM memories
+                WHERE category = ?
+                """,
+                (category,),
+            )
+
+            connection.commit()
+
+        return cursor.rowcount

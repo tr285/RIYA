@@ -1,0 +1,11 @@
+riya (1.0.0-1) stable; urgency=medium
+
+  * Initial production release for Linux (Ubuntu 24.04 LTS and Debian derivatives).
+  * Offline-first local AI inference with Qwen3 GGUF architecture.
+  * Local speech recognition via faster-whisper.
+  * Local speech synthesis via Piper, eSpeak NG, and Speech Dispatcher.
+  * Native Freedesktop XDG desktop and icon integration.
+  * Strict memory and filesystem sandboxing.
+
+ -- Tukaram <developer@riya.ai>  Sun, 15 Nov 2026 12:00:00 +0000
+
